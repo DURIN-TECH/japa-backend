@@ -54,7 +54,33 @@ export const CLIENT_TRANSACTION_FIELDS = [
   "consultationId",
   "createdAt",
   "paidAt",
+  // Issue #413 (H): refund rows only.
+  "refundOf",
+  "refundState",
 ] as const;
+
+/**
+ * Issue #413 (H): how a client reads a refund row, worked out from its
+ * status (never from internal fields the client does not see):
+ *  - "on_its_way": `pending` / `processing` (Paystack has it, or soon will);
+ *  - "refunded": `completed`;
+ *  - "delayed": `failed`, or HELD for an admin (`refundHeldReason`);
+ *  - "none_due": an admin closed it as `nothing_to_refund` (`closed`).
+ */
+export type ClientRefundState = "on_its_way" | "refunded" | "delayed" | "none_due";
+
+/**
+ * The client's reading of a refund row (issue #413 H). Pure. A held row is
+ * always "delayed" (never "a failed refund of ₦0.00"); a closed one "none_due".
+ */
+export function clientRefundState(
+  txn: Pick<Transaction, "status"> & Partial<Pick<Transaction, "refundHeldReason">>
+): ClientRefundState {
+  if (txn.status === "closed") return "none_due";
+  if (txn.refundHeldReason || txn.status === "failed") return "delayed";
+  if (txn.status === "completed") return "refunded";
+  return "on_its_way";
+}
 
 /**
  * One payment as its payer may see it (GET /transactions, client scope).
@@ -110,6 +136,22 @@ export interface ClientTransaction {
   createdAt: Timestamp;
   /** When the processor took the payment (consultation fees record it). */
   paidAt?: Timestamp;
+
+  // ---- Issue #413 (H): refund rows only (needed by #406 and #356) ----
+  /**
+   * The id of the payment row (`consultation_fee`) this refund gives back,
+   * so the client's history can pair the two. Absent on other rows, and on
+   * the refund of a payment that was never applied (it has no fee row).
+   */
+  refundOf?: string;
+  /**
+   * Where the refund stands for the client (see ClientRefundState). Set on
+   * every `refund` row. On a "delayed" row that is HELD for an admin, or on a
+   * "none_due" row, `amount` / `amountCharged` is 0 and is NOT a refund
+   * amount: it must not be shown as "refunded ₦0.00". Only on_its_way /
+   * refunded rows carry the amount coming back.
+   */
+  refundState?: ClientRefundState;
 }
 
 /**
@@ -170,6 +212,15 @@ export function toClientTransaction(txn: Transaction): ClientTransaction {
 
   // Paystack's payment time (recorded on consultation fees, issue #180).
   if (txn.paystackPaidAt !== undefined) out.paidAt = txn.paystackPaidAt;
+
+  // Issue #413 (H): a refund row says which payment it gives back and where
+  // it stands. Nothing else of the refund bookkeeping is copied (who carries
+  // Paystack's fee, the agent's reversal, the shortfall, the held reason,
+  // Paystack's fee and refund ids all stay on the server).
+  if (txn.type === "refund") {
+    if (txn.refundOf !== undefined) out.refundOf = txn.refundOf;
+    out.refundState = clientRefundState(txn);
+  }
 
   return out;
 }

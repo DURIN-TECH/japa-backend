@@ -152,7 +152,7 @@ import {
 } from "./consultation-charge.service";
 import { availableBalanceIn, transactionService } from "./transaction.service";
 // Issue #390 / #395: Paystack's fee on the refunded charge.
-import { consultationFeeCredit, isWellFormedFee } from "../money/paystack-fee";
+import { consultationFeeCredit, isUnresolvedFeeStatus, isWellFormedFee } from "../money/paystack-fee";
 import { resolvedFeeFields } from "./paystack-fee.service";
 import type { PaystackTransactionLookup } from "./billing/paystack.provider";
 import { notificationService } from "./notification.service";
@@ -383,7 +383,8 @@ export function feeForRefund(
   fee: Pick<Transaction, "currency"> & Partial<Pick<Transaction, "paystackFeeMinor" | "paystackFeeStatus">>,
   lookup: Pick<PaystackTransactionLookup, "fees" | "currency"> | null
 ): number | undefined {
-  if (fee.paystackFeeStatus !== "unknown" && isWellFormedFee(fee.paystackFeeMinor)) return fee.paystackFeeMinor;
+  // (#413 D: a "set_aside" row is as unknown as an "unknown" one.)
+  if (!isUnresolvedFeeStatus(fee.paystackFeeStatus) && isWellFormedFee(fee.paystackFeeMinor)) return fee.paystackFeeMinor;
   if (lookup && lookup.currency === fee.currency && isWellFormedFee(lookup.fees)) return lookup.fees;
   return undefined;
 }
@@ -394,7 +395,7 @@ export function feeForRefund(
  */
 export function refundNeedsFeeLookup(fee: Transaction | null): boolean {
   if (!fee) return false;
-  return fee.paystackFeeStatus === "unknown" || !isWellFormedFee(fee.paystackFeeMinor);
+  return isUnresolvedFeeStatus(fee.paystackFeeStatus) || !isWellFormedFee(fee.paystackFeeMinor);
 }
 
 /**
@@ -501,8 +502,58 @@ export function refundSummary(row: Transaction): RefundSummary {
   };
 }
 
-/** Order of refund statuses: a row only ever moves to a HIGHER rank (completed is final). */
-const STATUS_RANK: Record<RefundStatus, number> = { pending: 0, processing: 1, failed: 2, completed: 3 };
+/**
+ * Order of refund statuses: a row only ever moves to a HIGHER rank
+ * (completed is final). Issue #413 (B): `closed` (a held row an admin closed
+ * with nothing to refund) ranks above everything, so no event can ever move it.
+ */
+const STATUS_RANK: Record<RefundStatus, number> = { pending: 0, processing: 1, failed: 2, completed: 3, closed: 4 };
+
+/** How a Paystack refund for a charge compares with our row (issue #413 A, see `matchProviderRefund`). */
+export type ProviderRefundMatch =
+  /** No refund of the charge that did not fail: nothing to adopt. */
+  | { kind: "none" }
+  /** Exactly one live refund, of exactly the row's amount AND currency: adopt it. */
+  | { kind: "match"; refund: PaystackRefund }
+  /**
+   * A live refund that is not exactly ours (another amount or currency, one
+   * missing, or more than one live refund): never adopted, never followed by
+   * a create; the row is flagged for an admin.
+   */
+  | { kind: "mismatch"; refund: PaystackRefund };
+
+/**
+ * Compare the refunds Paystack holds for a charge with our refund row
+ * (issue #413 A). Pure. Shared by the engine (`processRefund`, both the
+ * lookup-first path and the lookup after a refused create) and the
+ * processing poll (#381).
+ *
+ *  - refunds Paystack reports `failed` are ignored (as before);
+ *  - none left: `none` (the engine may create one);
+ *  - exactly one left whose `amount` equals the row's `amount` AND whose
+ *    `currency` equals the row's `currency` (both REQUIRED: a missing one is
+ *    never taken as a match): `match`;
+ *  - anything else: `mismatch`, naming the first refund that is not exactly
+ *    ours (or, with two exact ones, the second: two live refunds of one charge
+ *    are never ours to pick between).
+ *
+ * @param row the refund row (`amount`, `currency`: minor units of that currency)
+ * @param refunds what Paystack reported for the charge's reference
+ */
+export function matchProviderRefund(
+  row: Pick<Transaction, "amount" | "currency">,
+  refunds: PaystackRefund[]
+): ProviderRefundMatch {
+  const live = refunds.filter((r) => r.status !== "failed");
+  if (live.length === 0) return { kind: "none" };
+  /** Exactly the row's money: both fields reported and equal. */
+  const exact = (r: PaystackRefund): boolean =>
+    typeof r.amount === "number" && r.amount === row.amount && typeof r.currency === "string" && r.currency === row.currency;
+  const notOurs = live.find((r) => !exact(r));
+  if (notOurs) return { kind: "mismatch", refund: notOurs };
+  if (live.length > 1) return { kind: "mismatch", refund: live[1] };
+  return { kind: "match", refund: live[0] };
+}
 
 /**
  * Our status for a Paystack refund status. Pure. `processed` is done;
@@ -553,6 +604,33 @@ function mirrorUpdate(
   return exceptionStatus ? { status: exceptionStatus, updatedAt: now } : null;
 }
 
+/**
+ * The client's copy for a payment refunded because the booking moved (issue
+ * #354 `paid_for_rescheduled_slot`; wording issue #413 C, decision
+ * 2026-11-21, plus the guest variant from the coordinator the same day).
+ * Shared by the verify 409 `CONSULTATION_RESCHEDULED` message and the
+ * refund notification, so the two can never drift apart. Pure.
+ *
+ * "we're refunding ... on its way", never "we've refunded": the refund may
+ * still be pending, or held for an admin (#392 design).
+ *
+ *  - app client: "... Please pay again for the new time.";
+ *  - guest (`bookedVia: "public_page"`): "... We've emailed you a link to
+ *    pay for the new time." (#391 sends that email);
+ *  - when the booking no longer awaits payment (paid through a fresh
+ *    checkout, or cancelled: #354 fix round) the last sentence is left out.
+ *
+ * @param opts.guestBooking the booking was made by a guest on a public page
+ * @param opts.bookingAwaitingPayment the booking still awaits payment (default true)
+ */
+export function rescheduledRefundMessage(opts: { guestBooking?: boolean; bookingAwaitingPayment?: boolean } = {}): string {
+  const base = "Your consultation moved, so we're refunding your payment in full. Your refund is on its way.";
+  if (opts.bookingAwaitingPayment === false) return base;
+  return opts.guestBooking
+    ? `${base} We've emailed you a link to pay for the new time.`
+    : `${base} Please pay again for the new time.`;
+}
+
 /** A money amount for notification copy, with its ISO code ("NGN 15,000.00"). */
 function describe(amount: Money): string {
   try {
@@ -587,7 +665,12 @@ export interface RefundContext {
   lockRef: FirebaseFirestore.DocumentReference;
   /** Whether the lock doc exists (for its counter). */
   lockData: Record<string, unknown> | null;
-  /** The agent's available balance in the fee's currency, read ONLY when the fee is released. */
+  /**
+   * The agent's available balance in the fee's currency, read whenever a
+   * refund may be written now (no row yet, or a HELD one). Issue #413 (F):
+   * also when the fee is still held, because the agent's Paystack-fee debit
+   * (written in the same commit) comes off the AVAILABLE balance too.
+   */
   availableInFeeCurrency: number | null;
 }
 
@@ -662,7 +745,11 @@ export async function readRefundContext(
   let availableInFeeCurrency: number | null = null;
   // A row HELD for an admin (#390) is still to be worked out: it may come
   // off the available balance when it goes ahead, so read it then too.
-  if (feeHold === "released" && (!existingRefund || existingRefund.refundHeldReason)) {
+  // Issue #413 (F): read whatever the hold says. A refund out of the hold
+  // does not touch the available balance, but the agent's fee debit written
+  // with it does, and its shortfall is recorded on the row. A CLOSED row
+  // (#413 B) is final: never worked out again, nothing to read for it.
+  if (!existingRefund || (existingRefund.refundHeldReason && existingRefund.status !== "closed")) {
     // Same query as the withdrawal check, read through this transaction.
     const agentRows = await tx.get(
       collections.transactions.where("agentId", "==", booking.agentId).orderBy("createdAt", "desc")
@@ -722,7 +809,8 @@ export function planRefund(
   if (!feeBorneBy) throw new Error(`planRefund: no feeBorneBy for reason ${input.reason}`);
   // A #395 "unknown" fee the lookup now knows: stored in this same commit.
   const resolveFee =
-    fee.paystackFeeStatus === "unknown"
+    // (#413 D: a set-aside row is resolved by a refund's lookup too.)
+    isUnresolvedFeeStatus(fee.paystackFeeStatus)
       ? resolvedFeeFields(fee, input.lookup, "refund", Timestamp.fromDate(input.at))
       : null;
   const effective = { ...fee, ...(resolveFee ?? {}) } as Transaction;
@@ -817,10 +905,7 @@ export function writeRefund(
   }
 
   // ---- The refund, under the fee rule ----
-  // #351: how far below zero this refund takes the available balance.
-  const available = ctx.availableInFeeCurrency ?? 0;
   const reversal = plan.agentReversalMinor;
-  const shortfall = fundedFrom === "available" ? Math.max(0, Math.min(reversal, reversal - available)) : 0;
   // The agent's fee debit: only when the plan needs one and this charge was
   // never debited (one per reference, across #354 and #390).
   const debit =
@@ -837,6 +922,15 @@ export function writeRefund(
   if (plan.debitMinor > 0 && ctx.debitExists) {
     console.warn(`[refund] ${ctx.refundRef!.id}: the charge's fee debit already exists; not written again`);
   }
+  // #351 / issue #413 (F): how far below zero THIS commit takes the agent's
+  // available balance: everything it takes off it, i.e. the reversal when
+  // the refund is paid from available, plus the fee debit when one is
+  // written now (from the hold too: a debit always comes off available).
+  const shortfall = refundShortfall({
+    availableMinor: ctx.availableInFeeCurrency ?? 0,
+    reversalMinor: fundedFrom === "available" ? reversal : 0,
+    debitMinor: debit ? debit.amount : 0,
+  });
   const built = transactionService.buildConsultationRefund(ctx.refundRef!.id, now, {
     fee,
     agentUserId: input.booking.agentId,
@@ -878,7 +972,7 @@ export function writeRefund(
   if (Object.keys(feeUpdate).length > 0) tx.update(collections.transactions.doc(fee.id), feeUpdate);
   if (shortfall > 0) {
     console.error(
-      `[refund] ${row.id}: refund of a released fee takes agent ${input.booking.agentId} ` +
+      `[refund] ${row.id}: refund (and any fee debit) takes agent ${input.booking.agentId} ` +
         `${shortfall} ${fee.currency} (minor units) below zero; carried forward, withdrawals blocked until positive`
     );
   }
@@ -900,9 +994,32 @@ export function writeRefund(
   return { row, debit };
 }
 
-/** The booking fields that mirror a refund row. */
-export function bookingRefundFields(row: Transaction): Pick<Consultation, "refundId" | "refundStatus"> {
-  return { refundId: row.id, refundStatus: row.status as RefundStatus };
+/**
+ * #351 / issue #413 (F): how far below zero one commit takes the agent's
+ * available balance X, given everything it takes off it (the reversal R
+ * when the refund is paid from available, 0 otherwise; the fee debit D
+ * written in the same commit, 0 when none is written). Pure:
+ *   shortfall = max(0, min(R + D, R + D - X))
+ * so X >= R + D gives 0, X <= 0 gives R + D (all of it is below zero), and in
+ * between only the part X does not cover.
+ */
+export function refundShortfall(input: { availableMinor: number; reversalMinor: number; debitMinor: number }): number {
+  const out = input.reversalMinor + input.debitMinor;
+  return Math.max(0, Math.min(out, out - input.availableMinor));
+}
+
+/**
+ * The booking fields that mirror a refund row. Issue #413 (portal design):
+ * a HELD row also mirrors its `refundHeldReason`, so the booking does not read
+ * as a plain failed refund. (A caller replacing a held row clears the
+ * booking's copy itself: see `adminRefund`.)
+ */
+export function bookingRefundFields(row: Transaction): Pick<Consultation, "refundId" | "refundStatus" | "refundHeldReason"> {
+  return {
+    refundId: row.id,
+    refundStatus: row.status as RefundStatus,
+    ...(row.refundHeldReason && row.status !== "closed" ? { refundHeldReason: row.refundHeldReason } : {}),
+  };
 }
 
 // ============================================
@@ -926,7 +1043,26 @@ export type AdminRefundOutcome =
   /** Issue #390: a client-borne fee >= the charge: nothing to give back, nothing written (409). */
   | { kind: "fee_not_less_than_amount" }
   /** Issue #390: Paystack could not be asked for the fee: nothing written (502). */
-  | { kind: "paystack_unavailable" };
+  | { kind: "paystack_unavailable" }
+  /** Issue #413 (B): the refund was closed by an admin with nothing to refund: final (409 REFUND_CLOSED). */
+  | { kind: "closed"; refund: Transaction };
+
+/**
+ * What closing a HELD client-cancel refund as `nothing_to_refund` did
+ * (issue #413 B, `closeHeldRefundNothingToRefund`).
+ */
+export type CloseHeldRefundOutcome =
+  /** Unknown booking, no settled fee, or no refund row for it: 404. */
+  | { kind: "not_found" }
+  /** Closed now. */
+  | { kind: "closed"; refund: Transaction; booking: Consultation }
+  /** Already closed: nothing written (a repeat, or two admins at once): 200. */
+  | { kind: "already_closed"; refund: Transaction }
+  /** Not a case the client is owed nothing on: 409 NOT_CLOSABLE, nothing written. */
+  | {
+      kind: "not_closable";
+      why: "agent_caused" | "not_held_fee_not_less_than_amount" | "fee_less_than_amount" | "not_consultation_refund";
+    };
 
 /** The admin reasons the endpoint takes, and the row reason each one is stored as. */
 export const ADMIN_REFUND_REASONS: Record<string, RefundReason> = {
@@ -1021,14 +1157,42 @@ class ConsultationRefundService {
     note?: string;
     /** Issue #390: who carries Paystack's fee (required for goodwill / other; agent for no-show). */
     feeBorneBy?: PaystackFeeBorneBy;
+    /**
+     * Issue #413 (portal design #357): retry mode. Only the EXISTING refund
+     * row with this id may be retried (failed -> pending, or a held one
+     * worked out again); no new refund is ever created in this mode (no row,
+     * or another id: not_found).
+     */
+    onlyRefundId?: string;
   }): Promise<AdminRefundOutcome> {
     const ref = collections.consultations.doc(input.consultationId);
 
-    // ---- Issue #390: ask Paystack for the fee first, outside any transaction ----
+    // ---- Reads outside any transaction (the Paystack call is slow) ----
     const pre = await ref.get();
     const preBooking = pre.exists ? (pre.data() as Consultation) : null;
     const preFee = preBooking && isPaidWithMoney(preBooking) ? await findFeeTransaction(preBooking) : null;
-    const { lookup, unavailable } = await lookUpRefundFee(preFee);
+    // Issue #413 (G): the charge's ONE possible refund row, read BEFORE
+    // Paystack is asked anything. A row that is live (pending, processing,
+    // completed) answers 409 ALREADY_REFUNDED with no Paystack call at all,
+    // so a Paystack outage can no longer turn it into a 502. The
+    // transaction below still re-checks (a row written in between is still
+    // refused there).
+    const preRefundSnap = preFee?.providerTransactionId
+      ? await collections.transactions.doc(refundDocId(preFee.providerTransactionId)).get()
+      : null;
+    const preRefund = preRefundSnap?.exists ? (preRefundSnap.data() as Transaction) : null;
+    if (preRefund && preRefund.status === "closed") return { kind: "closed", refund: preRefund };
+    if (preRefund && !preRefund.refundHeldReason && preRefund.status !== "failed") {
+      return { kind: "already_refunded", refund: preRefund };
+    }
+    // Retry mode names one row: it must be this booking's row.
+    if (input.onlyRefundId !== undefined && preRefund?.id !== input.onlyRefundId) return { kind: "not_found" };
+
+    // ---- Issue #390: ask Paystack for the fee, outside any transaction ----
+    // Only when a refund is to be WORKED OUT now (no row, or a held one). A
+    // failed live row is only sent again: its money is already decided.
+    const needsFee = !preRefund || !!preRefund.refundHeldReason;
+    const { lookup, unavailable } = needsFee ? await lookUpRefundFee(preFee) : { lookup: null, unavailable: false };
     if (unavailable) return { kind: "paystack_unavailable" };
 
     return chargeRuntime.runTransaction<AdminRefundOutcome>(async (tx) => {
@@ -1054,15 +1218,24 @@ class ConsultationRefundService {
 
       // ---- An existing row: retry a failed one, else refuse ----
       const existing = ctx.existingRefund;
+      // Retry mode: never a new refund, only the named row.
+      if (input.onlyRefundId !== undefined && existing?.id !== input.onlyRefundId) return { kind: "not_found" };
+      // Issue #413 (B): closed by an admin with nothing to refund: final.
+      if (existing && existing.status === "closed") return { kind: "closed", refund: existing };
       if (existing && !existing.refundHeldReason) {
         if (existing.status !== "failed") return { kind: "already_refunded", refund: existing };
         // The ONE backward move: an admin retry of a failed row (same row).
+        // Issue #413 (A): a row flagged for a Paystack refund that did not
+        // match loses the flag here; `processRefund` looks the charge up
+        // FIRST (the row has made a Paystack call before) and flags it again,
+        // creating nothing, while that refund is still live at Paystack.
         const retry = {
           status: "pending" as const,
           refundAttempts: 0,
           refundNextAttemptAt: now,
           refundLeaseUntil: FieldValue.delete(),
           refundFailedAt: FieldValue.delete(),
+          refundFailureReason: FieldValue.delete(),
           updatedAt: now,
         };
         tx.update(ctx.refundRef!, retry);
@@ -1070,6 +1243,7 @@ class ConsultationRefundService {
         const row = { ...existing, status: "pending", refundAttempts: 0, refundNextAttemptAt: now, updatedAt: now } as Transaction;
         delete row.refundLeaseUntil;
         delete row.refundFailedAt;
+        delete row.refundFailureReason;
         return {
           kind: "retried", refund: row, booking: { ...booking, refundStatus: "pending", updatedAt: now }, debit: null, fromHeld: false,
         };
@@ -1099,11 +1273,146 @@ class ConsultationRefundService {
         planned,
       });
       const fields = bookingRefundFields(written.row);
-      tx.update(ref, { ...fields, updatedAt: now });
+      // Issue #413: the booking's copy of a held reason goes when the held
+      // row is worked out (the live row has none).
+      tx.update(ref, { ...fields, ...(booking.refundHeldReason ? { refundHeldReason: FieldValue.delete() } : {}), updatedAt: now });
       const updated = { ...booking, ...fields, updatedAt: now };
+      delete updated.refundHeldReason;
       return existing
         ? { kind: "retried", refund: written.row, booking: updated, debit: written.debit, fromHeld: true }
         : { kind: "created", refund: written.row, booking: updated, debit: written.debit };
+    });
+  }
+
+  /**
+   * Issue #413 (portal design #357): `POST /consultations/:id/refund
+   * { refundId }` retries ANY failed refund of the booking by its row id, as
+   * stored. WHO may call it (admins only) is the controller's check.
+   *
+   *  - the row is the booking's OWN consultation refund (an agent or client
+   *    cancel, or an admin refund): it is retried by `adminRefund` in retry
+   *    mode, under its STORED reason and `feeBorneBy` (a failed row back to
+   *    pending, the same row; a HELD row re-reads Paystack's fee first, as
+   *    #390 does; a live row: 409; a closed one: 409);
+   *  - anything else (the refund of an unapplied payment, #354, or a held
+   *    one of those with no row yet): `adminRetryExceptionRefund`, as before.
+   * Idempotent: a second call finds the row no longer failed (409).
+   */
+  async adminRetryRefundById(input: {
+    consultationId: string;
+    refundId: string;
+    adminUid: string;
+  }): Promise<{ kind: "booking"; outcome: AdminRefundOutcome } | { kind: "exception"; outcome: ExceptionRetryOutcome }> {
+    const snap = await collections.transactions.doc(input.refundId).get();
+    const row = snap.exists ? (snap.data() as Transaction) : null;
+    if (row && row.type === "refund" && !row.paymentExceptionId && row.consultationId === input.consultationId) {
+      const outcome = await this.adminRefund({
+        consultationId: input.consultationId,
+        adminUid: input.adminUid,
+        // Only read for a NEW refund, which retry mode never writes: the
+        // stored reason and feeBorneBy of the row are what is used.
+        reason: row.reason ?? "admin_other",
+        feeBorneBy: row.feeBorneBy,
+        onlyRefundId: input.refundId,
+      });
+      return { kind: "booking", outcome };
+    }
+    return { kind: "exception", outcome: await this.adminRetryExceptionRefund(input) };
+  }
+
+  /**
+   * Close a HELD client-cancel refund as `nothing_to_refund` (issue #413 B,
+   * decision 2026-11-21), for `POST /consultations/:id/refund/close`. WHO may
+   * call it (admins only) is the controller's check. Follows
+   * `closeExceptionNothingToRefund`.
+   *
+   * A client cancel whose Paystack fee F is the whole charge A or more is
+   * planned `{ kind: "hold", reason: "fee_not_less_than_amount" }`: a held
+   * row (amount 0) and a FROZEN fee row, with no way out. Under the fee rule
+   * the client is owed A - F <= 0, i.e. nothing; the agent was credited
+   * nothing for that fee (#395: credit = A - F, null when F >= A); Seli's
+   * total for the booking is 0. Decision: nobody gets anything.
+   *
+   * One Firestore transaction re-reads the booking, its fee and its refund row:
+   *  - unknown booking, no settled fee, or no refund row: not_found (404);
+   *  - already closed: already_closed (200, nothing written);
+   *  - closable only when ALL hold: a consultation refund of this booking's
+   *    fee (not an unapplied payment's), HELD with reason
+   *    `fee_not_less_than_amount`, client-caused (`feeBorneBy: "client"`),
+   *    and the STORED Paystack fee on the fee row still gives that hold under
+   *    `planCancellationRefund` (no fresh lookup, no estimate). Otherwise
+   *    not_closable with the first rule that failed (409).
+   * Closing makes NO Paystack call and writes no money: the refund row keeps
+   * amount 0 and becomes `closed` (`refundClosedAt`, `refundClosedBy`,
+   * `refundClosedOutcome`), so it leaves the admin failed list; the fee row
+   * loses its freeze in the same commit; no fee debit is written; the
+   * booking mirrors `refundStatus: "closed"` and loses `refundHeldReason`.
+   */
+  async closeHeldRefundNothingToRefund(input: { consultationId: string; adminUid: string }): Promise<CloseHeldRefundOutcome> {
+    const ref = collections.consultations.doc(input.consultationId);
+    return chargeRuntime.runTransaction<CloseHeldRefundOutcome>(async (tx) => {
+      // ---- Reads (all before any write) ----
+      const snap = await tx.get(ref);
+      if (!snap.exists) return { kind: "not_found" };
+      const booking = snap.data() as Consultation;
+      const fee = await readFeeTransaction(tx, booking);
+      if (!fee) return { kind: "not_found" };
+      const refundRef = collections.transactions.doc(refundDocId(fee.providerTransactionId!));
+      const refundSnap = await tx.get(refundRef);
+      if (!refundSnap.exists) return { kind: "not_found" };
+      const row = refundSnap.data() as Transaction;
+
+      // ---- Idempotent: closed is final, a repeat writes nothing ----
+      if (row.status === "closed") return { kind: "already_closed", refund: row };
+
+      // ---- Only a client-caused hold where the client is owed nothing ----
+      if (row.type !== "refund" || row.paymentExceptionId || row.consultationId !== booking.id) {
+        return { kind: "not_closable", why: "not_consultation_refund" };
+      }
+      if (row.refundHeldReason !== "fee_not_less_than_amount" || row.status !== "failed") {
+        return { kind: "not_closable", why: "not_held_fee_not_less_than_amount" };
+      }
+      if (row.feeBorneBy !== "client") return { kind: "not_closable", why: "agent_caused" };
+      // The STORED fee only (no lookup, never estimated), re-checked by the rule.
+      const plan = planCancellationRefund({
+        amountMinor: fee.amount,
+        creditMinor: consultationFeeCredit(fee) ?? 0,
+        feeMinor: fee.paystackFeeMinor,
+        feeBorneBy: "client",
+        fundedFrom: "hold",
+      });
+      if (plan.kind !== "hold" || plan.reason !== "fee_not_less_than_amount") {
+        return { kind: "not_closable", why: "fee_less_than_amount" };
+      }
+
+      // ---- Close: no Paystack call, no money row ----
+      const now = Timestamp.fromDate(chargeRuntime.now());
+      const rowUpdate = {
+        status: "closed" as const,
+        refundClosedAt: now,
+        refundClosedBy: input.adminUid,
+        refundClosedOutcome: "nothing_to_refund" as const,
+        updatedAt: now,
+      };
+      tx.update(refundRef, rowUpdate);
+      // The fee is unfrozen in the SAME commit. It still credits nobody
+      // (F >= A: `consultationFeeCredit` is null), so nothing becomes
+      // available or withdrawable by this.
+      if (fee.feeHoldFrozenByRefundId) {
+        tx.update(collections.transactions.doc(fee.id), {
+          feeHoldFrozenByRefundId: FieldValue.delete(),
+          feeHoldFrozenAt: FieldValue.delete(),
+          updatedAt: now,
+        });
+      }
+      tx.update(ref, { refundStatus: "closed", refundHeldReason: FieldValue.delete(), updatedAt: now });
+      console.warn(
+        `[refund] held refund ${row.id} of ${booking.id} closed as nothing_to_refund by admin ${input.adminUid}: ` +
+          `Paystack fee ${fee.paystackFeeMinor} >= charge ${fee.amount} ${fee.currency}; no Paystack call, no money`
+      );
+      const updated = { ...booking, refundStatus: "closed" as const, updatedAt: now };
+      delete updated.refundHeldReason;
+      return { kind: "closed", refund: { ...row, ...rowUpdate }, booking: updated };
     });
   }
 
@@ -1398,11 +1707,23 @@ class ConsultationRefundService {
     const reference = row.providerTransactionId ?? "";
 
     // ---- 2 + 3. Look up / create ----
+    // Issue #413 (A): a refund Paystack holds for the charge is adopted only
+    // when it is EXACTLY this row's (amount and currency, `matchProviderRefund`).
+    // One that is not stops the run: nothing adopted, nothing created (a
+    // second refund on the same charge could pay the client twice), and the
+    // row is flagged for an admin.
     let found: PaystackRefund | null = null;
+    let mismatch: PaystackRefund | null = null;
     let lastError: string | null = null;
+    /** Look the charge up and sort the answer into `found` / `mismatch`. */
+    const lookUp = async (): Promise<void> => {
+      const match = await this.findLiveRefund(reference, row);
+      if (match.kind === "match") found = match.refund;
+      else if (match.kind === "mismatch") mismatch = match.refund;
+    };
     try {
-      if (claim.lookUpFirst) found = await this.findLiveRefund(reference);
-      if (!found) {
+      if (claim.lookUpFirst) await lookUp();
+      if (!found && !mismatch) {
         try {
           found = await paystackProvider.createRefund({
             reference,
@@ -1415,7 +1736,7 @@ class ConsultationRefundService {
           // reversed"): it may already hold a refund for this charge. Look it
           // up and adopt it; never call create again in this run.
           const refused = error instanceof PaystackApiError && !!error.httpStatus && error.httpStatus < 500;
-          if (refused) found = await this.findLiveRefund(reference);
+          if (refused) await lookUp();
         }
       }
     } catch (error) {
@@ -1423,6 +1744,7 @@ class ConsultationRefundService {
       lastError = (error as Error)?.message ?? String(error);
     }
 
+    if (mismatch) return this.flagProviderMismatch(refundId, mismatch);
     if (found) {
       const outcome = await this.advanceRefundStatus(refundId, refundStatusFromPaystack(found.status), {
         providerRefundId: found.id,
@@ -1433,11 +1755,72 @@ class ConsultationRefundService {
     return this.recordFailedAttempt(refundId, lastError ?? "Paystack returned no refund");
   }
 
-  /** A Paystack refund of this charge that did not fail, or null. */
-  private async findLiveRefund(reference: string): Promise<PaystackRefund | null> {
-    if (!reference) return null;
+  /**
+   * The Paystack refunds of this charge, compared with the row (issue #413
+   * A, `matchProviderRefund`). Throws when Paystack cannot be reached (the
+   * caller then tries again later).
+   */
+  private async findLiveRefund(reference: string, row: Pick<Transaction, "amount" | "currency">): Promise<ProviderRefundMatch> {
+    if (!reference) return { kind: "none" };
     const refunds = await paystackProvider.findRefundsForTransaction(reference);
-    return refunds.find((r) => r.status !== "failed") ?? null;
+    return matchProviderRefund(row, refunds);
+  }
+
+  /**
+   * Flag a row whose charge already has a Paystack refund that is not
+   * exactly ours (issue #413 A). One transaction; only a row still `pending`
+   * (this worker holds its lease) is touched:
+   *  - `failed`, `refundFailureReason: "provider_refund_mismatch"`, the
+   *    Paystack refund's id, amount and currency as found
+   *    (`providerRefundMismatch`); NO `providerRefundId` is written from it
+   *    and no status is taken from it;
+   *  - its booking (or #354 exception) mirrors `failed`;
+   *  - listed for admins by `GET /transactions?role=admin&type=refund&status=failed`.
+   * The client is told the refund is delayed ONCE per such Paystack refund:
+   * an admin retry that finds the same one again flags the row again but
+   * does not notify again. No money moves here: what the refund took off
+   * the agent stays as it was (frozen) until an admin decides.
+   */
+  private async flagProviderMismatch(refundId: string, refund: PaystackRefund): Promise<Transaction | null> {
+    const ref = collections.transactions.doc(refundId);
+    const result = await chargeRuntime.runTransaction<{ row: Transaction | null; notify: boolean }>(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return { row: null, notify: false };
+      const row = snap.data() as Transaction;
+      if (row.status !== "pending") return { row, notify: false };
+      const mirror = mirrorTarget(row);
+      const mirrorSnap = mirror ? await tx.get(mirror.ref) : null;
+      const now = Timestamp.fromDate(chargeRuntime.now());
+      const seen = {
+        id: refund.id,
+        amountMinor: typeof refund.amount === "number" ? refund.amount : null,
+        currency: typeof refund.currency === "string" ? refund.currency : null,
+        status: refund.status,
+        seenAt: now,
+      };
+      const update = {
+        status: "failed" as const,
+        refundFailureReason: "provider_refund_mismatch" as const,
+        providerRefundMismatch: seen,
+        refundFailedAt: now,
+        refundLastError: "provider_refund_mismatch",
+        refundLeaseUntil: FieldValue.delete(),
+        updatedAt: now,
+      };
+      tx.update(ref, update);
+      const mirrored = mirror ? mirrorUpdate(mirror.kind, "failed", now) : null;
+      if (mirror && mirrorSnap?.exists && mirrored) tx.update(mirror.ref, mirrored);
+      console.error(
+        `[refund] ${refundId}: Paystack refund ${refund.id} (${seen.amountMinor ?? "?"} ${seen.currency ?? "?"}, ` +
+          `${refund.status}) does not match the row (${row.amount} ${row.currency}); not adopted, none created, flagged for an admin`
+      );
+      const next = { ...row, ...update } as unknown as Transaction;
+      delete next.refundLeaseUntil;
+      // Told once per Paystack refund: a re-flag of the same one is silent.
+      return { row: next, notify: row.providerRefundMismatch?.id !== refund.id };
+    });
+    if (result.notify && result.row) await this.notifyDelayed(result.row);
+    return result.row;
   }
 
   /**
@@ -1702,19 +2085,24 @@ class ConsultationRefundService {
      * after the booking was paid through a fresh checkout, or cancelled, the
      * "pay again" sentence would be wrong. Defaults to true (the #354 copy).
      */
-    opts: { bookingAwaitingPayment?: boolean } = {}
+    opts: {
+      bookingAwaitingPayment?: boolean;
+      /** Issue #413 (C): the booking was made by a guest on a public page (emailed pay link). */
+      guestBooking?: boolean;
+    } = {}
   ): Promise<void> {
     const currency = row.currency as Money["currency"];
     const amount = describe({ amountMinor: row.amount, currency });
     const kept = Number(row.paystackFeeKeptMinor) || 0;
     const keptLine = kept > 0 ? ` The payment provider kept a processing fee of ${describe({ amountMinor: kept, currency })}.` : "";
-    const payAgain = opts.bookingAwaitingPayment !== false ? " Please pay again for the new time." : "";
+    // Issue #413 (C): "we're refunding", not "we've refunded": the refund
+    // may still be pending at Paystack, or held for an admin.
     const body =
       exception.reason === "paid_for_rescheduled_slot"
-        ? `Your consultation moved, so we've refunded your payment in full.${payAgain}`
+        ? rescheduledRefundMessage(opts)
         : exception.reason === "booking_not_payable"
-          ? `This consultation was no longer awaiting payment, so we've refunded ${amount}.${keptLine}`
-          : `This consultation was already paid for, so we've refunded your extra payment of ${amount}.${keptLine}`;
+          ? `This consultation was no longer awaiting payment, so we're refunding ${amount}. Your refund is on its way.${keptLine}`
+          : `This consultation was already paid for, so we're refunding your extra payment of ${amount}. Your refund is on its way.${keptLine}`;
     await notificationService
       .notifyUser({
         userId: row.userId,

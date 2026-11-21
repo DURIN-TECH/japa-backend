@@ -213,7 +213,7 @@ describe("client-caused refunds keep Paystack's fee", () => {
         (n) =>
           n.userId === client.uid &&
           n.body ===
-            "This consultation was no longer awaiting payment, so we've refunded NGN 8,850.00. " +
+            "This consultation was no longer awaiting payment, so we're refunding NGN 8,850.00. Your refund is on its way. " +
               "The payment provider kept a processing fee of NGN 150.00."
       ),
       JSON.stringify(notified)
@@ -244,7 +244,7 @@ describe("client-caused refunds keep Paystack's fee", () => {
       notified.some(
         (n) =>
           n.body ===
-          "This consultation was already paid for, so we've refunded your extra payment of NGN 8,372.50. " +
+          "This consultation was already paid for, so we're refunding your extra payment of NGN 8,372.50. Your refund is on its way. " +
             "The payment provider kept a processing fee of NGN 127.50."
       ),
       JSON.stringify(notified)
@@ -282,7 +282,7 @@ describe("agent-caused refunds debit the agent Paystack's fee", () => {
     const out = await verify(reference);
     assert.equal(out.status, 409);
     assert.equal(out.body.error, "CONSULTATION_RESCHEDULED");
-    assert.equal(out.body.message, "Your consultation moved, so we've refunded your payment in full. Please pay again for the new time.");
+    assert.equal(out.body.message, "Your consultation moved, so we're refunding your payment in full. Your refund is on its way. Please pay again for the new time.");
 
     // The client: everything back.
     const [row] = refundRows();
@@ -317,7 +317,7 @@ describe("agent-caused refunds debit the agent Paystack's fee", () => {
     assert.equal(revenueEffect(d as any), -FEE_KOBO, "analytics agree with stats");
 
     // Notices.
-    assert.ok(notified.some((n) => n.userId === client.uid && n.body.includes("refunded your payment in full")));
+    assert.ok(notified.some((n) => n.userId === client.uid && n.body.includes("refunding your payment in full")));
     assert.ok(
       notified.some(
         (n) =>

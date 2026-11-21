@@ -18,6 +18,8 @@ import { Timestamp } from "firebase-admin/firestore";
 import type { Transaction as FirestoreTransaction } from "firebase-admin/firestore";
 import type { ChargeSnapshot, CurrencyCode } from "../types/money";
 import {
+  // Issue #413 (K): the one copy of "what a refund takes off the agent".
+  agentReversalOf,
   CurrencyBuckets,
   // Issue #354: Paystack-fee debits from the agent.
   isAgentDebit,
@@ -51,6 +53,66 @@ export interface TransactionFilters {
   applicationId?: string;
   startDate?: string;
   endDate?: string;
+}
+
+// ============================================
+// Issue #413 (E): admin list filters that Firestore can serve
+// ============================================
+//
+// `getAllTransactions` pushes every equality filter into ONE Firestore query
+// ordered by `createdAt` desc (the date range is a range on `createdAt`
+// itself, so it needs no extra index field). Firestore answers such a query
+// only with a composite index on exactly those equality fields + createdAt;
+// without one it throws FAILED_PRECONDITION (a 500). The emulator does not
+// enforce indexes, so this list is the contract: every combination here has
+// its index in firestore.indexes.json (checked by
+// test/transactions/admin-filter-indexes.test.ts), and every other
+// combination is refused with 400 VALIDATION_ERROR before any read.
+
+/** The admin list's equality filters, in the order they are named in messages. */
+export const ADMIN_EQUALITY_FILTERS = ["type", "paystackFeeStatus", "status", "applicationId"] as const;
+/** One admin equality filter. */
+export type AdminEqualityFilter = (typeof ADMIN_EQUALITY_FILTERS)[number];
+
+/**
+ * Every set of equality filters the admin list serves (each with or without
+ * `startDate` / `endDate`). The empty set is the plain list (single-field
+ * `createdAt` index, automatic).
+ */
+export const ADMIN_SUPPORTED_FILTER_SETS: ReadonlyArray<ReadonlyArray<AdminEqualityFilter>> = [
+  [],
+  ["type"],
+  ["status"],
+  ["paystackFeeStatus"],
+  ["applicationId"],
+  ["type", "status"],
+  ["type", "paystackFeeStatus"],
+  ["paystackFeeStatus", "status"],
+  ["type", "paystackFeeStatus", "status"],
+  ["applicationId", "status"],
+];
+
+/**
+ * The equality filters an admin list request uses, in ADMIN_EQUALITY_FILTERS
+ * order. Pure.
+ */
+export function adminEqualityFiltersOf(filters: TransactionFilters | undefined): AdminEqualityFilter[] {
+  return ADMIN_EQUALITY_FILTERS.filter((key) => !!filters?.[key]);
+}
+
+/**
+ * Null when the admin list can serve `filters` with an index, else the 400
+ * message naming the unsupported combination (issue #413 E). Pure.
+ */
+export function unsupportedAdminFilterCombination(filters: TransactionFilters | undefined): string | null {
+  const used = adminEqualityFiltersOf(filters);
+  const supported = ADMIN_SUPPORTED_FILTER_SETS.some(
+    (set) => set.length === used.length && set.every((key) => used.includes(key))
+  );
+  if (supported) return null;
+  return `This combination of filters is not supported: ${used.join(" + ")}. ` +
+    `Supported: ${ADMIN_SUPPORTED_FILTER_SETS.filter((set) => set.length > 0).map((set) => set.join(" + ")).join("; ")} ` +
+    "(each with or without startDate / endDate).";
 }
 
 /**
@@ -100,7 +162,20 @@ export interface CurrencyTransactionStats {
    * `paystackFees`. A fee row whose fee is unknown is in none of the three.
    */
   paystackFees?: number;
-  /** Issue #395, admin stats only: `totalRevenue` before Paystack's fees (see `paystackFees`). */
+  /**
+   * Issue #413 (I), admin stats only: the charged amount A of every settled
+   * consultation fee whose Paystack fee is not known yet ("unknown",
+   * "set_aside", or bad stored data). Such a row credits nobody (it is in no
+   * balance and not in `totalRevenue`) but the client WAS charged A, so it
+   * belongs in gross.
+   */
+  unknownFeeAmount?: number;
+  /**
+   * Issue #395 / #413 (I), admin stats only: revenue before Paystack's fees.
+   * Every settled consultation fee counts its charged amount A here, whatever
+   * its Paystack-fee status (known, older full-credit rows, unknown or set
+   * aside): `grossRevenue = totalRevenue + paystackFees + unknownFeeAmount`.
+   */
   grossRevenue?: number;
 }
 
@@ -327,6 +402,10 @@ class TransactionService {
   async getAllTransactions(
     filters?: TransactionFilters
   ): Promise<Transaction[]> {
+    // Issue #413 (E): never send Firestore a query it has no index for (the
+    // controller answers 400 first; this is the second line).
+    const unsupported = unsupportedAdminFilterCombination(filters);
+    if (unsupported) throw new Error(`getAllTransactions: ${unsupported}`);
     let query = collections.transactions
       .orderBy("createdAt", "desc") as FirebaseFirestore.Query;
 
@@ -431,6 +510,9 @@ class TransactionService {
     // Issue #395: Paystack's fees taken off the consultation fees counted in
     // revenue (for the admin's gross / fee / net breakdown).
     const paystackFees = new CurrencyBuckets();
+    // Issue #413 (I): the charged amount of settled fees whose Paystack fee
+    // is not known yet (credited nowhere, but charged: part of gross).
+    const unknownFees = new CurrencyBuckets();
     // Distinct paying clients with a pending payment (count, not money).
     const pendingUserIds = new Set<string>();
 
@@ -500,7 +582,17 @@ class TransactionService {
         // Issue #395: the agent's credit is A - Paystack's fee. A fee that
         // cannot be worked out yet credits nothing, held or released.
         const credit = consultationFeeCredit(txn);
-        if (credit === null) continue;
+        if (credit === null) {
+          // Issue #413 (I): credited nobody, but the client paid A. A fee
+          // Paystack reported as the whole charge or more is Paystack's (it
+          // kept all of A); any other row's fee is still unknown.
+          if (txn.paystackFeeStatus === "fee_not_less_than_amount" && typeof txn.paystackFeeMinor === "number") {
+            paystackFees.add(currency, txn.amount);
+          } else {
+            unknownFees.add(currency, txn.amount);
+          }
+          continue;
+        }
         // The fee Paystack kept, for the admin breakdown (0 on a legacy row).
         paystackFees.add(currency, txn.amount - credit);
         const hold = feeHoldStatusAt(txn, at);
@@ -524,7 +616,12 @@ class TransactionService {
       heldBalance: held.get(currency),
       // Issue #395: admin stats show gross, Paystack's fee and net together.
       ...(opts.feeBreakdown
-        ? { paystackFees: paystackFees.get(currency), grossRevenue: revenue.get(currency) + paystackFees.get(currency) }
+        ? {
+          paystackFees: paystackFees.get(currency),
+          unknownFeeAmount: unknownFees.get(currency),
+          // Issue #413 (I): every settled consultation fee at its charge A.
+          grossRevenue: revenue.get(currency) + paystackFees.get(currency) + unknownFees.get(currency),
+        }
         : {}),
     }));
 
@@ -1285,12 +1382,10 @@ class TransactionService {
 }
 
 /**
- * Issue #390: what a refund row takes off the agent, in minor units of its
- * currency: `agentReversalMinor` when the row has a usable one (written
- * since #390), else `amount` (older rows, as before). Pure.
+ * Issue #390 / #413 (K): what a refund row takes off the agent. The rule
+ * lives in money/totals.ts (one copy, shared with `revenueEffect`); it is
+ * re-exported here so existing imports of it from this module keep working.
  */
-export function agentReversalOf(txn: Pick<Transaction, "amount"> & Partial<Pick<Transaction, "agentReversalMinor">>): number {
-  return isUsableAmount(txn.agentReversalMinor) ? txn.agentReversalMinor : txn.amount;
-}
+export { agentReversalOf } from "../money/totals";
 
 export const transactionService = new TransactionService();

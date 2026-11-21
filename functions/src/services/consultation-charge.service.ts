@@ -550,6 +550,13 @@ export interface UnappliedRefundWrite {
    * that was paid since (another checkout) or cancelled, it must not.
    */
   bookingAwaitingPayment: boolean;
+  /**
+   * Issue #413 (C, coordinator 2026-11-21): whether the booking was made by
+   * a GUEST on an agency's public page (`bookedVia: "public_page"`). A guest
+   * is emailed a link to pay for the new time (#391) instead of being told
+   * to pay again in the app.
+   */
+  guestBooking: boolean;
 }
 
 /**
@@ -579,7 +586,9 @@ export function writeUnappliedRefund(
     booking: Pick<
       Consultation,
       "userId" | "agentId" | "clientName" | "clientEmail" | "status" | "paymentStatus" | "supersededCheckouts"
-    >;
+    > &
+      // Issue #413 (C): a guest booking (public page) gets other copy.
+      Partial<Pick<Consultation, "bookedVia">>;
     now: Timestamp;
   }
 ): UnappliedRefundWrite {
@@ -603,6 +612,8 @@ export function writeUnappliedRefund(
   // only then do they need to "pay again for the new time").
   const bookingAwaitingPayment =
     input.booking.status === "pending_payment" && input.booking.paymentStatus !== "paid";
+  // Issue #413 (C): a guest booking is told about the emailed pay link.
+  const guestBooking = input.booking.bookedVia === "public_page";
 
   if (plan.kind === "hold") {
     const exception: ConsultationPaymentException = {
@@ -617,7 +628,7 @@ export function writeUnappliedRefund(
       `[consultation] refund of ${input.exception.reference} on ${input.exception.consultationId} HELD for an admin ` +
         `(${plan.reason}): no refund row, no Paystack call, no agent debit`
     );
-    return { exception, refund: null, debit: null, bookingAwaitingPayment };
+    return { exception, refund: null, debit: null, bookingAwaitingPayment, guestBooking };
   }
 
   const refund = transactionService.buildUnappliedPaymentRefund(reads.refundRef.id, now, {
@@ -673,7 +684,7 @@ export function writeUnappliedRefund(
       (plan.feeKeptMinor !== undefined ? `, Paystack fee ${plan.feeKeptMinor} kept from the client` : "") +
       (debit ? `, Paystack fee ${debit.amount} debited from agent ${debitAgentId} (${debit.id})` : "")
   );
-  return { exception, refund, debit, bookingAwaitingPayment };
+  return { exception, refund, debit, bookingAwaitingPayment, guestBooking };
 }
 
 /** What settling a successful Paystack payment did. */
@@ -1033,6 +1044,7 @@ export async function startUnappliedRefund(written: UnappliedRefundWrite): Promi
   }
   await consultationRefundService.notifyUnappliedRefund(row, written.exception, {
     bookingAwaitingPayment: written.bookingAwaitingPayment,
+    guestBooking: written.guestBooking,
   });
   if (written.debit) await consultationRefundService.notifyFeeDebit(written.debit);
   return row;

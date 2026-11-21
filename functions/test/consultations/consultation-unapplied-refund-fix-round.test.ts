@@ -88,7 +88,7 @@ const FEE_KOBO = 15_000;
 const agent2: AuthzSubject = { uid: "uid-agent2", role: ROLES.AGENT, agencyId: "agency-a" };
 
 /** The client's copy for an agent-caused refund while the booking still awaits payment. */
-const RESCHEDULED_COPY = "Your consultation moved, so we've refunded your payment in full. Please pay again for the new time.";
+const RESCHEDULED_COPY = "Your consultation moved, so we're refunding your payment in full. Your refund is on its way. Please pay again for the new time.";
 
 /** Seed an UNPAID, priced booking `id` with an open checkout locked for 30 minutes. */
 async function seedPending(id = "c1", charge: Money = FEE_NGN, over: Record<string, unknown> = {}): Promise<string> {
@@ -225,7 +225,7 @@ describe("a payment on a checkout retired by a reschedule is always agent-caused
     assert.equal(feeRows().length, 1, "only R2's fee Transaction");
     // The client is not asked to pay again: the booking is already paid.
     assert.ok(
-      notified.some((n) => n.userId === client.uid && n.body === "Your consultation moved, so we've refunded your payment in full."),
+      notified.some((n) => n.userId === client.uid && n.body === "Your consultation moved, so we're refunding your payment in full. Your refund is on its way."),
       JSON.stringify(notified)
     );
     assert.equal(notified.some((n) => n.body.includes("Please pay again")), false);

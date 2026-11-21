@@ -306,18 +306,20 @@ describe("fee unknown at settle", () => {
     });
   }
 
-  test("the scheduled job stores the fee once Paystack reports it; still missing it writes nothing", async () => {
+  // Issue #413 (D): "writes nothing" now means no FEE is stored; the job
+  // counts its answered lookup on the row (`paystackFeeLookupAttempts`).
+  test("the scheduled job stores the fee once Paystack reports it; still missing it stores no fee", async () => {
     const held = await bookAndPay("c1", { fees: undefined });
     const other = await bookAndPay("c2", { fees: null });
     // First run: Paystack still has nothing.
     let run = await paystackFeeService.resolveUnknownFees();
-    assert.deepEqual(run, { scanned: 2, resolved: 0, stillUnknown: 2, errors: 0 });
+    assert.deepEqual(run, { scanned: 2, resolved: 0, stillUnknown: 2, setAside: 0, errors: 0 });
     assert.equal(feeOf("c1")!.paystackFeeStatus, "unknown");
 
     // Paystack reports c1's fee (held: the meeting is still to come).
     paystackNowReports("c1", F);
     run = await paystackFeeService.resolveUnknownFees();
-    assert.deepEqual(run, { scanned: 2, resolved: 1, stillUnknown: 1, errors: 0 });
+    assert.deepEqual(run, { scanned: 2, resolved: 1, stillUnknown: 1, setAside: 0, errors: 0 });
     const stored = feeOf("c1")!;
     assert.equal(stored.id, held.id);
     assert.equal(stored.paystackFeeMinor, F);
@@ -330,7 +332,7 @@ describe("fee unknown at settle", () => {
     // A Paystack outage counts as still unknown, and does not stop the run.
     harness.failNextLookup = true;
     run = await paystackFeeService.resolveUnknownFees();
-    assert.deepEqual(run, { scanned: 1, resolved: 0, stillUnknown: 1, errors: 0 });
+    assert.deepEqual(run, { scanned: 1, resolved: 0, stillUnknown: 1, setAside: 0, errors: 0 });
   });
 
   test("a fee reported later in ANOTHER currency stays unknown", async () => {

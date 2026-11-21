@@ -179,6 +179,9 @@ const FULL_BOOKING: Required<Consultation> = {
   // Issue #317: the refund row's id is internal; its status is shown.
   refundId: "HIDDEN-refund-row-id",
   refundStatus: "processing",
+  // Issue #413: the booking's mirror of a HELD refund's reason (hidden: the
+  // client reads `refundStatus`, and the transaction's `refundState`).
+  refundHeldReason: "fee_not_less_than_amount",
 };
 
 /**
@@ -248,6 +251,8 @@ const HIDDEN_FIELDS: readonly (keyof Consultation)[] = [
   "cancelledBy",
   // Issue #317: the refund row id (`refund_<Paystack reference>`).
   "refundId",
+  // Issue #413: internal reason a refund is held for an admin.
+  "refundHeldReason",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */

@@ -274,7 +274,8 @@ describe("the refund matrix on a net-credited fee (A - F)", () => {
     const bal = await balanceOf(agent);
     assert.equal(bal.heldBalance, 0);
     assert.equal(bal.availableBalance, -F);
-    assert.equal(bal.totalRevenue, A - F - F, "while the refund is still processing at Paystack");
+    // Issue #413 (J): -F (the fee once) already while Paystack processes it, never A - 2F.
+    assert.equal(bal.totalRevenue, -F, "while the refund is still processing at Paystack");
     assert.equal(await seliNet(A), 0);
     assert.equal((await withdraw(1)).status, 400);
     await completeRefunds();

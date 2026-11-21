@@ -1,6 +1,11 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { transactionService, TransactionFilters } from "../services/transaction.service";
+import {
+  transactionService,
+  TransactionFilters,
+  // Issue #413 (E): admin filter combinations Firestore has an index for.
+  unsupportedAdminFilterCombination,
+} from "../services/transaction.service";
 import { toClientTransaction } from "../transactions/client-transaction";
 import { collections } from "../utils/firebase";
 import { Agent, PaystackFeeStatus, Transaction } from "../types";
@@ -21,7 +26,8 @@ const TRANSACTION_TYPES: Transaction["type"][] = [
 ];
 
 /** Issue #395: every Paystack-fee status, for the admin `paystackFeeStatus` list filter. */
-const PAYSTACK_FEE_STATUSES: PaystackFeeStatus[] = ["known", "unknown", "fee_not_less_than_amount"];
+// Issue #413 (D): "set_aside" lists the rows the lookup job gave up on.
+const PAYSTACK_FEE_STATUSES: PaystackFeeStatus[] = ["known", "unknown", "fee_not_less_than_amount", "set_aside"];
 
 export class TransactionController {
   /**
@@ -147,6 +153,15 @@ export class TransactionController {
         if (req.authz?.role !== ROLES.ADMIN) {
           sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
           return;
+        }
+        // Issue #413 (E): a filter combination with no Firestore index is a
+        // 400 naming it, never a 500 from the query.
+        {
+          const unsupported = unsupportedAdminFilterCombination(filters);
+          if (unsupported) {
+            sendError(res, "VALIDATION_ERROR", unsupported);
+            return;
+          }
         }
         transactions = await transactionService.getAllTransactions(filters);
         break;

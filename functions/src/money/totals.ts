@@ -139,6 +139,20 @@ export function unionCurrencies(...sets: CurrencyBuckets[]): CurrencyCode[] {
 //    out of the hold, at least the refund when paid from available. With
 //    the agent's fee debit, the agent's total per reference is A - F (kept),
 //    0 (client-caused refund) or -F (agent-caused), once everything settled.
+//  - (issue #413, J) a consultation refund paid out of the HOLD or from the
+//    AVAILABLE balance (`refundFundedFrom` "hold" / "available") counts from
+//    the moment it is WRITTEN, whatever its status (pending, processing,
+//    completed, or failed and awaiting an admin retry). The agent's
+//    Paystack-fee debit written in the same commit counts at once too
+//    (`completed`), so counting the refund only once settled showed
+//    A - 2F for a while on an agent-caused refund (credit A - F, debit F,
+//    refund not yet counted). Now the agent's and the admin's revenue for
+//    the booking read the final figure (-F, the fee once) at every step.
+//    This matches the balances: such a refund is already out of
+//    `availableBalance` (or the fee out of `heldBalance`) from the moment it
+//    is written. A HELD or CLOSED row (`refundHeldReason`, no
+//    `refundFundedFrom`, amount 0) still counts nowhere; an older refund
+//    kind (no `refundFundedFrom`) still counts once settled.
 
 /** Statuses at which a transaction's money has actually moved. */
 export const SETTLED_STATUSES: readonly TransactionStatus[] = ["completed", "released"];
@@ -164,7 +178,12 @@ export function revenueEffect(
   txn: Pick<Transaction, "type" | "status" | "amount"> &
     Partial<Pick<Transaction, "refundFundedFrom" | "paystackFeeStatus" | "paystackFeeMinor" | "agentReversalMinor">>
 ): number {
-  if (txn.type === "withdrawal" || !isSettled(txn)) return 0;
+  if (txn.type === "withdrawal") return 0;
+  // Issue #413 (J): a consultation refund out of the hold or from available
+  // is owed from the moment it is written (see the rule list above), so it
+  // takes what it takes off the AGENT at every status, settled or not.
+  if (isAgentFundedRefund(txn)) return -agentReversalOf(txn);
+  if (!isSettled(txn)) return 0;
   // Issue #354: the refund of a payment that never confirmed its booking
   // gives back money that was never counted as revenue (no fee Transaction
   // was written for it), so it subtracts nothing either.
@@ -179,11 +198,37 @@ export function revenueEffect(
   // Issue #390: a refund takes off revenue what it takes off the AGENT
   // (`agentReversalMinor`), which may differ from what the client got back
   // (Paystack keeps its fee). Older rows have none: `amount`, as before.
-  if (txn.type === "refund") {
-    const reversal = txn.agentReversalMinor;
-    return -(typeof reversal === "number" && Number.isSafeInteger(reversal) ? reversal : txn.amount);
-  }
+  if (txn.type === "refund") return -agentReversalOf(txn);
   return txn.amount;
+}
+
+/**
+ * Issue #413 (J): true for a consultation refund the AGENT funds: paid out
+ * of the held fee (`refundFundedFrom: "hold"`) or from the agent's available
+ * balance (`"available"`). Such a row is money the agent gives back from the
+ * moment it is written, whatever its status. Not a held / closed row (those
+ * have no `refundFundedFrom`), not the refund of an unapplied payment
+ * (`"unapplied_payment"`, neutral), not an older refund kind. Pure.
+ */
+export function isAgentFundedRefund(
+  txn: Pick<Transaction, "type"> & Partial<Pick<Transaction, "refundFundedFrom">>
+): boolean {
+  return txn.type === "refund" && (txn.refundFundedFrom === "hold" || txn.refundFundedFrom === "available");
+}
+
+/**
+ * Issue #390: what a refund row takes off the agent, in minor units of its
+ * currency: `agentReversalMinor` when the row has a usable one (a safe
+ * integer, written since #390), else `amount` (older rows, as before). Pure.
+ *
+ * Issue #413 (K): the ONE copy of this rule. It lived in
+ * services/transaction.service.ts too; that module now imports (and
+ * re-exports) this one, so revenue (`revenueEffect`, here) and the balances
+ * (`computeStats`) can never disagree on it.
+ */
+export function agentReversalOf(txn: Pick<Transaction, "amount"> & Partial<Pick<Transaction, "agentReversalMinor">>): number {
+  const reversal = txn.agentReversalMinor;
+  return typeof reversal === "number" && Number.isSafeInteger(reversal) ? reversal : txn.amount;
 }
 
 /**

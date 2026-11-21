@@ -133,7 +133,8 @@ const FULL_ROW: Required<Transaction> = {
     slotStartAt: Timestamp.fromMillis(1_755_555_555_000),
     releaseAt: Timestamp.fromMillis(1_755_555_556_000),
   },
-  refundOf: "HIDDEN-refunded-fee-id",
+  // Issue #413 (H): shown on REFUND rows (pairs a refund with its payment).
+  refundOf: "fee-row-full",
   // Issue #354: the exception an unapplied-payment refund gives back (= a Paystack reference). Hidden.
   paymentExceptionId: "HIDDEN-payment-exception-reference",
   reason: "admin_other",
@@ -168,6 +169,17 @@ const FULL_ROW: Required<Transaction> = {
   // Issue #390: the freeze of a fee whose refund is held (hidden).
   feeHoldFrozenByRefundId: "HIDDEN-frozen-by-refund-id",
   feeHoldFrozenAt: Timestamp.fromMillis(1_755_555_562_000),
+  // ---- Issue #413: refund matching, the held close, the fee lookup job (hidden) ----
+  refundFailureReason: "provider_refund_mismatch",
+  providerRefundMismatch: {
+    id: "HIDDEN-mismatched-refund-id", amountMinor: 97_979, currency: "NGN", status: "processed",
+    seenAt: Timestamp.fromMillis(1_755_555_563_000),
+  },
+  refundClosedAt: Timestamp.fromMillis(1_755_555_564_000),
+  refundClosedBy: "HIDDEN-closing-admin",
+  refundClosedOutcome: "nothing_to_refund",
+  paystackFeeLookupAttempts: 7,
+  paystackFeeSetAsideAt: Timestamp.fromMillis(1_755_555_565_000),
 };
 
 /**
@@ -176,8 +188,9 @@ const FULL_ROW: Required<Transaction> = {
  */
 const SHOWN_FROM: Partial<Record<keyof Transaction, readonly string[]>> = {
   id: ["id"],
-  type: ["type"],
-  status: ["status"],
+  // Issue #413 (H): a refund row's `type` + `status` give its `refundState`.
+  type: ["type", "refundState"],
+  status: ["status", "refundState"],
   description: ["description"],
   visaTypeName: ["visaTypeName"],
   amount: ["amount", "amountCharged"],
@@ -188,6 +201,8 @@ const SHOWN_FROM: Partial<Record<keyof Transaction, readonly string[]>> = {
   consultationId: ["consultationId"],
   createdAt: ["createdAt"],
   paystackPaidAt: ["paidAt"],
+  // Issue #413 (H): on refund rows only.
+  refundOf: ["refundOf"],
 };
 
 /**
@@ -224,7 +239,6 @@ const HIDDEN_FIELDS: readonly (keyof Transaction)[] = [
   // Issue #317: the fee hold and the refund engine's bookkeeping. A refund
   // row reaches the client as type "refund" + status + amount only.
   "feeHold",
-  "refundOf",
   // Issue #354: names a Paystack reference, so never shown to the client.
   "paymentExceptionId",
   "reason",
@@ -257,6 +271,15 @@ const HIDDEN_FIELDS: readonly (keyof Transaction)[] = [
   "refundId",
   "feeHoldFrozenByRefundId",
   "feeHoldFrozenAt",
+  // Issue #413: the engine's mismatch flag, the admin close and the fee
+  // lookup job's bookkeeping. The client reads a refund through `refundState`.
+  "refundFailureReason",
+  "providerRefundMismatch",
+  "refundClosedAt",
+  "refundClosedBy",
+  "refundClosedOutcome",
+  "paystackFeeLookupAttempts",
+  "paystackFeeSetAsideAt",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */
@@ -272,6 +295,9 @@ const HIDDEN_VALUES: readonly string[] = [
   "admin_other", // reason
   "hold", // fxRateSource
   "delivered+hidden-client@resend.dev",
+  "97979", // the mismatched Paystack refund's amount (#413)
+  "provider_refund_mismatch", // the engine's flag (#413)
+  "nothing_to_refund", // the admin close outcome (#413)
   "NOT-IN-THE-TYPE", // the undeclared fields seeded below
 ];
 
@@ -344,8 +370,17 @@ describe("client transaction allow-list (issue #329)", () => {
   test("the response keys are exactly the allow-list, each fed by a field marked as shown", () => {
     const fed = new Set(Object.values(SHOWN_FROM).flat());
     assert.deepEqual([...fed].sort(), [...CLIENT_TRANSACTION_FIELDS].sort());
-    // A fully populated row produces every allow-listed key and no other.
-    assert.deepEqual(Object.keys(toClientTransaction(FULL_ROW)).sort(), [...CLIENT_TRANSACTION_FIELDS].sort());
+    // A fully populated REFUND row produces every allow-listed key and no
+    // other (#413: `refundOf` / `refundState` exist on refund rows only).
+    assert.deepEqual(
+      Object.keys(toClientTransaction({ ...FULL_ROW, type: "refund" })).sort(),
+      [...CLIENT_TRANSACTION_FIELDS].sort()
+    );
+    // Any other row: the same keys without the two refund-only ones.
+    assert.deepEqual(
+      Object.keys(toClientTransaction(FULL_ROW)).sort(),
+      [...CLIENT_TRANSACTION_FIELDS].filter((k) => k !== "refundOf" && k !== "refundState").sort()
+    );
   });
 
   test("the mapper output is exactly the documented client view", () => {
@@ -370,7 +405,33 @@ describe("client transaction allow-list (issue #329)", () => {
 
   test("no hidden field, nested field, undeclared field or marker value is in the mapper output", () => {
     assertNoLeak(toClientTransaction({ ...FULL_ROW, ...UNDECLARED } as Transaction) as any);
+    // Issue #413 (H): nor in a refund row's, which carries refundOf + refundState.
+    assertNoLeak(toClientTransaction({ ...FULL_ROW, ...UNDECLARED, type: "refund" } as Transaction) as any);
   });
+
+  // ---- Issue #413 (H): how a client reads a refund row ----
+  const REFUND_STATES: Array<[string, Partial<Transaction>, string]> = [
+    ["pending", { status: "pending" }, "on_its_way"],
+    ["processing", { status: "processing" }, "on_its_way"],
+    ["completed", { status: "completed" }, "refunded"],
+    ["failed at Paystack", { status: "failed" }, "delayed"],
+    ["HELD for an admin (failed, amount 0)", { status: "failed", amount: 0, refundHeldReason: "fee_not_less_than_amount" }, "delayed"],
+    ["closed as nothing_to_refund", { status: "closed", amount: 0, refundHeldReason: "fee_not_less_than_amount" }, "none_due"],
+  ];
+  for (const [name, over, state] of REFUND_STATES) {
+    test(`a refund row ${name} reads as refundState "${state}", with refundOf, and nothing internal`, () => {
+      const out = toClientTransaction({
+        ...FULL_ROW, type: "refund", refundHeldReason: undefined, ...over,
+      } as unknown as Transaction) as any;
+      assert.equal(out.refundState, state);
+      assert.equal(out.refundOf, "fee-row-full");
+      assertNoLeak(out);
+      // Never the internal refund bookkeeping, whatever the state.
+      for (const key of ["refundHeldReason", "feeBorneBy", "agentReversalMinor", "balanceShortfallMinor", "paystackFeeMinor", "providerRefundId"]) {
+        assert.equal(key in out, false, key);
+      }
+    });
+  }
 
   test("a legacy row (no snapshot, no currency code) maps to NGN with no dollar price", () => {
     const legacy = {

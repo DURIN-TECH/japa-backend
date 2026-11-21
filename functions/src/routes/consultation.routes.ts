@@ -57,6 +57,14 @@ router.post("/:id/refund", verifyAuth, (req, res) =>
   consultationController.refundConsultation(req, res)
 );
 
+// Issue #413 (B): an admin closes the booking's HELD client-cancel refund as
+// nothing_to_refund (Paystack's stored fee >= the charge). No money moves.
+// 401 without a token (verifyAuth); the controller answers 403 for anyone
+// but an admin, before anything is read.
+router.post("/:id/refund/close", verifyAuth, (req, res) =>
+  consultationController.closeHeldRefund(req, res)
+);
+
 // Issue #354 fix round: an admin closes a client-caused unapplied-payment
 // exception as nothing_to_refund (Paystack's fee >= the charge). No money
 // moves. 401 without a token (verifyAuth); the controller answers 403 for

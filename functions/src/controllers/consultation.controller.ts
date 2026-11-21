@@ -57,6 +57,11 @@ import {
   isPaidWithMoney,
   MAX_REFUND_NOTE_LENGTH,
   refundSummary,
+  // Issue #413 (C): the one copy of the "your consultation moved" refund message.
+  rescheduledRefundMessage,
+  // Issue #413: the admin refund answers, and the agent view's processing fee.
+  AdminRefundOutcome,
+  feeForRefund,
 } from "../services/consultation-refund.service";
 import { chargeRuntime } from "../services/charge-checkout.service";
 import { clientChargeFields } from "../money/client-charge";
@@ -295,6 +300,20 @@ export class ConsultationController {
 
       // (#332) The shape depends on who is asking.
       const view = this.bookingFor(req, consultation);
+      // Issue #413 (portal design #357): the agent side's view of a paid
+      // booking names Paystack's processing fee when it is STORED on the fee
+      // Transaction (never looked up on a read, never estimated), so the
+      // agent's cancel confirm can say what an agent-caused refund costs
+      // them. Null while it is not stored.
+      if (seesFullConsultation({ uid: req.userId, role: req.authz?.role }, consultation) && isPaidWithMoney(consultation)) {
+        const fee = await findFeeTransaction(consultation);
+        const feeMinor = fee ? feeForRefund(fee, null) : undefined;
+        sendSuccess(res, {
+          ...view,
+          processingFee: fee && feeMinor !== undefined ? { amountMinor: feeMinor, currency: fee.currency } : null,
+        });
+        return;
+      }
       // (#317) The client view of a paid, not cancelled booking says what
       // cancelling would give back (the mobile cancel screen reads this and
       // never computes the rule itself). Server clock.
@@ -1211,6 +1230,70 @@ export class ConsultationController {
   }
 
   /**
+   * POST /consultations/:id/refund/close (issue #413 B, ADMIN only;
+   * decision 2026-11-21).
+   *
+   * Closes the booking's HELD client-cancel refund as `nothing_to_refund`
+   * when Paystack's STORED fee on the charge is the whole charge or more:
+   * the client is owed nothing, the agent's credit for that fee is 0, Seli's
+   * total is 0. No Paystack call, no money row; the refund row becomes
+   * `closed` (it leaves the admin failed list), the fee is unfrozen, and the
+   * booking mirrors `refundStatus: "closed"`.
+   *
+   *  - no token: 401 (verifyAuth, before this runs);
+   *  - not an admin: 403 FORBIDDEN, before anything is read;
+   *  - unknown booking, or no held refund row for it: 404;
+   *  - already closed: 200 with `alreadyClosed: true`, nothing written;
+   *  - agent-caused, not held for this reason, or the fee is no longer
+   *    >= the charge: 409 NOT_CLOSABLE with the reason, nothing written;
+   *  - otherwise: 200 with the refund summary and the booking.
+   */
+  async closeHeldRefund(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      // Admins only, checked first: no read for anyone else.
+      if (req.authz?.role !== ROLES.ADMIN) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      const outcome = await consultationRefundService.closeHeldRefundNothingToRefund({
+        consultationId: req.params.id,
+        adminUid: req.userId!,
+      });
+      if (outcome.kind === "not_found") {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (outcome.kind === "not_closable") {
+        /** One plain sentence per rule that failed. */
+        const messages: Record<typeof outcome.why, string> = {
+          agent_caused: "The agent side caused this refund, so the client is owed the payment in full: it cannot be closed.",
+          not_held_fee_not_less_than_amount:
+            "Only a refund held because the processing fee is not less than the amount charged can be closed.",
+          fee_less_than_amount: "The processing fee is now less than the amount charged, so the client is owed a refund.",
+          not_consultation_refund: "This refund is not the consultation's own refund, so it cannot be closed here.",
+        };
+        // The rule that failed is named in `data.reason` for the portal.
+        res.status(409).json({ success: false, error: "NOT_CLOSABLE", message: messages[outcome.why], data: { reason: outcome.why } });
+        return;
+      }
+      if (outcome.kind === "already_closed") {
+        sendSuccess(res, { refund: refundSummary(outcome.refund), refundId: outcome.refund.id, closed: true, alreadyClosed: true });
+        return;
+      }
+      sendSuccess(res, {
+        refund: refundSummary(outcome.refund),
+        refundId: outcome.refund.id,
+        closed: true,
+        alreadyClosed: false,
+        consultation: outcome.booking,
+      });
+    } catch (error) {
+      console.error("Error closing held consultation refund:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * POST /consultations/:id/refund  (issue #317, admins only)
    *
    * Body `{ reason: "agent_no_show" | "goodwill" | "other", note? }`; `note`
@@ -1268,10 +1351,21 @@ export class ConsultationController {
           sendError(res, "VALIDATION_ERROR", "refundId must be a refund id");
           return;
         }
-        const retry = await consultationRefundService.adminRetryExceptionRefund({
+        // Issue #413 (portal design #357): ANY failed refund of this
+        // booking may be retried by its id, as stored. The booking's own
+        // refund (agent / client cancel, admin) goes through the admin
+        // refund path in retry mode, under its stored reason and
+        // feeBorneBy; an unapplied payment's (#354) as before.
+        const byId = await consultationRefundService.adminRetryRefundById({
           consultationId: req.params.id,
           refundId: body.refundId,
+          adminUid: req.userId!,
         });
+        if (byId.kind === "booking") {
+          await this.sendAdminRefundOutcome(res, byId.outcome);
+          return;
+        }
+        const retry = byId.outcome;
         if (retry.kind === "not_found") {
           sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
           return;
@@ -1366,62 +1460,77 @@ export class ConsultationController {
         note,
         feeBorneBy,
       });
-      switch (outcome.kind) {
-      case "not_found":
-        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
-        return;
-      case "nothing_to_refund":
-        sendError(res, "NOTHING_TO_REFUND", outcome.message, 409);
-        return;
-      case "already_refunded":
-        sendError(res, "ALREADY_REFUNDED", "This consultation already has a refund.", 409);
-        return;
-      // ---- Issue #390: Paystack's fee could not be used: nothing written ----
-      case "fee_unknown":
-        sendError(
-          res,
-          "PAYSTACK_FEE_UNKNOWN",
-          "Paystack still reports no processing fee for this payment, so the refund cannot be worked out yet.",
-          409
-        );
-        return;
-      case "fee_not_less_than_amount":
-        sendError(
-          res,
-          "FEE_NOT_LESS_THAN_AMOUNT",
-          "Paystack's processing fee is not less than the amount charged, so there is nothing left to refund.",
-          409
-        );
-        return;
-      case "paystack_unavailable":
-        sendError(res, "PAYSTACK_ERROR", "Paystack could not be reached. Try again in a moment.", 502);
-        return;
-      case "retried":
-      case "created": {
-        // Send it to Paystack now; a failure leaves it for the retry job.
-        let refund = outcome.refund;
-        try {
-          refund = (await consultationRefundService.processRefund(refund.id)) ?? refund;
-        } catch (e) {
-          console.error(`[consultation] admin refund ${refund.id} could not be sent yet; the retry job will:`, e);
-        }
-        const booking = { ...outcome.booking, refundStatus: refund.status as typeof outcome.booking.refundStatus };
-        // (#390) A new refund, or a held one now worked out: both sides told
-        // (with the agent's Paystack-fee debit, when one was written).
-        if (outcome.kind === "created" || outcome.fromHeld) {
-          await consultationRefundService.notifyCreated(refund, booking, outcome.debit);
-        }
-        if (outcome.kind === "created") {
-          sendCreated(res, { refund: refundSummary(refund), refundId: refund.id, consultation: booking }, "Refund started");
-          return;
-        }
-        sendSuccess(res, { refund: refundSummary(refund), refundId: refund.id, retried: true, consultation: booking });
-        return;
-      }
-      }
+      await this.sendAdminRefundOutcome(res, outcome);
     } catch (error) {
       console.error("Error refunding consultation:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * Answer one admin refund outcome (issue #317 / #390), shared by
+   * `POST /consultations/:id/refund` with a reason and (issue #413) with
+   * `{ refundId }` naming the booking's own refund row. A new or retried row
+   * is sent to Paystack now; a failure leaves it for the retry job.
+   * Issue #413 (B): a refund an admin closed with nothing to refund is final:
+   * 409 REFUND_CLOSED.
+   */
+  private async sendAdminRefundOutcome(res: Response, outcome: AdminRefundOutcome): Promise<void> {
+    switch (outcome.kind) {
+    case "not_found":
+      sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+      return;
+    case "nothing_to_refund":
+      sendError(res, "NOTHING_TO_REFUND", outcome.message, 409);
+      return;
+    case "already_refunded":
+      sendError(res, "ALREADY_REFUNDED", "This consultation already has a refund.", 409);
+      return;
+    // ---- Issue #390: Paystack's fee could not be used: nothing written ----
+    case "fee_unknown":
+      sendError(
+        res,
+        "PAYSTACK_FEE_UNKNOWN",
+        "Paystack still reports no processing fee for this payment, so the refund cannot be worked out yet.",
+        409
+      );
+      return;
+    case "fee_not_less_than_amount":
+      sendError(
+        res,
+        "FEE_NOT_LESS_THAN_AMOUNT",
+        "Paystack's processing fee is not less than the amount charged, so there is nothing left to refund.",
+        409
+      );
+      return;
+    case "paystack_unavailable":
+      sendError(res, "PAYSTACK_ERROR", "Paystack could not be reached. Try again in a moment.", 502);
+      return;
+    case "closed":
+      sendError(res, "REFUND_CLOSED", "This refund was closed with nothing to refund, so there is nothing to retry.", 409);
+      return;
+    case "retried":
+    case "created": {
+      // Send it to Paystack now; a failure leaves it for the retry job.
+      let refund = outcome.refund;
+      try {
+        refund = (await consultationRefundService.processRefund(refund.id)) ?? refund;
+      } catch (e) {
+        console.error(`[consultation] admin refund ${refund.id} could not be sent yet; the retry job will:`, e);
+      }
+      const booking = { ...outcome.booking, refundStatus: refund.status as typeof outcome.booking.refundStatus };
+      // (#390) A new refund, or a held one now worked out: both sides told
+      // (with the agent's Paystack-fee debit, when one was written).
+      if (outcome.kind === "created" || outcome.fromHeld) {
+        await consultationRefundService.notifyCreated(refund, booking, outcome.debit);
+      }
+      if (outcome.kind === "created") {
+        sendCreated(res, { refund: refundSummary(refund), refundId: refund.id, consultation: booking }, "Refund started");
+        return;
+      }
+      sendSuccess(res, { refund: refundSummary(refund), refundId: refund.id, retried: true, consultation: booking });
+      return;
+    }
     }
   }
 
@@ -2159,7 +2268,9 @@ export class ConsultationController {
       res.status(409).json({
         success: false,
         error: "CONSULTATION_RESCHEDULED",
-        message: "Your consultation moved, so we've refunded your payment in full. Please pay again for the new time.",
+        // Issue #413 (C): shared copy ("we're refunding ... on its way"),
+        // with the guest variant for a public-page booking (emailed pay link).
+        message: rescheduledRefundMessage({ guestBooking: outcome.consultation.bookedVia === "public_page" }),
         data: { refundPending: true, consultation: bookingSummary(outcome.consultation) },
       });
       return;

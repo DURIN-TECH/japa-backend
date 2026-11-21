@@ -447,9 +447,13 @@ describe("the refund record", () => {
     assert.deepEqual(refund.amountCharged, FEE_NGN);
     assert.equal(refund.status, "processing");
     const json = JSON.stringify(refund);
-    for (const key of ["providerTransactionId", "providerRefundId", "refundOf", "agentId", "metadata", "refundFundedFrom"]) {
+    for (const key of ["providerTransactionId", "providerRefundId", "agentId", "metadata", "refundFundedFrom"]) {
       assert.ok(!json.includes(`"${key}":`), `no ${key}`);
     }
+    // Issue #413 (H): the refund names the payment row it gives back, and
+    // where it stands for the client.
+    assert.equal(refund.refundOf, feeOf("c1")!.id);
+    assert.equal(refund.refundState, "on_its_way");
     assert.ok(!json.includes(refOf("c1")), "no Paystack reference");
   });
 
@@ -471,12 +475,15 @@ describe("the refund record", () => {
 // ============================================
 
 describe("agent balance effect", () => {
-  test("revenue drops by the refund only once Paystack reports it processed", async () => {
+  // Issue #413 (J): a refund out of the hold counts from the moment it is
+  // written, so revenue reads the final figure at every status (it used to
+  // drop only once Paystack reported it processed).
+  test("revenue drops by the refund as soon as it is written, and stays there once processed", async () => {
     await bookAndPay("c1");
     await setStatus(agent, "cancelled", "c1");
-    assert.equal((await balanceOf(agent)).totalRevenue, 900_000, "processing: revenue unchanged");
+    assert.equal((await balanceOf(agent)).totalRevenue, 0, "processing: revenue already lower by the refund");
     await webhook(refundEvent("refund.processed", refOf("c1")));
-    assert.equal((await balanceOf(agent)).totalRevenue, 0, "completed: revenue lower by the refund");
+    assert.equal((await balanceOf(agent)).totalRevenue, 0, "completed: the same figure");
   });
 
   test("admin refund of a RELEASED fee takes the agent negative (carried forward); withdrawals blocked", async () => {

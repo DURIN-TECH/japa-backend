@@ -123,11 +123,22 @@ export function consultationFeeCredit(
 }
 
 /**
+ * Issue #413 (D): whether a fee status means "Paystack's fee is not known
+ * yet": "unknown", or "set_aside" (an unknown row the scheduled job stopped
+ * picking). Both count EXACTLY alike everywhere (credited nowhere, nothing
+ * guessed); only the job's query tells them apart. Pure.
+ */
+export function isUnresolvedFeeStatus(status: PaystackFeeStatus | undefined): boolean {
+  return status === "unknown" || status === "set_aside";
+}
+
+/**
  * Whether a consultation fee Transaction is waiting for Paystack's fee, so a
  * lookup (the scheduled job, an admin refresh, a refund) may store it
- * (issue #395). Only "unknown" rows: a known fee is never overwritten, and a
- * legacy row keeps counting as A. Pure.
+ * (issue #395). Only "unknown" rows (and, issue #413 D, "set_aside" ones,
+ * which the admin refresh and a refund still resolve): a known fee is never
+ * overwritten, and a legacy row keeps counting as A. Pure.
  */
 export function awaitsPaystackFee(txn: Pick<Transaction, "type"> & Partial<Pick<Transaction, "paystackFeeStatus">>): boolean {
-  return txn.type === "consultation_fee" && txn.paystackFeeStatus === "unknown";
+  return txn.type === "consultation_fee" && isUnresolvedFeeStatus(txn.paystackFeeStatus);
 }

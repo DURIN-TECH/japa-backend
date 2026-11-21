@@ -585,8 +585,14 @@ export const retryConsultationRefunds = functions
  * list them with
  * `GET /transactions?role=admin&type=consultation_fee&paystackFeeStatus=unknown`.
  *
- * Secrets: PAYSTACK_SECRET_KEY (transaction verify). Query: single-field
- * equality on `paystackFeeStatus` (automatic index).
+ * Issue #413 (D): oldest first, a batch per run; a row Paystack keeps
+ * answering without a fee is set aside after PAYSTACK_FEE_MAX_JOB_LOOKUPS
+ * lookups (`paystackFeeStatus=set_aside` in the admin list; the admin
+ * refresh still resolves it), so it cannot starve newer rows.
+ *
+ * Secrets: PAYSTACK_SECRET_KEY (transaction verify). Query: equality on
+ * `paystackFeeStatus` ordered by `createdAt` asc (composite index in
+ * firestore.indexes.json).
  */
 export const resolveConsultationPaystackFees = functions
   .runWith({ timeoutSeconds: 300, memory: "256MB", secrets: ["PAYSTACK_SECRET_KEY"] })
@@ -597,7 +603,7 @@ export const resolveConsultationPaystackFees = functions
       const r = await paystackFeeService.resolveUnknownFees();
       console.log(
         `Consultation Paystack fee lookup: ${r.scanned} unknown, ${r.resolved} resolved, ` +
-          `${r.stillUnknown} still unknown, ${r.errors} errors`
+          `${r.stillUnknown} still unknown, ${r.setAside} set aside, ${r.errors} errors`
       );
     } catch (error) {
       // Logged, never thrown: the next run tries again.

@@ -95,7 +95,7 @@ afterEach(() => {
 // ============================================
 
 /** The copy the client gets when their payment was for a slot that moved. */
-const RESCHEDULED_COPY = "Your consultation moved, so we've refunded your payment in full. Please pay again for the new time.";
+const RESCHEDULED_COPY = "Your consultation moved, so we're refunding your payment in full. Your refund is on its way. Please pay again for the new time.";
 
 /**
  * Seed an UNPAID, priced booking `id` with an OPEN checkout (`refOf(id)`,
@@ -191,6 +191,35 @@ describe("late payment after a reschedule (paid_for_rescheduled_slot)", () => {
     assert.equal(b.supersededCheckouts[0].chargedAmountMinor, FEE_NGN.amountMinor);
     assert.equal(b.scheduledTime, "11:00");
   });
+
+  // ---- Issue #413 (C): the copy says "we're refunding ... on its way" ----
+  // (decision 2026-11-21), with a guest variant (coordinator 2026-11-21): a
+  // public-page guest is emailed a pay link (#391) instead of "pay again".
+  const COPY_VARIANTS: Array<[string, Record<string, unknown>, string]> = [
+    ["an app client", { bookedVia: "client" }, RESCHEDULED_COPY],
+    [
+      "a guest (public page)",
+      { bookedVia: "public_page" },
+      "Your consultation moved, so we're refunding your payment in full. Your refund is on its way. " +
+        "We've emailed you a link to pay for the new time.",
+    ],
+  ];
+  for (const [who, over, copy] of COPY_VARIANTS) {
+    test(`#413 copy for ${who}: the verify 409 message and the refund notice say the same, in the new words`, async () => {
+      const reference = await seedPending("c1", FEE_NGN, over);
+      pastTheLock();
+      assert.equal((await reschedule()).status, 200);
+      paystackPaid(reference, "c1", FEE_NGN);
+      const out = await verify(reference);
+      assert.equal(out.status, 409, JSON.stringify(out.body));
+      assert.equal(out.body.error, "CONSULTATION_RESCHEDULED");
+      assert.equal(out.body.message, copy);
+      const toClient = notified.filter((n) => n.userId === client.uid).map((n) => n.body);
+      assert.ok(toClient.includes(copy), JSON.stringify(toClient));
+      // Never the old past-tense promise.
+      assert.ok(!JSON.stringify([out.body, toClient]).includes("we've refunded"));
+    });
+  }
 
   test("an exact payment on the retired checkout is refunded in full, never confirms; the client pays again at today's price", async () => {
     const reference = await seedPending();
@@ -636,7 +665,10 @@ describe("a confirmed payment is never refunded through these paths", () => {
     assert.equal(refundRows().length, 0);
   });
 
-  test("an admin retry naming a fee refund, or another booking's refund, is 404 and writes nothing", async () => {
+  // Issue #413 (portal design #357): `{ refundId }` now retries ANY failed
+  // refund of the booking, its own fee refund included (it used to 404);
+  // another booking's refund is still 404.
+  test("an admin retry naming this booking's fee refund retries it; another booking's refund is 404", async () => {
     // Booking c2: a real fee refund (failed), and an exception refund (failed).
     await bookAndPay("c2");
     for (let i = 0; i < MAX_REFUND_ATTEMPTS; i++) harness.refundBehaviour.push("network");
@@ -647,9 +679,13 @@ describe("a confirmed payment is never refunded through these paths", () => {
     }
     const feeRefund = refundRows()[0];
     assert.equal(feeRefund.status, "failed");
-    // Naming the FEE refund through the exception path: not such a refund.
-    const asException = await adminRefund(admin, { refundId: feeRefund.id }, "c2");
-    assert.equal(asException.status, 404);
+    // Naming the booking's own FEE refund: retried as stored, the same row.
+    const asOwn = await adminRefund(admin, { refundId: feeRefund.id }, "c2");
+    assert.equal(asOwn.status, 200, JSON.stringify(asOwn.body));
+    assert.equal(asOwn.body.data.retried, true);
+    assert.equal(asOwn.body.data.refundId, feeRefund.id);
+    // Naming it under ANOTHER booking: not that booking's refund.
+    assert.equal((await adminRefund(admin, { refundId: feeRefund.id }, "c1")).status, 404);
     // Booking c3's exception refund, named under booking c2: not this booking's.
     const reference = await seedPending("c3");
     harness.clock.advanceHours(1);
