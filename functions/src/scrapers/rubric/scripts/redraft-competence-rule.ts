@@ -174,6 +174,9 @@ export interface PlannedRequest {
   // Characters of prompt (system + user) when the request can be built offline; null when it
   // depends on an earlier answer (the check reads the re-drafted rule).
   chars: number | null;
+  // (#455) The output limit the request goes out with (generated tokens, thinking included): the
+  // production DRAFTING limit for the re-draft and the competence steps, the checker's own for the check.
+  maxOutputTokens: number;
 }
 
 /** What a run did, for tests and the summary line. */
@@ -458,26 +461,37 @@ export async function runCompetenceRule(snapshot: GuidanceSnapshotContent, versi
   summary.aspects = await aspectsToRepair(rule, opts.verdicts);
   const { competenceStepsRequest } = await import("../rubric-extraction.service");
   const { DEFAULT_PUBLISH_SETTINGS } = await import("../rubric-publish-settings");
-  const limits = { maxOutputTokens: DEFAULT_PUBLISH_SETTINGS.checkerMaxOutputTokensPerRequest, timeoutMs: DEFAULT_PUBLISH_SETTINGS.checkerRequestTimeoutMs };
+  const { DEFAULT_RUBRIC_SETTINGS } = await import("../rubric-settings");
+  // (#455, owner decision 2026-11-21) The two DRAFTING calls (the re-draft and the competence steps)
+  // go out with the output limit production drafting uses: `maxOutputTokensPerRequest` of the
+  // extraction settings, read from the same defaults production starts from (`DEFAULT_RUBRIC_SETTINGS`;
+  // this script never reads a project, so a stored override does not apply). The first #335 run sent
+  // them with the CHECKER's limit (`checkerMaxOutputTokensPerRequest`), far below what a call 2 answer
+  // can need (a dense call 2 was cut off at 16,000 in #112), and stopped at the competence call.
+  // The wall-clock timeout is unchanged (the checker's, which equals the drafting default today).
+  const limits = { maxOutputTokens: DEFAULT_RUBRIC_SETTINGS.maxOutputTokensPerRequest, timeoutMs: DEFAULT_PUBLISH_SETTINGS.checkerRequestTimeoutMs };
+  // The check keeps the checker's own limit: `RubricCheckerService` reads it from its publish settings
+  // (`loadSettings` below hands it `DEFAULT_PUBLISH_SETTINGS`), never from `limits`.
+  const checkOutputTokens = DEFAULT_PUBLISH_SETTINGS.checkerMaxOutputTokensPerRequest;
   const routeName = opts.routeName ?? "the route";
   const window = index.passageWindow(found, REPAIR_WINDOW_LINES_BEFORE, REPAIR_WINDOW_LINES_AFTER, REPAIR_WINDOW_CHARS);
   // The re-draft request is built inside `redraftRule` from the same window; its size is the window plus the prompt.
-  if (summary.aspects.length > 0) summary.planned.push({ step: "redraft", role: "judgement", chars: null });
+  if (summary.aspects.length > 0) summary.planned.push({ step: "redraft", role: "judgement", chars: null, maxOutputTokens: limits.maxOutputTokens });
   // The competence request, built from the rule as it stands (a live run builds it from the replacement).
   const comp = competenceStepsRequest(rule, index, routeName, limits, []);
   if ("notFound" in comp) return stop(`quote_${comp.notFound}`);
-  summary.planned.push({ step: "competence_steps", role: comp.request.role, chars: comp.request.system.length + comp.request.user.length });
+  summary.planned.push({ step: "competence_steps", role: comp.request.role, chars: comp.request.system.length + comp.request.user.length, maxOutputTokens: comp.request.maxOutputTokens });
   // The check: one batch for an ordinary rule (verification model), one per model for a protected one.
-  summary.planned.push({ step: "check", role: "verification", chars: null });
+  summary.planned.push({ step: "check", role: "verification", chars: null, maxOutputTokens: checkOutputTokens });
   const { isProtectedRule } = await import("../rubric-gates");
-  if (isProtectedRule(rule)) summary.planned.push({ step: "check", role: "judgement", chars: null });
+  if (isProtectedRule(rule)) summary.planned.push({ step: "check", role: "judgement", chars: null, maxOutputTokens: checkOutputTokens });
 
   opts.print(
     `${ruleId}: quote found; ${isBar(rule) ? "bar" : "ordinary"}${isProtectedRule(rule) ? " (protected)" : ""}, kind ${rule.kind}; ` +
     `stored list lines ${summary.listLinesStored} (verify against the snapshot: ${summary.storedListVerifies ? "yes" : "no"}); list lines read now ${summary.listLinesRead}; ` +
     `old letters ${opts.verdicts ?? "none"}; aspects a re-draft would be told: ${summary.aspects.length > 0 ? summary.aspects.join(",") : "none"}; window ${window.text.length} characters.`
   );
-  summary.planned.forEach((p, i) => opts.print(`  planned request ${i + 1}: ${p.step}, role ${p.role}${p.chars !== null ? `, ${p.chars} characters` : ""}`));
+  summary.planned.forEach((p, i) => opts.print(`  planned request ${i + 1}: ${p.step}, role ${p.role}${p.chars !== null ? `, ${p.chars} characters` : ""}, output limit ${p.maxOutputTokens} tokens`));
   opts.print(`  planned: ${summary.planned.length} request(s); at most ${summary.planned.length * 2} if every one needs its one retry for a transient provider failure.`);
 
   if (!opts.live) {

@@ -30,6 +30,8 @@ import { fromFirestoreRest, outFileProblem, placeQuestions, questionsTheBlockNee
 import { ReplayProvider, answersFileProblem, answersFileWriter, answersPathFor, outFileOf, readAnswersFile, type CompetenceRuleRunSummary, type SavedAnswer } from "../../../src/scrapers/rubric/scripts/redraft-competence-rule";
 import { statSync } from "node:fs";
 import type { LlmRequest, LlmResponse } from "../../../src/services/ai/llm-provider";
+import { DEFAULT_RUBRIC_SETTINGS } from "../../../src/scrapers/rubric/rubric-settings";
+import { DEFAULT_PUBLISH_SETTINGS } from "../../../src/scrapers/rubric/rubric-publish-settings";
 import { RUBRIC_INTAKE_SYSTEM_PROMPT } from "../../../src/scrapers/rubric/rubric-prompt";
 import { competenceProblems } from "../../../src/scrapers/rubric/rubric-competence";
 import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/types";
@@ -669,5 +671,29 @@ describe("(#455) --replay: the code steps on saved answers, 0 requests, the same
     assert.equal(file.replayed, true);
     // A replay keeps no answers file of its own.
     assert.equal(existsSync(answersPathFor(out)), false);
+  });
+});
+
+describe("(#455, owner decision 2026-11-21) the drafting calls use production drafting's output limit", () => {
+  const drafting = DEFAULT_RUBRIC_SETTINGS.maxOutputTokensPerRequest;
+  const checking = DEFAULT_PUBLISH_SETTINGS.checkerMaxOutputTokensPerRequest;
+
+  test("the two limits differ (otherwise this test proves nothing)", () => {
+    assert.notEqual(drafting, checking);
+  });
+
+  test("offline: the plan names each call's output limit, and prints it", async () => {
+    const lines: string[] = [];
+    const s = await runCompetenceRule(PAGE, version(), ID, { live: false, verdicts: "uyayaa", print: (l) => lines.push(l) });
+    assert.deepEqual(s.planned.map((p) => `${p.step}:${p.maxOutputTokens}`), [`redraft:${drafting}`, `competence_steps:${drafting}`, `check:${checking}`]);
+    assert.ok(lines.some((l) => l === `  planned request 1: redraft, role judgement, output limit ${drafting} tokens`), lines.join("\n"));
+    assert.ok(lines.some((l) => /^ {2}planned request 2: competence_steps, role judgement, \d+ characters, output limit (\d+) tokens$/.test(l) && l.endsWith(`limit ${drafting} tokens`)), lines.join("\n"));
+    assert.ok(lines.some((l) => l === `  planned request 3: check, role verification, output limit ${checking} tokens`), lines.join("\n"));
+  });
+
+  test("live: the re-draft and the competence call go out with the drafting limit, the check with the checker's", async () => {
+    const p = provider();
+    await runCompetenceRule(PAGE, version(), ID, { live: true, verdicts: "uyayaa", provider: p, ...quiet });
+    assert.deepEqual(p.requests.map((r) => `${r.role}:${r.maxOutputTokens}`), [`judgement:${drafting}`, `judgement:${drafting}`, `verification:${checking}`]);
   });
 });

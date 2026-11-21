@@ -373,3 +373,15 @@ describe("(#440 fix round 1) a rule whose list lines changed is asked again", ()
     assert.equal(rec?.reuse?.totals.rulesReused, 20);
   });
 });
+
+describe("(#455) only a live result may become version 2", () => {
+  test("an --out file written by a --replay run is refused (`replayed_result`), and builds nothing", async () => {
+    const out = await outFor();
+    // A replay re-runs the code steps on SAVED answers to diagnose a stop: never a result to keep.
+    assert.deepEqual(deriveVersion(version1(), { ...out, replayed: true }, PAGE), { ok: false, refusal: "replayed_result" });
+    assert.deepEqual(keptResultOf({ ...out, replayed: true }), { ok: false, code: "replayed_result" });
+    // The same file from the live run is still kept.
+    assert.equal(out.replayed, false);
+    assert.equal(keptResultOf(out).ok, true);
+  });
+});
