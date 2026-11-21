@@ -61,7 +61,11 @@ import {
   isAbandonedBooking,
   guestPayLinkStillLive,
   decideAbandonedCheckouts,
+  sweepRuntime,
+  SWEEP_TIME_BUDGET_MS,
 } from "../../src/services/consultation.service";
+import { PAYSTACK_LOOKUP_TIMEOUT_MS } from "../../src/services/billing/paystack.provider";
+import { notificationService } from "../../src/services/notification.service";
 import { backfillSweepLane, needsSweepLane } from "../../src/scripts/backfill-sweep-lane";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -344,10 +348,13 @@ describe("stuck bookings are counted and set aside (criterion 1)", () => {
     assert.equal(booking("rev").sweepReview.checkouts[0].settleOutcome, "mismatch");
     assert.equal(booking("nf").sweepReview.lastOutcome, "not_found");
     assert.equal(booking("fail").sweepReview.lastOutcome, "lookup_failed");
-    for (const id of ["rev", "nf", "fail"]) {
+    for (const id of ["rev", "nf"]) {
       assert.equal(booking(id).sweepReview.unresolvedRuns, 1, id);
       assert.equal(booking(id).status, "pending_payment", id);
     }
+    // Review round 1: Paystack not answering is recorded, but not counted.
+    assert.equal(booking("fail").sweepReview.unresolvedRuns, 0, "an outage is not counted");
+    assert.equal(booking("fail").status, "pending_payment");
     // A paid-but-unapplied reference is not final: asked again next run.
     harness.clock.advanceHours(1);
     const seen: string[] = [];
@@ -547,7 +554,7 @@ describe("bounded Paystack lookups (criterion 2)", () => {
     assert.equal(booking("b1").status, "cancelled");
   });
 
-  test("lookups stop at the first checkout still in progress", async () => {
+  test("lookups stop at the first checkout still in progress, but the live checkout is still asked (review round 1)", async () => {
     await seedPending("b1", 30, {
       transactionId: "live-1", supersededCheckouts: [entry("old-1"), entry("old-2"), entry("old-3")],
     });
@@ -557,10 +564,10 @@ describe("bounded Paystack lookups (criterion 2)", () => {
     paystackAbandoned("live-1", "b1");
     const seen = countLookups();
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(seen, ["old-1", "old-2"]);
+    assert.deepEqual(seen, ["old-1", "old-2", "live-1"], "old-3 is skipped; the live one never is");
     assert.equal(result.leftInProgress, 1);
     const states = Object.fromEntries(booking("b1").sweepReview.checkouts.map((r: any) => [r.reference, r.state]));
-    assert.deepEqual(states, { "old-1": "final_unpaid", "old-2": "in_progress" });
+    assert.deepEqual(states, { "old-1": "final_unpaid", "old-2": "in_progress", "live-1": "final_unpaid" });
   });
 
   test("the run cap: at most SWEEP_MAX_LOOKUPS_PER_RUN calls; the rest is left for the next run, not errors, not counted", async () => {
@@ -1160,4 +1167,149 @@ describe("wiring (issue #411)", () => {
     // Now swept.
     assert.equal((await consultationService.sweepAbandonedBookings()).cancelled, 1);
   });
+});
+
+// ============================================
+// Review round 1 (orchestrator notes 1, 2, 3 and 5)
+// ============================================
+
+describe("review round 1: the live checkout, outages, the time budget, the cancelled wording", () => {
+  /** Every notification of the test. */
+  const notified: Array<{ userId: string; type: string; body: string }> = [];
+  beforeEach(() => {
+    notified.length = 0;
+    (notificationService as any).notifyUser = async (n: { userId: string; type: string; body: string }) => {
+      notified.push({ userId: n.userId, type: n.type, body: n.body });
+    };
+    sweepRuntime.wallClockMs = realWallClock;
+  });
+  const realWallClock = sweepRuntime.wallClockMs;
+
+  test("note 1: a PAID live checkout is settled even while an older retired one is still in progress", async () => {
+    await seedPending("b1", 30, { transactionId: "live-1", supersededCheckouts: [entry("old-1")] });
+    paystackStatus("old-1", "b1", "ongoing");
+    paystackPaid("live-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" });
+    const seen = countLookups();
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(seen, ["old-1", "live-1"]);
+    assert.equal(result.settled, 1);
+    assert.equal(result.cancelled, 0);
+    assert.equal(booking("b1").status, "scheduled");
+    assert.equal(booking("b1").paymentStatus, "paid");
+    assert.equal(booking("b1").transactionId, "live-1");
+  });
+
+  test("note 1: the same while an older checkout keeps failing (Paystack's own 'not found')", async () => {
+    await seedPending("b1", 30, { transactionId: "live-1", supersededCheckouts: [entry("T999paystackmade")] });
+    harness.realisticNotFound = true;
+    paystackPaid("live-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" });
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.settled, 1);
+    assert.equal(booking("b1").status, "scheduled");
+  });
+
+  test("note 1: the admin check never stops early: a set-aside booking whose live checkout is paid is settled", async () => {
+    await seedPending("b1", 30, { transactionId: "live-1", supersededCheckouts: [entry("old-1"), entry("old-2")] });
+    paystackStatus("old-1", "b1", "ongoing");
+    paystackAbandoned("old-2", "b1");
+    paystackAbandoned("live-1", "b1");
+    await runSweeps(SWEEP_SET_ASIDE_AFTER_RUNS);
+    assert.equal(booking("b1").sweepSetAside, true);
+    // The client paid the live checkout after all (webhook missed).
+    paystackPaid("live-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" });
+    const seen = countLookups();
+    const out = await call("recheckSweepReview", ROLES.ADMIN, "b1");
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.equal(out.body.data.result, "settled");
+    assert.deepEqual(seen, ["old-1", "old-2", "live-1"], "every checkout asked, none skipped");
+    assert.equal(booking("b1").status, "scheduled");
+  });
+
+  test("note 2: a Paystack outage never sets bookings aside, however long it lasts", async () => {
+    await seedPending("b1", 30, { transactionId: "live-1" });
+    paystackStatus("live-1", "b1", "ongoing");
+    harness.onLookup = async () => {
+      throw new Error("PAYSTACK_ERROR: Invalid key (HTTP 401)");
+    };
+    await runSweeps(SWEEP_SET_ASIDE_AFTER_RUNS + 2);
+    const b = booking("b1");
+    assert.equal(b.sweepSetAside, false);
+    assert.equal(b.sweepReview.unresolvedRuns, 0);
+    assert.equal(b.sweepReview.lastOutcome, "lookup_failed", "the reason is still recorded");
+    assert.equal(b.status, "pending_payment");
+  });
+
+  test("note 3: once the run's time budget is spent, the remaining bookings wait for the next run (left, untouched)", async () => {
+    await seedPending("a", 32, { transactionId: "live-a" });
+    await seedPending("b", 31, { transactionId: "live-b" });
+    await seedPending("c", 30, { transactionId: "live-c" });
+    let ms = 0;
+    sweepRuntime.wallClockMs = () => ms;
+    // The first booking takes the whole budget.
+    harness.onLookup = async () => {
+      ms += SWEEP_TIME_BUDGET_MS;
+      return undefined;
+    };
+    for (const id of ["a", "b", "c"]) paystackAbandoned(`live-${id}`, id);
+    const before = JSON.stringify([booking("b"), booking("c")]);
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.leftForCap, 2);
+    assert.equal(JSON.stringify([booking("b"), booking("c")]), before);
+  });
+
+  test("note 3: Paystack lookups carry a 10 s timeout", () => {
+    assert.equal(PAYSTACK_LOOKUP_TIMEOUT_MS, 10_000);
+    const source = fs.readFileSync(path.join(__dirname, "../../src/services/billing/paystack.provider.ts"), "utf8");
+    // verify (twice: metadata and the refund list's id), the refund list, and fetch refund.
+    assert.equal((source.match(/timeout: PAYSTACK_LOOKUP_TIMEOUT_MS/g) ?? []).length, 4);
+  });
+
+  test("note 5: a retired checkout paid late, refunded and then cancelled in the same run: the client is told it was cancelled, never 'pay again'", async () => {
+    await recordedThenPaidRetired();
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.cancelled, 1);
+    const notices = notified.filter((n) => n.type === "consultation_refunded" && n.userId === "uid-client1");
+    assert.equal(notices.length, 1, "told once");
+    assert.equal(
+      notices[0].body,
+      "Your consultation was cancelled, so we're refunding your payment in full. Your refund is on its way."
+    );
+    assert.ok(!/pay again/i.test(notices[0].body));
+  });
+
+  test("note 5: the same through the admin sweep cancel", async () => {
+    await recordedThenPaidRetired();
+    const out = await call("cancelSweepReview", ROLES.ADMIN, "b1");
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.equal(booking("b1").status, "cancelled");
+    const notices = notified.filter((n) => n.type === "consultation_refunded" && n.userId === "uid-client1");
+    assert.equal(notices.length, 1);
+    assert.match(notices[0].body, /^Your consultation was cancelled/);
+  });
+
+  test("note 5: when the cancel does not happen (the booking changed), the usual wording is sent, once", async () => {
+    await recordedThenPaidRetired();
+    const real = (consultationService as any).cancelAbandonedBooking;
+    (consultationService as any).cancelAbandonedBooking = async () => false;
+    try {
+      await consultationService.sweepAbandonedBookings();
+    } finally {
+      (consultationService as any).cancelAbandonedBooking = real;
+    }
+    const notices = notified.filter((n) => n.type === "consultation_refunded" && n.userId === "uid-client1");
+    assert.equal(notices.length, 1);
+    assert.match(notices[0].body, /Please pay again for the new time\.$/);
+  });
+
+  /** A retired checkout recorded as final unpaid, then paid; the live one now final unpaid too. */
+  async function recordedThenPaidRetired(): Promise<void> {
+    await seedPending("b1", 30, { transactionId: "live-1", supersededCheckouts: [entry("old-1", true)] });
+    paystackAbandoned("old-1", "b1");
+    paystackStatus("live-1", "b1", "ongoing");
+    await consultationService.sweepAbandonedBookings();
+    paystackPaid("old-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" }, harness.clock.now(), { fees: 20_000 });
+    paystackAbandoned("live-1", "b1");
+    harness.clock.advanceHours(1);
+    notified.length = 0;
+  }
 });

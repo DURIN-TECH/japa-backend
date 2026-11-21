@@ -822,7 +822,8 @@ describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)"
     paystackAbandoned("live-1", "b1");
     paystackAbandoned("old-1", "b1");
     // Issue #411: the superseded one is asked first and fails: the lookups
-    // stop there (the live one is not asked).
+    // stop there, except for the live one (review round 1: always asked, so
+    // a paid live checkout is always settled).
     let calls = 0;
     harness.onLookup = async (reference: string) => {
       calls++;
@@ -833,7 +834,7 @@ describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)"
     const result = await consultationService.sweepAbandonedBookings();
     assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 0, errors: 1 }));
     assert.equal(withoutSweep("b1"), before);
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
   });
 
   test("a superseded reference of OURS that Paystack never saw counts as final unpaid", async () => {

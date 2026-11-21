@@ -22,9 +22,9 @@ import {
 // Issue #411: a "not found" lookup failure is recorded as such (fail closed).
 import { isPaystackReferenceNotFound } from "./billing/paystack.provider";
 // Issue #288: a booking the sweep finds PAID at Paystack is settled, not cancelled.
-import { settlePayment } from "./consultation-charge.service";
+import { sendDeferredRefundNotice, settlePayment } from "./consultation-charge.service";
 // Issue #397: the sweep reads settle outcomes to decide whether to cancel.
-import type { SettleOutcome } from "./consultation-charge.service";
+import type { DeferredRefundNotice, SettleOutcome } from "./consultation-charge.service";
 // Issue #317: the refund rule, the refund write (same transaction as the
 // cancel), and the fee hold.
 import {
@@ -1199,6 +1199,24 @@ export const SWEEP_SET_ASIDE_AFTER_RUNS = 24;
 export const SWEEP_MAX_LOOKUPS_PER_RUN = 300;
 
 /**
+ * Review round 1 (orchestrator note 3): how long ONE sweep run may work
+ * before it leaves the remaining bookings for the next run, in ms. The
+ * scheduled function times out at 540 s (index.ts); 420 s leaves room for
+ * the booking in hand (a few Paystack lookups of at most
+ * PAYSTACK_LOOKUP_TIMEOUT_MS each, its settles and its cancel).
+ */
+export const SWEEP_TIME_BUDGET_MS = 420_000;
+
+/**
+ * The sweep's REAL clock for its time budget (review round 1). Not the
+ * charge clock (`chargeRuntime.now`, which tests fix): a property bag so a
+ * test can make time pass. Production never changes it.
+ */
+export const sweepRuntime = {
+  wallClockMs: (): number => Date.now(),
+};
+
+/**
  * The order the sweep looks a booking's checkouts up in (issue #411):
  * every `supersededCheckouts` entry in stored order (oldest first), then
  * the live one (`transactionId`), duplicates dropped. Pure.
@@ -1340,6 +1358,12 @@ interface SweepLookups {
   stoppedBy: "in_progress" | "lookup_failed" | "not_found" | "cap" | null;
   /** Paystack calls made. */
   calls: number;
+  /**
+   * Review round 1: at least one lookup failed because Paystack could not
+   * answer (network, 5xx, timeout, auth; not "not found"). Not counted
+   * toward set-aside, the same as #413's fee job.
+   */
+  outage: boolean;
 }
 
 /**
@@ -1374,15 +1398,17 @@ async function lookUpSweepCheckouts(
   }
 ): Promise<SweepLookups> {
   const states = options.fresh ? new Map<string, SweepCheckoutState>() : recordedFinalStates(booking);
-  const out: SweepLookups = { states, lookups: new Map(), records: [], stoppedBy: null, calls: 0 };
-  for (const reference of options.references ?? sweepLookupOrder(booking)) {
-    // Final and recorded: costs nothing (criterion 2).
-    if (states.has(reference)) continue;
-    // The run's Paystack budget is spent: the rest waits for the next run.
-    if (options.budget && options.budget.remaining <= 0) {
-      out.stoppedBy = "cap";
-      break;
-    }
+  const out: SweepLookups = { states, lookups: new Map(), records: [], stoppedBy: null, calls: 0, outage: false };
+  const order = options.references ?? sweepLookupOrder(booking);
+  // Review round 1 (orchestrator, #411 note 1): the LIVE checkout is always
+  // asked about, even when an older one stopped the lookups (in progress,
+  // or a failed lookup): a paid live checkout must always be reachable and
+  // settled (a confirming settle is always safe; a later payment elsewhere
+  // is refunded by settlePayment). It is the last in `sweepLookupOrder`.
+  const live = booking.transactionId && order.includes(booking.transactionId) ? booking.transactionId : null;
+  /** Ask Paystack about one reference; false when the run's budget is spent. */
+  const ask = async (reference: string): Promise<boolean> => {
+    if (options.budget && options.budget.remaining <= 0) return false;
     if (options.budget) options.budget.remaining--;
     out.calls++;
     try {
@@ -1393,9 +1419,7 @@ async function lookUpSweepCheckouts(
         out.records.push({ reference, state: "final_unpaid", final: true, checkedAt: options.at });
       } else if (lookup.state === "in_progress") {
         out.records.push({ reference, state: "in_progress", final: false, checkedAt: options.at });
-        // Nothing can be cancelled this run: later checkouts need no call.
-        out.stoppedBy = "in_progress";
-        break;
+        out.stoppedBy ??= "in_progress";
       }
       // `paid`: recorded once settlePayment has answered (recordForSettle).
     } catch (error) {
@@ -1406,10 +1430,28 @@ async function lookUpSweepCheckouts(
       );
       states.set(reference, "lookup_failed");
       out.records.push({ reference, state: failure, final: false, checkedAt: options.at });
-      out.stoppedBy = failure;
+      out.stoppedBy ??= failure;
+      // Review round 1 (#411 note 2): Paystack could not answer (network,
+      // 5xx, timeout, 401). Such a run is not counted toward set-aside.
+      if (failure === "lookup_failed") out.outage = true;
+    }
+    return true;
+  };
+  for (const reference of order) {
+    // Final and recorded: costs nothing (criterion 2).
+    if (states.has(reference)) continue;
+    // A run (budget) stops at the first checkout that rules a cancel out;
+    // an admin (no budget) asks about every checkout (review round 1).
+    if (options.budget && out.stoppedBy !== null) break;
+    if (!(await ask(reference))) {
+      // The run's Paystack budget is spent: the rest waits for the next run.
+      out.stoppedBy = "cap";
       break;
     }
   }
+  // The live checkout, if the loop stopped before it (budget permitting).
+  // (Budget spent: it waits for the next run like any other reference.)
+  if (live && !states.has(live) && out.stoppedBy !== null && out.stoppedBy !== "cap") await ask(live);
   return out;
 }
 
@@ -1427,6 +1469,32 @@ function paidSupersededReferences(
   return sweepLookupOrder({ supersededCheckouts: c.supersededCheckouts }).filter(
     (reference) => superseded.has(reference) && states.get(reference) === "paid"
   );
+}
+
+/**
+ * The PAID references to settle while a booking is LEFT (a checkout in
+ * progress, or a failed lookup): review round 1 of #411 (orchestrator note
+ * 1), the LIVE checkout first when it is paid (a confirming settle is always
+ * safe, so the client's payment is applied however an older checkout
+ * stands), then every paid superseded one (`paidSupersededReferences`:
+ * refunded, or confirming at its own price). Pure.
+ */
+export function paidReferencesWhileLeft(
+  c: Pick<Consultation, "transactionId" | "supersededCheckouts">,
+  states: ReadonlyMap<string, SweepCheckoutState>
+): string[] {
+  const live = c.transactionId && states.get(c.transactionId) === "paid" ? [c.transactionId] : [];
+  return [...live, ...paidSupersededReferences(c, states).filter((r) => r !== c.transactionId)];
+}
+
+/**
+ * Send refund notices a sweep run (or an admin sweep cancel) deferred,
+ * once (issue #411, review round 1). `bookingCancelled`: the booking was
+ * cancelled right after the refunds, so a moved booking's refund says so
+ * and never asks the client to pay again. Never throws.
+ */
+async function sendNotices(notices: readonly DeferredRefundNotice[], bookingCancelled: boolean): Promise<void> {
+  for (const notice of notices) await sendDeferredRefundNotice(notice, { bookingCancelled });
 }
 
 /** The most set-aside bookings the admin list returns and the release pass reads. */
@@ -1565,6 +1633,8 @@ interface AdminSweepCheck {
   verdict: "paid" | "not_abandoned" | "clear" | "in_progress" | "review" | "lookup_failed" | "not_found";
   /** What to record for each reference looked up or settled. */
   records: SweepCheckoutRecord[];
+  /** Review round 1: refund notices the check's settles deferred (sent by the caller, once). */
+  notices: DeferredRefundNotice[];
 }
 
 /** What `adminRecheckSweepReview` did (issue #411). */
@@ -1921,8 +1991,18 @@ class ConsultationService {
 
     // Issue #411: the Paystack budget of THIS run, shared by every booking.
     const budget = { remaining: SWEEP_MAX_LOOKUPS_PER_RUN };
+    // Review round 1 (orchestrator note 3): the run's wall-clock budget.
+    // Bookings not reached in time wait for the next run (`leftForCap`), so
+    // the function never hits its own timeout mid-booking.
+    const startedAt = sweepRuntime.wallClockMs();
 
-    for (const doc of snapshot.docs) {
+    for (const [index, doc] of snapshot.docs.entries()) {
+      if (sweepRuntime.wallClockMs() - startedAt >= SWEEP_TIME_BUDGET_MS) {
+        const left = snapshot.size - index;
+        result.leftForCap += left;
+        console.warn(`[consultation sweep] time budget spent; ${left} booking(s) left for the next run`);
+        break;
+      }
       const booking = doc.data() as Consultation;
       // The fingerprint of the booking as the lookups saw it (issue #411).
       const observedFingerprint = sweepFingerprint(booking);
@@ -2000,6 +2080,7 @@ class ConsultationService {
           if (!again.states.has(reference)) look.states.delete(reference);
         }
         look.stoppedBy = again.stoppedBy;
+        look.outage ||= again.outage;
         decision = decideAbandonedCheckouts(booking, look.states, chargeRuntime.now());
       }
     }
@@ -2013,8 +2094,10 @@ class ConsultationService {
       // ---- 3a. Left, but paid retired checkouts are settled (issue #411) ----
       // The cancel waits; the client's money does not. Only settlePayment
       // writes (exception + refund, or a confirmation at that checkout's price).
-      const paidRetired = paidSupersededReferences(booking, look.states);
-      const settled = await this.settleSweepReferences(id, paidRetired, look, stamp);
+      // Review round 1: a paid LIVE checkout is settled here too (it
+      // confirms the booking), whatever an older checkout is doing.
+      const paidWhileLeft = paidReferencesWhileLeft(booking, look.states);
+      const settled = await this.settleSweepReferences(id, paidWhileLeft, look, stamp);
       const records = [...look.records, ...settled.records];
       if (settled.outcomes.some((o) => isConfirmingSweepSettle(o))) {
         // A superseded re-priced checkout confirmed the booking: it is paid.
@@ -2045,12 +2128,18 @@ class ConsultationService {
         result.leftInProgress++;
         unresolved = "in_progress";
       }
-      const counted = await this.recordSweepRun(id, observedFingerprint, records, unresolved);
+      // Review round 1 (orchestrator note 2): a run in which Paystack could
+      // not answer (network, 5xx, timeout, a mis-set key) is NOT counted
+      // toward set-aside, the same as #413's fee job: an outage must never
+      // set every abandoned booking aside. What was learned is still recorded.
+      const counted = await this.recordSweepRun(id, observedFingerprint, records, unresolved, { notCounted: look.outage });
       if (counted.setAside) result.setAside++;
       return;
     }
 
     let records = look.records;
+    // Refund notices deferred by this run's settles (sent once, below).
+    let notices: DeferredRefundNotice[] = [];
     if (decision.kind === "settle") {
       // ---- 4. Paid somewhere: settle each paid reference ----
       // ONLY through settlePayment: it re-reads the booking in its own
@@ -2058,17 +2147,23 @@ class ConsultationService {
       // records an exception with its refund and fee debit (#354:
       // one refund per reference, one debit per reference). The sweep
       // itself never writes money rows.
-      const settled = await this.settleSweepReferences(id, decision.references, look, stamp);
+      // Review round 1 (orchestrator note 5): the refund notices of these
+      // settles wait until the run knows whether it cancels the booking, so
+      // a refund followed by the cancel never says "pay again".
+      const settled = await this.settleSweepReferences(id, decision.references, look, stamp, { deferNotices: true });
+      notices = settled.notices;
       records = [...records, ...settled.records];
       const after = decideAfterSweepSettles(settled.outcomes);
       if (after === "settled") {
         result.settled++;
+        await sendNotices(notices, false);
         await this.recordSweepRun(id, observedFingerprint, records, null);
         return;
       }
       if (after === "review") {
         // Paid money that could not be applied: a human must look.
         result.skipped++;
+        await sendNotices(notices, false);
         const counted = await this.recordSweepRun(id, observedFingerprint, records, "review");
         if (counted.setAside) result.setAside++;
         return;
@@ -2078,12 +2173,23 @@ class ConsultationService {
     }
 
     // ---- 5. Cancel, re-checked in its own transaction ----
-    if (await this.cancelAbandonedBooking(id, booking.transactionId ?? null, supersededReferencesOf(booking))) {
+    let cancelled: boolean;
+    try {
+      cancelled = await this.cancelAbandonedBooking(id, booking.transactionId ?? null, supersededReferencesOf(booking));
+    } catch (error) {
+      // The refunds happened: the client is still told (usual wording).
+      await sendNotices(notices, false);
+      throw error;
+    }
+    if (cancelled) {
       result.cancelled++;
+      // The client is told about the refund with the cancelled wording.
+      await sendNotices(notices, true);
       return;
     }
     // Changed meanwhile (paid, re-priced, moved): keep what was learned.
     result.skipped++;
+    await sendNotices(notices, false);
     if (records.length > 0) await this.recordSweepRun(id, observedFingerprint, records, null);
   }
 
@@ -2099,15 +2205,19 @@ class ConsultationService {
     id: string,
     references: readonly string[],
     look: SweepLookups,
-    stamp: Timestamp
-  ): Promise<{ outcomes: Array<SettleOutcome | null>; records: SweepCheckoutRecord[] }> {
+    stamp: Timestamp,
+    /** Review round 1: keep the refund notices for the caller (it may cancel next). */
+    options: { deferNotices?: boolean } = {}
+  ): Promise<{ outcomes: Array<SettleOutcome | null>; records: SweepCheckoutRecord[]; notices: DeferredRefundNotice[] }> {
     const outcomes: Array<SettleOutcome | null> = [];
     const records: SweepCheckoutRecord[] = [];
+    const notices: DeferredRefundNotice[] = [];
     for (const reference of references) {
       const reported = look.lookups.get(reference)?.result;
       // A paid state always comes with Paystack's answer; never settle without it.
       if (!reported) continue;
-      const outcome = await settlePayment(id, reference, reported);
+      const outcome = await settlePayment(id, reference, reported, { deferRefundNotice: options.deferNotices === true });
+      if (outcome && "deferredNotice" in outcome && outcome.deferredNotice) notices.push(outcome.deferredNotice);
       outcomes.push(outcome);
       records.push(recordForSettle(reference, outcome, stamp));
       if (!isConfirmingSweepSettle(outcome) && !isHandledSweepSettle(outcome)) {
@@ -2119,7 +2229,7 @@ class ConsultationService {
         );
       }
     }
-    return { outcomes, records };
+    return { outcomes, records, notices };
   }
 
   /**
@@ -2142,7 +2252,13 @@ class ConsultationService {
     id: string,
     observedFingerprint: string,
     records: readonly SweepCheckoutRecord[],
-    unresolved: SweepUnresolvedOutcome | null
+    unresolved: SweepUnresolvedOutcome | null,
+    /**
+     * Review round 1 (orchestrator note 2): `notCounted` records why the run
+     * left the booking (`lastOutcome`, `lastRunAt`) WITHOUT adding to the
+     * counter: Paystack could not answer, which must never set it aside.
+     */
+    opts: { notCounted?: boolean } = {}
   ): Promise<{ setAside: boolean }> {
     const ref = collections.consultations.doc(id);
     return chargeRuntime.runTransaction<{ setAside: boolean }>(async (tx) => {
@@ -2152,7 +2268,7 @@ class ConsultationService {
       if (fresh.status !== "pending_payment" || fresh.paymentStatus === "paid") return { setAside: false };
       const freshFingerprint = sweepFingerprint(fresh);
       const stored = fresh.sweepReview;
-      const count = nextSweepCount(stored, observedFingerprint, freshFingerprint, unresolved);
+      const count = nextSweepCount(stored, observedFingerprint, freshFingerprint, opts.notCounted ? null : unresolved);
       const stamp = Timestamp.fromDate(chargeRuntime.now());
       const counted = unresolved !== null && freshFingerprint === observedFingerprint;
       const setAsideNow = count.setAside && fresh.sweepSetAside !== true;
@@ -2297,14 +2413,24 @@ class ConsultationService {
    * references through `settlePayment` only; paid retired ones also while
    * another checkout is in progress). Writes only through `settlePayment`.
    */
-  private async adminSweepCheck(id: string, booking: Consultation): Promise<AdminSweepCheck> {
+  private async adminSweepCheck(
+    id: string,
+    booking: Consultation,
+    /** Review round 1: the admin CANCEL defers the refund notices until it knows whether it cancelled. */
+    options: { deferNotices?: boolean } = {}
+  ): Promise<AdminSweepCheck> {
     const stamp = Timestamp.fromDate(chargeRuntime.now());
+    // No budget: every checkout is asked about, none skipped (review round 1).
     const look = await lookUpSweepCheckouts(booking, { budget: null, fresh: true, at: stamp, logId: `${id} (admin)` });
     const decision = decideAbandonedCheckouts(booking, look.states, chargeRuntime.now());
     let toSettle: string[] = [];
     if (decision.kind === "settle") toSettle = decision.references;
-    else if (decision.kind === "leave" || decision.kind === "error") toSettle = paidSupersededReferences(booking, look.states);
-    const settled = await this.settleSweepReferences(id, toSettle, look, stamp);
+    // Review round 1: a paid LIVE checkout is settled too, whatever an older one is doing.
+    else if (decision.kind === "leave" || decision.kind === "error") toSettle = paidReferencesWhileLeft(booking, look.states);
+    const settled = await this.settleSweepReferences(id, toSettle, look, stamp, {
+      // Only a settle that may be followed by the cancel waits.
+      deferNotices: options.deferNotices === true && decision.kind === "settle",
+    });
     const after = decision.kind === "settle" ? decideAfterSweepSettles(settled.outcomes) : null;
     const confirmed = settled.outcomes.some((o) => isConfirmingSweepSettle(o));
     let verdict: AdminSweepCheck["verdict"];
@@ -2314,7 +2440,7 @@ class ConsultationService {
     else if (decision.kind === "leave") verdict = "in_progress";
     else if (after === "review") verdict = "review";
     else verdict = "clear"; // cancel, or settle -> cancel: nothing in flight, nothing unapplied
-    return { verdict, records: [...look.records, ...settled.records] };
+    return { verdict, records: [...look.records, ...settled.records], notices: settled.notices };
   }
 
   /**
@@ -2397,19 +2523,29 @@ class ConsultationService {
     if (booking.status !== "pending_payment" || booking.paymentStatus === "paid") return { kind: "not_pending" };
     if (!isAbandonedBooking(booking, chargeRuntime.now())) return { kind: "grace_running" };
     const observedFingerprint = sweepFingerprint(booking);
-    const check = await this.adminSweepCheck(id, booking);
+    const check = await this.adminSweepCheck(id, booking, { deferNotices: true });
+    // Review round 1: refund notices deferred by the check are sent once,
+    // with the cancelled wording only when this call did cancel.
+    if (check.verdict !== "clear") await sendNotices(check.notices, false);
     if (check.verdict === "paid") return { kind: "paid" };
     if (check.verdict === "not_abandoned") return { kind: "grace_running" };
     if (check.verdict !== "clear") {
       await this.recordSweepRun(id, observedFingerprint, check.records, null);
       return { kind: "blocked", reason: check.verdict };
     }
-    const cancelled = await this.cancelAbandonedBooking(
-      id,
-      booking.transactionId ?? null,
-      supersededReferencesOf(booking),
-      { cancelledBy: adminUid, allowSetAside: true }
-    );
+    let cancelled: boolean;
+    try {
+      cancelled = await this.cancelAbandonedBooking(
+        id,
+        booking.transactionId ?? null,
+        supersededReferencesOf(booking),
+        { cancelledBy: adminUid, allowSetAside: true }
+      );
+    } catch (error) {
+      await sendNotices(check.notices, false);
+      throw error;
+    }
+    await sendNotices(check.notices, cancelled);
     if (!cancelled) {
       // Changed between the checks and the write (a payment, a re-price, a move).
       await this.recordSweepRun(id, observedFingerprint, check.records, null);
