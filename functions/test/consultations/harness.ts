@@ -182,6 +182,8 @@ export async function useHarness(): Promise<void> {
     "withdrawalLocks", "bankAccounts",
     // Issue #382: the client's "the meeting didn't happen" reports.
     "noShowReports",
+    // Issue #391: guest pay-again links (settlePayment uses them up).
+    "consultationPayLinks",
   ]) {
     firebase.collections[name] = fakeCollection(name);
   }
