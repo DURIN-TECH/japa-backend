@@ -18,9 +18,16 @@
  *    action) but every gate still applies, so with the independent check and the
  *    question plan not yet built (parts B and C) a real run HOLDS the draft.
  *  - Never prints source text: ids, counts, reason codes and titles only.
+ *  - (#440) `--reuse-check-from <n>` lets the independent check reuse the answers
+ *    it gave on version n for the rules (and the intention-to-stay reading) that
+ *    did not change, so only changed rules are sent to the model. The check
+ *    allows it for ONE rulebook and ONE pair of versions (services/rubric-check-reuse-pair.ts)
+ *    and holds anything else before any spend. It skips no gate and no check:
+ *    a reused answer is judged exactly like a fresh one. The check's run record
+ *    says, per rule, what was reused and what was asked.
  *
  * Run (from functions/):
- *   npm run publish:rubric -- --project <id> --route <routeKey> --version <n> [--dry-run] [--skip-checker] [--allow-production]
+ *   npm run publish:rubric -- --project <id> --route <routeKey> --version <n> [--dry-run] [--skip-checker] [--reuse-check-from <n>] [--allow-production]
  * (#233) `<routeKey>` is any rulebook key: `{countryCode}_{visaTypeId}` for a
  * country, or `{authorityId}_{sharedRouteId}` for a bloc / treaty's shared
  * layer. Every gate is the same for both.
@@ -57,6 +64,8 @@ async function main(): Promise<void> {
   const versionText = flag(args, "version") ?? "";
   const dryRun = args.includes("--dry-run");
   const skipChecker = args.includes("--skip-checker");
+  // (#440) The earlier version whose check answers may be reused (absent = the check as always).
+  const reuseText = flag(args, "reuse-check-from");
 
   // ---- the project must be explicit, and never production by accident ----
   if (!project) {
@@ -81,6 +90,15 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
+  // (#440) A version number below the one published, or nothing at all (a bare flag is a mistake, not "no reuse").
+  const reuseFrom = reuseText === undefined ? undefined : Number(reuseText);
+  if (args.includes("--reuse-check-from") || args.some((a) => a.startsWith("--reuse-check-from="))) {
+    if (reuseFrom === undefined || !Number.isInteger(reuseFrom) || reuseFrom < 1 || reuseFrom >= version) {
+      console.error(`${TAG} --reuse-check-from needs an earlier version number (below ${version}).`);
+      process.exitCode = 1;
+      return;
+    }
+  }
 
   // Set BEFORE Firebase Admin loads, so it can never initialise against an unintended default.
   process.env.GCLOUD_PROJECT = project;
@@ -95,7 +113,8 @@ async function main(): Promise<void> {
   const { rubricAutoPublishService } = await import("../../../services/rubric-auto-publish.service");
   const { rubricVersionId } = await import("../../../services/rubric-review.service");
   const { checkerStatusLine } = await import("../rubric-gates");
-  const report = await rubricAutoPublishService.runOnDraft(rubricVersionId(route, version), { dryRun, skipChecker, trigger: "script" });
+  if (reuseFrom !== undefined) console.log(`${TAG} the check may reuse its answers from version ${reuseFrom} for unchanged rules (allowed for one rulebook and version pair only).`);
+  const report = await rubricAutoPublishService.runOnDraft(rubricVersionId(route, version), { dryRun, skipChecker, trigger: "script", ...(reuseFrom !== undefined ? { reuseCheckFromVersion: reuseFrom } : {}) });
 
   // ---- the report (the same fields the admin endpoint returns) ----
   console.log(`\n${TAG} outcome: ${report.outcome}${report.dryRun ? " (report only)" : ""}`);

@@ -1477,3 +1477,28 @@ describe("auto-publish: the layer check of an own layer (#233 P4b)", () => {
     assert.equal(detail.layerCheck.status, "checked");
   });
 });
+
+// ============================================
+// (#440) The "reuse from version n" choice is passed to the check, and only when named
+// ============================================
+
+describe("(#440) auto-publish: reuseCheckFromVersion reaches the check as the stored base version", () => {
+  test("named on the call: the check gets the base version as stored; not named (the trigger, the endpoint): nothing", async () => {
+    const hash = await seedA();
+    settings();
+    // Version 2 over the same page (written with force here only to set up the fixture).
+    await write(bigDraft(hash, { extra: { createdAt: Timestamp.fromMillis(REVIEW_T0 + 86_400_000) } }));
+    const checker = checkerStub({ ok: false, reasonCodes: ["checker_unavailable:provider"] });
+    const svc = service({ checker, planner: plannerStub() });
+    await quiet(() => svc.runOnDraft(ID_A2, { trigger: "script", reuseCheckFromVersion: 1 }));
+    assert.equal(checker.calls.length, 1);
+    const reuse = checker.calls[0].reuseFrom;
+    assert.equal(reuse?.version, 1);
+    assert.equal(reuse?.rubric.version, 1);
+    assert.equal(reuse?.rubric.criteria.length, 10, "the base as stored, unfiltered");
+    // A run without the choice (the admin endpoint's call) passes no reuse.
+    await quiet(() => svc.runOnDraft(ID_A2, { trigger: "admin_endpoint" }));
+    assert.equal(checker.calls.length, 2);
+    assert.equal(checker.calls[1].reuseFrom, undefined);
+  });
+});

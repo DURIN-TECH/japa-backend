@@ -1,7 +1,9 @@
 import { Timestamp, type DocumentSnapshot, type Transaction } from "firebase-admin/firestore";
 import { collections, db, subcollections } from "../../utils/firebase";
-import type { RubricExtractionRun, RubricHead, VisaRubric } from "../../types/rubric";
+import { createHash } from "node:crypto";
+import { RUBRIC_REVIEW_FIELDS, type RubricExtractionRun, type RubricHead, type VisaRubric } from "../../types/rubric";
 import { applyExclusions } from "./rubric-exclusions";
+import { stableJson } from "./rubric-repair";
 import { keyFieldsOf, rulebookPartsOf, rulebookTargetOf, withKeyParts } from "./rubric-key";
 import { INLINE_MAX_BYTES, VersionPartsError, VersionTooLargeError, assembleVersion, firestoreDocSize, isPartitioned, layoutVersion, type VersionPartDoc } from "./rubric-version-storage";
 
@@ -99,6 +101,33 @@ export type PendingWriteResult =
   // background job had already finished, was cancelled, or lost its lease):
   // nothing was written. `version` is the head's newest version.
   | { written: false; version: number; guarded: true };
+
+/**
+ * (#440) What `writeDerivedPendingVersion` did: written, or a code word saying
+ * why nothing was written (see the method for each code).
+ */
+export type DerivedWriteResult =
+  | { written: true; version: number }
+  | { written: false; version: number; reason: "already_exists" | "no_head" | "head_moved" | "base_missing" | "base_not_approved" | "base_changed" | "source_set_differs" };
+
+/**
+ * (#440) Review fields with no initial value that a derived draft must not carry (every entry of
+ * `RUBRIC_REVIEW_FIELDS` except the seven that `writePendingVersion` already checks for their initial value).
+ */
+const DERIVED_INITIAL_FIELDS: readonly string[] = ["reviewStatus", "intentPolarity", "reviewedBy", "reviewedAt", "rejectReason", "revision", "supersededAt"];
+const DERIVED_ABSENT_FIELDS: readonly string[] = RUBRIC_REVIEW_FIELDS.filter((f) => !DERIVED_INITIAL_FIELDS.includes(f));
+
+/**
+ * (#440) A fingerprint of a version's CONTENT, the part a derived version is built from: rules, questions,
+ * document items, the competence block, the polarity proposal, the sources and their hash. Review fields,
+ * timestamps and provenance strings are not in it, so the same content read from a Firestore REST export (ISO
+ * dates) and from the store (Timestamps) gives the same fingerprint. Key order does not matter (`stableJson`).
+ */
+export function derivedBaseFingerprint(v: Pick<VisaRubric, "criteria" | "intakeQuestions" | "evidenceItems" | "intentPolarityProposal" | "sourceSnapshots" | "sourceSetHash" | "competence" | "routeKey">): string {
+  return createHash("sha256")
+    .update(stableJson({ routeKey: v.routeKey, criteria: v.criteria ?? [], intakeQuestions: v.intakeQuestions ?? [], evidenceItems: v.evidenceItems ?? [], intentPolarityProposal: v.intentPolarityProposal ?? null, sourceSnapshots: v.sourceSnapshots ?? [], sourceSetHash: v.sourceSetHash, competence: v.competence ?? null }))
+    .digest("hex");
+}
 
 /**
  * (#216) A caller's own writes joined to the version write, in the SAME
@@ -390,6 +419,135 @@ export class RubricStore {
         };
         tx.set(headRef, newHead as unknown as Record<string, unknown>);
       }
+      return { written: true as const, version };
+    });
+  }
+
+  /**
+   * (#440) Store a version DERIVED from an approved one (version n + 1 built
+   * from version n plus a one-rule result, scripts/derive-version-from-one-rule.ts)
+   * as a pending draft. A narrow sibling of `writePendingVersion`, which it
+   * does not change and does not call.
+   *
+   * WHY ITS OWN WRITE: a derived version cites the SAME snapshots as its base,
+   * so its `sourceSetHash` equals the head's `latestSourceSetHash` and
+   * `writePendingVersion`'s hash gate (correctly) says "already have a version
+   * for these snapshots". Turning that gate off (`force`) would let ANY caller
+   * write a version over the same sources; this method instead allows exactly
+   * one shape of write and refuses everything else:
+   *
+   *  - the draft passes the same governance guard as an extracted one
+   *    (`pending_review`, every review field at its initial value, no
+   *    exclusions) AND carries no other approval field (`questionPlan`,
+   *    recorded replacements, the layer check): a derived version is
+   *    decided again from scratch by the publish pipeline;
+   *  - inside ONE transaction: the head exists, its `approvedVersion` AND its
+   *    `latestVersion` are both `baseVersion` (nothing newer was drafted, the
+   *    base is what the app serves), the base version document exists and is
+   *    itself `approved`, and the draft's `sourceSetHash` is the head's
+   *    `latestSourceSetHash` (this path is ONLY for a version over the same
+   *    sources; new sources go through extraction and the hash gate);
+   *  - the new version is `baseVersion + 1`; its document must not exist
+   *    (immutability: created once, never overwritten);
+   *  - the head's `latestVersion` (and `updatedAt`) move; `approvedVersion`,
+   *    `latestSourceSetHash` and `sourceIds` are not in the update at all, so
+   *    the app keeps serving the base version.
+   *
+   * IDEMPOTENT: when the head already says `latestVersion === baseVersion + 1`
+   * (an earlier run of the same tool), nothing is written and the result says
+   * the version already exists. Running the tool twice never creates n + 2.
+   *
+   * @returns `{ written: true, version }`, or `{ written: false, version, reason }`
+   *   with `reason` a code word: `already_exists` (a version n + 1 is already the latest; its content is not compared with this draft),
+   *   `no_head`, `head_moved` (the head no longer points at the base for both
+   *   approved and latest), `base_missing`, `base_not_approved`,
+   *   `base_changed` (the stored base's content is not the one the caller built
+   *   from: `opts.baseFingerprint`, see `derivedBaseFingerprint`),
+   *   `source_set_differs`.
+   * @throws RubricStoreError("not_pending") for a draft that is not pristine,
+   *   ("route_mismatch") for key fields that disagree, ("version_exists") when
+   *   the n + 1 document exists although the head does not point at it,
+   *   ("too_large") when even split storage cannot hold it.
+   */
+  async writeDerivedPendingVersion(draft: RubricDraft, opts: { baseVersion: number; baseFingerprint: string; now?: Timestamp }): Promise<DerivedWriteResult> {
+    // ---- governance: the very same guard as `writePendingVersion`, plus every other approval field ----
+    if (
+      draft.reviewStatus !== "pending_review" ||
+      draft.intentPolarity !== null ||
+      draft.reviewedBy !== null ||
+      draft.reviewedAt !== null ||
+      draft.rejectReason !== null ||
+      draft.supersededAt !== null ||
+      draft.revision !== 0 ||
+      // A derived draft must not arrive with a decision of its base carried over: every review field
+      // that has no initial value above (exclusions, the question plan, recorded replacements, the layer
+      // check, the admin tags; the list in types/rubric.ts) must be absent.
+      DERIVED_ABSENT_FIELDS.some((f) => (draft as unknown as Record<string, unknown>)[f] !== undefined)
+    ) {
+      throw new RubricStoreError("not_pending", "a derived version may only be written as a pending_review rubric with untouched review and approval fields");
+    }
+    if (!Number.isInteger(opts.baseVersion) || opts.baseVersion < 1) throw new RubricStoreError("route_mismatch", "the base version must be a positive integer");
+    // ---- the key fields agree (the same check as `writePendingVersion`) ----
+    let target;
+    try {
+      target = rulebookTargetOf(draft);
+    } catch (err) {
+      throw new RubricStoreError("route_mismatch", (err as Error).message);
+    }
+    const routeKey = target.routeKey;
+    if (draft.routeKey !== routeKey) throw new RubricStoreError("route_mismatch", "routeKey does not match authorityId and routeSlug (countryCode and visaTypeId)");
+
+    const now = opts.now ?? Timestamp.now();
+    const base = opts.baseVersion;
+    const version = base + 1;
+    const headRef = collections.visaRubrics.doc(routeKey);
+    const baseRef = subcollections.rubricVersions(routeKey).doc(String(base));
+    const versionRef = subcollections.rubricVersions(routeKey).doc(String(version));
+    return this.runTransaction(async (tx) => {
+      // Every read first (a Firestore transaction reads before it writes).
+      const headSnap = await tx.get(headRef);
+      const baseSnap = await tx.get(baseRef);
+      const existing = await tx.get(versionRef);
+      if (!headSnap.exists) return { written: false as const, version: 0, reason: "no_head" as const };
+      const head = headSnap.data() as RubricHead;
+      // A second run of the same tool: the derived version is already the newest. Nothing is written.
+      if (head.latestVersion === version && head.approvedVersion === base && existing.exists) return { written: false as const, version, reason: "already_exists" as const };
+      // The base must be what is served AND the newest: otherwise the inputs are stale (the head moved).
+      if (head.approvedVersion !== base || head.latestVersion !== base) return { written: false as const, version: head.latestVersion, reason: "head_moved" as const };
+      if (!baseSnap.exists) return { written: false as const, version: head.latestVersion, reason: "base_missing" as const };
+      // The header of a split version carries `reviewStatus` too, so this read is enough for either layout.
+      if ((baseSnap.data() as { reviewStatus?: unknown }).reviewStatus !== "approved") return { written: false as const, version: head.latestVersion, reason: "base_not_approved" as const };
+      // The base the caller built from is EXACTLY the stored base (its content, read whole in this
+      // transaction whichever layout it is stored in): a stale or different input file is refused.
+      const baseData = await this.readVersionDataInTx(tx, routeKey, base, baseSnap.data());
+      if (derivedBaseFingerprint(baseData) !== opts.baseFingerprint) return { written: false as const, version: head.latestVersion, reason: "base_changed" as const };
+      // Only a version over the SAME snapshots may take this path (the hash gate stays the rule for new sources).
+      // (Fix round 1) Both hashes must be present (two missing hashes are not "the same sources"), and the draft's
+      // snapshot list must be the base's own, so the store itself guarantees "over the same sources".
+      if (!draft.sourceSetHash || !head.latestSourceSetHash || head.latestSourceSetHash !== draft.sourceSetHash || stableJson(draft.sourceSnapshots ?? []) !== stableJson(baseData.sourceSnapshots ?? [])) {
+        return { written: false as const, version: head.latestVersion, reason: "source_set_differs" as const };
+      }
+      // Immutability: the head says n + 1 does not exist yet; a document there anyway is refused, never replaced.
+      if (existing.exists) throw new RubricStoreError("version_exists", `rubric version ${routeKey}/${version} already exists`);
+
+      // (#233) Key fields as every new version carries them; (#278) one document or header plus parts.
+      const rubric: VisaRubric = { ...draft, ...keyFieldsOf(target), version };
+      let layout;
+      try {
+        layout = layoutVersion(rubric, versionRef.path);
+      } catch (err) {
+        if (err instanceof VersionTooLargeError) throw new RubricStoreError("too_large", `rubric version ${routeKey}/${version} cannot be stored: ${err.message}`);
+        throw err;
+      }
+      if (layout.kind === "inline") {
+        tx.set(versionRef, rubric as unknown as Record<string, unknown>);
+      } else {
+        tx.set(versionRef, layout.header);
+        const parts = subcollections.rubricVersionParts(routeKey, version);
+        for (const part of layout.parts) tx.set(parts.doc(String(part.index)), part as unknown as Record<string, unknown>);
+      }
+      // Only the "newest" pointer moves. approvedVersion, latestSourceSetHash and sourceIds are not in this update.
+      tx.update(headRef, { latestVersion: version, updatedAt: now });
       return { written: true as const, version };
     });
   }
