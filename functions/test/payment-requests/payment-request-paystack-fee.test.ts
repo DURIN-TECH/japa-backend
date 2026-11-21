@@ -54,7 +54,12 @@ import { transactionController } from "../../src/controllers/transaction.control
 import { bankAccountController } from "../../src/controllers/bank-account.controller";
 import { settlePaymentRequest } from "../../src/services/payment-request-settlement.service";
 import { toTransactionLookup } from "../../src/services/billing/paystack.provider";
-import { paystackFeeService } from "../../src/services/paystack-fee.service";
+import {
+  paystackFeeJobConfig,
+  paystackFeeService,
+  PAYSTACK_FEE_LOOKUP_BATCH_SIZE,
+  PAYSTACK_FEE_MAX_JOB_LOOKUPS,
+} from "../../src/services/paystack-fee.service";
 import { transactionService } from "../../src/services/transaction.service";
 import { awaitsPaystackFee, isPaystackFeeTracked } from "../../src/money/paystack-fee";
 import { revenueEffect } from "../../src/money/totals";
@@ -416,16 +421,16 @@ describe("fee unknown at settle", () => {
     });
   }
 
-  test("the scheduled job stores the fee once Paystack reports it; still missing it writes nothing", async () => {
+  test("the scheduled job stores the fee once Paystack reports it; still missing it stores no fee", async () => {
     const first = await paidNgn(undefined);
     const second = await paidNgn(null);
     let run = await paystackFeeService.resolveUnknownFees();
-    assert.deepEqual(run, { scanned: 2, resolved: 0, stillUnknown: 2, errors: 0 });
+    assert.deepEqual(run, { scanned: 2, resolved: 0, stillUnknown: 2, setAside: 0, errors: 0 });
     assert.equal(rowOf(first.id).paystackFeeStatus, "unknown");
 
     paystackReports(first.ref, first.id, A, "NGN", F);
     run = await paystackFeeService.resolveUnknownFees();
-    assert.deepEqual(run, { scanned: 2, resolved: 1, stillUnknown: 1, errors: 0 });
+    assert.deepEqual(run, { scanned: 2, resolved: 1, stillUnknown: 1, setAside: 0, errors: 0 });
     const resolved = rowOf(first.id);
     assert.equal(resolved.paystackFeeMinor, F);
     assert.equal(resolved.paystackFeeResolvedBy, "job");
@@ -435,7 +440,7 @@ describe("fee unknown at settle", () => {
     // A Paystack outage counts as still unknown and does not stop the run.
     harness.failNextLookup = true;
     run = await paystackFeeService.resolveUnknownFees();
-    assert.deepEqual(run, { scanned: 1, resolved: 0, stillUnknown: 1, errors: 0 });
+    assert.deepEqual(run, { scanned: 1, resolved: 0, stillUnknown: 1, setAside: 0, errors: 0 });
   });
 
   test("a fee reported later in ANOTHER currency stays unknown (409)", async () => {
@@ -699,5 +704,82 @@ describe("legacy escrow_release rows (written before #393)", () => {
     assert.equal(out.body.error, "FEE_NOT_TRACKED");
     assert.equal((await paystackFeeService.resolveUnknownFees()).scanned, 0);
     assert.equal((await withdraw(A)).status, 201);
+  });
+});
+
+// ============================================
+// Integration with #413 (D): the fee job's set-aside and oldest-first order
+// apply to payment-request rows exactly as to consultation fees
+// ============================================
+
+describe("#413 D on payment-request rows: set aside, oldest first", () => {
+  // The job's tunables are a shared property bag: restore them after each test.
+  beforeEach(() => {
+    paystackFeeJobConfig.batchSize = PAYSTACK_FEE_LOOKUP_BATCH_SIZE;
+    paystackFeeJobConfig.maxJobLookups = PAYSTACK_FEE_MAX_JOB_LOOKUPS;
+  });
+
+  test("a permanently unknown escrow_release row is set aside, credited nowhere, listed, and the admin refresh still resolves it", async () => {
+    paystackFeeJobConfig.maxJobLookups = 1;
+    try {
+      const { id, ref, row } = await paidNgn(undefined);
+      const run = await paystackFeeService.resolveUnknownFees();
+      assert.deepEqual(run, { scanned: 1, resolved: 0, stillUnknown: 1, setAside: 1, errors: 0 });
+      assert.equal(rowOf(id).paystackFeeStatus, "set_aside");
+      assert.equal(rowOf(id).paystackFeeLookupAttempts, 1);
+
+      // Counts exactly as unknown: in neither balance nor revenue, never withdrawable.
+      const bal = await balanceOf(agentA);
+      assert.deepEqual([bal.heldBalance, bal.availableBalance, bal.totalRevenue], [0, 0, 0]);
+      assert.equal((await withdraw(1)).status, 400);
+      assert.equal(awaitsPaystackFee(rowOf(id)), true, "still awaits Paystack's fee");
+
+      // The job no longer picks it.
+      const again = await paystackFeeService.resolveUnknownFees();
+      assert.equal(again.scanned, 0);
+
+      // Listed for admins under set_aside, not under unknown.
+      const setAside = await listTransactions(admin, { role: "admin", type: "escrow_release", paystackFeeStatus: "set_aside" });
+      assert.deepEqual(setAside.body.data.map((t: any) => t.id), [row.id]);
+      const unknown = await listTransactions(admin, { role: "admin", type: "escrow_release", paystackFeeStatus: "unknown" });
+      assert.deepEqual(unknown.body.data, []);
+
+      // The admin refresh resolves it once Paystack reports the fee.
+      paystackReports(ref, id, A, "NGN", F);
+      const done = await refresh(admin, row.id);
+      assert.equal(done.status, 200);
+      assert.equal(done.body.data.refreshed, true);
+      assert.equal(rowOf(id).paystackFeeStatus, "known");
+      assert.equal(rowOf(id).agentCreditMinor, A - F);
+      assert.equal((await balanceOf(agentA)).availableBalance, A - F);
+    } finally {
+      paystackFeeJobConfig.maxJobLookups = PAYSTACK_FEE_MAX_JOB_LOOKUPS;
+    }
+  });
+
+  test("an older permanently unknown request cannot starve a newer one: oldest first, then set aside", async () => {
+    paystackFeeJobConfig.batchSize = 1;
+    paystackFeeJobConfig.maxJobLookups = 1;
+    try {
+      const older = await paidNgn(undefined);
+      harness.clock.advanceHours(0.1);
+      const newer = await paidNgn(undefined);
+      paystackReports(newer.ref, newer.id, A, "NGN", F);
+
+      // Run 1 picks the OLDER row only, and sets it aside.
+      let run = await paystackFeeService.resolveUnknownFees();
+      assert.deepEqual(run, { scanned: 1, resolved: 0, stillUnknown: 1, setAside: 1, errors: 0 });
+      assert.equal(rowOf(older.id).paystackFeeStatus, "set_aside");
+      assert.equal(rowOf(newer.id).paystackFeeStatus, "unknown");
+
+      // Run 2 reaches the newer row and stores its fee.
+      run = await paystackFeeService.resolveUnknownFees();
+      assert.deepEqual(run, { scanned: 1, resolved: 1, stillUnknown: 0, setAside: 0, errors: 0 });
+      assert.equal(rowOf(newer.id).paystackFeeStatus, "known");
+      assert.equal((await balanceOf(agentA)).availableBalance, A - F);
+    } finally {
+      paystackFeeJobConfig.batchSize = PAYSTACK_FEE_LOOKUP_BATCH_SIZE;
+      paystackFeeJobConfig.maxJobLookups = PAYSTACK_FEE_MAX_JOB_LOOKUPS;
+    }
   });
 });
