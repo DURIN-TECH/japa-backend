@@ -98,7 +98,8 @@ describe("versions moved, and the kind wording is shared (#243)", () => {
     // (#234) moved on again: v11 (groups decided from what the applicant holds) and repair v5.
     // (#235) v12: the intake call drafts competence steps; the re-draft is unchanged (v5).
     // (#335) v13: call 2 is shown a rule's list lines; the re-draft is still unchanged (v5).
-    assert.equal(RUBRIC_PROMPT_VERSION, "2026-11-rubric-v13");
+    // (#456) v14: the intake schema fits the provider's grammar limit; the re-draft is still unchanged (v5).
+    assert.equal(RUBRIC_PROMPT_VERSION, "2026-11-rubric-v14");
     assert.equal(RUBRIC_REPAIR_PROMPT_VERSION, "2026-11-repair-v5");
   });
 

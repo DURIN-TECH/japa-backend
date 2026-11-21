@@ -26,6 +26,7 @@
     "evaluate:language": "npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/evaluate-language.js",
     "repair:saved-rule": "npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/repair-saved-rule.js",
     "redraft:competence-rule": "npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/redraft-competence-rule.js",
+    "probe:intake-schema": "npm run build && node --env-file-if-exists=.env.local lib/scrapers/rubric/scripts/probe-intake-schema.js",
     "derive:one-rule-version": "npm run build && node lib/scrapers/rubric/scripts/derive-version-from-one-rule.js",
     "draft:entry-rules": "npm run build && node --env-file-if-exists=.env.local lib/entry-requirements/scripts/draft-entry-rules.js",
     "plan:questions": "npm run build && node lib/scrapers/rubric/scripts/plan-questions.js",

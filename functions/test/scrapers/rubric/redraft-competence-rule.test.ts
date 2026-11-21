@@ -32,7 +32,8 @@ import { readdirSync, statSync } from "node:fs";
 import type { LlmRequest, LlmResponse } from "../../../src/services/ai/llm-provider";
 import { DEFAULT_RUBRIC_SETTINGS } from "../../../src/scrapers/rubric/rubric-settings";
 import { DEFAULT_PUBLISH_SETTINGS } from "../../../src/scrapers/rubric/rubric-publish-settings";
-import { RUBRIC_INTAKE_SYSTEM_PROMPT } from "../../../src/scrapers/rubric/rubric-prompt";
+import { RUBRIC_INTAKE_SYSTEM_PROMPT, buildIntakeOutputSchema } from "../../../src/scrapers/rubric/rubric-prompt";
+import { measureSchema } from "../../../src/scrapers/rubric/rubric-schema-size";
 import { competenceProblems } from "../../../src/scrapers/rubric/rubric-competence";
 import type { GuidanceSnapshotContent } from "../../../src/scrapers/guidance/types";
 import type { AssessmentCriterion, IntakeQuestion, VisaRubric } from "../../../src/types/rubric";
@@ -805,6 +806,44 @@ describe("(#455 fix round 1) the answers file is written atomically", () => {
     writeFileSync(path, "earlier");
     assert.throws(() => answersFileWriter(path, ID)(entry(1)));
     assert.equal(readFileSync(path, "utf8"), "earlier");
+  });
+});
+
+describe("(#456) the one-rule script on the v14 intake schema", () => {
+  test("offline: still 3 planned requests (at most 6), and the competence-steps request carries the v14 schema", async () => {
+    const p = provider();
+    const live = await liveRun(p);
+    const s = await runCompetenceRule(PAGE, version(), ID, { live: false, verdicts: "uyayaa", ...quiet });
+    assert.equal(s.planned.length, 3);
+    assert.equal(s.requests, 0);
+    // The request the live path sends for the competence step is built with the new schema.
+    const intake = p.requests.find(isIntake) as LlmRequest;
+    assert.deepEqual(intake.schema, buildIntakeOutputSchema());
+    assert.equal(measureSchema(intake.schema as Record<string, unknown>).unions, 0);
+    assert.equal(live.s.stop, null);
+  });
+
+  test("a replay of the 2026-11-21 answers (the v13 competence request was refused) stops cleanly with replay_mismatch at competence_steps", async () => {
+    // The 2026-11-21 run: the re-draft was answered, then the competence-steps request got HTTP 400
+    // ("the compiled grammar is too large"). Its saved fingerprint is that of the v13 request: the
+    // same prompts with the v13 schema (three union `value`s, `competenceSteps` / `optionsFrom` optional).
+    const p = failingAt("competence", "hard");
+    const live = await liveRun(p);
+    assert.equal(live.s.stop?.step, "competence_steps");
+    const v13: any = structuredClone(buildIntakeOutputSchema());
+    const union = { anyOf: [{ type: "string" }, { type: "number" }, { type: "boolean" }] };
+    v13.properties.intakeQuestions.items.properties.showWhenAnyOf.items.properties.value = union;
+    v13.properties.evidenceItems.items.properties.showWhenAnyOf.items.properties.value = union;
+    v13.properties.competenceSteps.items.properties.whenAllOf.items.properties.value = union;
+    v13.required = v13.required.filter((k: string) => k !== "competenceSteps");
+    const intakeRequest = p.requests.find(isIntake) as LlmRequest;
+    const v13Hash = requestHashOf({ ...intakeRequest, schema: v13 });
+    assert.notEqual(v13Hash, requestHashOf(intakeRequest));
+    const saved = live.answers.map((e) => (e.kind !== "stop_detail" && e.step === "competence_steps" ? { ...e, requestHash: v13Hash } : e));
+    // Replayed through the code paths: 0 requests, no throw, a clean stop at the step whose schema changed.
+    const again = await runCompetenceRule(PAGE, version(), ID, { live: true, replay: true, verdicts: "uyayaa", provider: new ReplayProvider(saved), ...quiet });
+    assert.equal(again.requests, 0);
+    assert.deepEqual({ step: again.stop?.step, code: again.stop?.code }, { step: "competence_steps", code: "replay_mismatch" });
   });
 });
 

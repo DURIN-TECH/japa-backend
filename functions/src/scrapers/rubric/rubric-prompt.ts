@@ -129,8 +129,16 @@ import { KIND_WORDING_SENTENCE } from "./rubric-kind-wording";
  *    Fix round 2 of #335 (same version, same reason: still unpushed, never sent): when a rule
  *    has `listItems`, the step words must come from one of those list lines, never from the
  *    lead-in quote (`competence_rests_on_lead_in`), and the instruction now says so.
+ *  - "2026-11-rubric-v14" (#456): the intake schema (call 2) is cut to fit the provider's
+ *    compiled-grammar limit (v13's was refused with HTTP 400 "The compiled grammar is too
+ *    large"): a condition `value` is a string (no union types left), `competenceSteps` is a
+ *    required list (empty = none) and `optionsFrom` is required (`none` for an ordinary
+ *    question). Code types each value against its question and refuses a misfit
+ *    (`typeConditionValues`); the stored rulebook keeps its shape. The intake prompt says how to
+ *    write a value and to give empty lists. The criteria prompt and schema (call 1) are
+ *    byte-for-byte v13's, so the re-draft prompt and its version are unchanged.
  */
-export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v13";
+export const RUBRIC_PROMPT_VERSION = "2026-11-rubric-v14";
 
 /** Instructions shared by both calls: what the excerpt is, and how to treat it. */
 const COMMON_INSTRUCTIONS = [
@@ -197,13 +205,13 @@ export const RUBRIC_INTAKE_SYSTEM_PROMPT = [
   COMMON_INSTRUCTIONS,
   "The criteria are given as JSON with a `ref`, a `title` and the `quote` each rests on. Refer to a criterion only by its `ref`.",
   "",
-  "`intakeQuestions`: questions an applicant would need to answer for the listed criteria to be assessed. Each lists, in `criterionRefs`, the `ref` of every criterion that reads the answer. Ask only what a listed criterion needs, and ask each thing once. If a question matters only when an earlier answer has a certain value (for example a question about someone else only when someone else is involved), give `showWhenAnyOf` with the id of that earlier question and the value. A question about another person's details sets `party` accordingly. When another person takes part (pays, hosts, sponsors, vouches) and criteria read facts about them, also ask for that person's full name as written on their documents, with the same condition.",
+  "`intakeQuestions`: questions an applicant would need to answer for the listed criteria to be assessed. Each lists, in `criterionRefs`, the `ref` of every criterion that reads the answer. Ask only what a listed criterion needs, and ask each thing once. If a question matters only when an earlier answer has a certain value (for example a question about someone else only when someone else is involved), give `showWhenAnyOf` with the id of that earlier question and the value; a question that is always asked gives an empty `showWhenAnyOf` list. Every condition `value` (in `showWhenAnyOf` and in `whenAllOf`) is written as text: \"true\" or \"false\" for a yes_no question, the number in digits for a number question, and otherwise the option value or the answer exactly as the question records it. Every question gives `optionsFrom`: `none`, unless its options are the route's member countries (see `competenceSteps`). A question about another person's details sets `party` accordingly. When another person takes part (pays, hosts, sponsors, vouches) and criteria read facts about them, also ask for that person's full name as written on their documents, with the same condition.",
   "",
-  "`evidenceItems`: documents the excerpt itself names as evidence, each with the verbatim passage naming it (`quote`, copied character for character from one paragraph of the excerpt), the `documentType`, whose document it is (`party`), the `ref` of the criteria it evidences and, when it is asked for only after a certain answer, `showWhenAnyOf` naming the intake question and the value that triggers it. Do not add documents the excerpt does not name.",
+  "`evidenceItems`: documents the excerpt itself names as evidence, each with the verbatim passage naming it (`quote`, copied character for character from one paragraph of the excerpt), the `documentType`, whose document it is (`party`), the `ref` of the criteria it evidences and, when it is asked for only after a certain answer, `showWhenAnyOf` naming the intake question and the value that triggers it (an empty list when it is always asked for). Do not add documents the excerpt does not name.",
   "",
   "`ruleTriggers`: some accepted criteria carry an `applicability` of `specialist` or `conditional` and a `condition`, the words of the source that say when the rule applies. For each such criterion, say which answer establishes that it applies: give its `criterionRef`, the `questionId` of an intake question, and `answerValues`, the option values of that question for which the rule applies. The question must be one of your `intakeQuestions` or one listed under \"Questions already asked\". Where the source distinguishes applicants by activity, sub-category or purpose (the conditions name them), include one `single_choice` question (or `multi_choice` when an applicant can be in several) that establishes it, with one option per activity or sub-category the source names, the option `label` in the source's own words and the `value` a short lowercase slug. Reuse that same question, with the same `id`, for every rule of that kind, and add an option to it when the source names another one; reuse a question listed under \"Questions already asked\" the same way. For a yes_no question the `answerValues` are \"true\" or \"false\". Use only activities, sub-categories and circumstances the excerpt itself names: never add one from general knowledge. If no question could establish when a rule applies, leave it out of `ruleTriggers`.",
   "",
-  "`competenceSteps`: only when the excerpt itself states which member country is responsible for examining an application (for example the country that is the only destination, or the main destination, or the country whose border is crossed first). Give one entry per case the excerpt names, IN THE ORDER the excerpt applies them. Each entry gives `criterionRef`, the `ref` of the accepted criterion whose quote states that case; `restsOn`, the words that name the case, copied character for character from that criterion's `quote` when the criterion has no `listItems`; when it has `listItems` (the list lines that follow a quote ending with a lead-in such as \"shall be:\"), copied from ONE of those list lines, never from the quote, because the lead-in names no case. The words must be whole words, at least 8 characters, and must appear in that one place only: choose words that the other list lines and the quote do not also contain, because the program refuses words found in more than one of them, and refuses words of a criterion with `listItems` that are not in one of its list lines; `questionId`, the intake question whose answer names the country for that case; and `whenAllOf`, the earlier answers that must ALL hold for this case to apply (empty when it applies whenever the cases before it did not decide). Every such question is a `single_choice` question (`multi_choice` when the applicant may name several countries) with `optionsFrom` set to `route_destinations`: list NO country among its options, because the program lists the member countries when the question is asked; you may list options that are not a country (for example that the applicant cannot say). Ask each such question once. When the excerpt lets a case rest on more than one basis (one reason OR another), the question names every basis, or another question asks which basis applies to the applicant: never choose a basis for them, and never work a country out from other answers such as dates or lengths. Never name a country in a question, an option or a step. If the excerpt does not state which member country is responsible, return an empty `competenceSteps` list.",
+  "`competenceSteps`: only when the excerpt itself states which member country is responsible for examining an application (for example the country that is the only destination, or the main destination, or the country whose border is crossed first). Give one entry per case the excerpt names, IN THE ORDER the excerpt applies them. Each entry gives `criterionRef`, the `ref` of the accepted criterion whose quote states that case; `restsOn`, the words that name the case, copied character for character from that criterion's `quote` when the criterion has no `listItems`; when it has `listItems` (the list lines that follow a quote ending with a lead-in such as \"shall be:\"), copied from ONE of those list lines, never from the quote, because the lead-in names no case. The words must be whole words, at least 8 characters, and must appear in that one place only: choose words that the other list lines and the quote do not also contain, because the program refuses words found in more than one of them, and refuses words of a criterion with `listItems` that are not in one of its list lines; `questionId`, the intake question whose answer names the country for that case; and `whenAllOf`, the earlier answers that must ALL hold for this case to apply (empty when it applies whenever the cases before it did not decide). Every such question is a `single_choice` question (`multi_choice` when the applicant may name several countries) with `optionsFrom` set to `route_destinations`: list NO country among its options, because the program lists the member countries when the question is asked; you may list options that are not a country (for example that the applicant cannot say). Ask each such question once. When the excerpt lets a case rest on more than one basis (one reason OR another), the question names every basis, or another question asks which basis applies to the applicant: never choose a basis for them, and never work a country out from other answers such as dates or lengths. Never name a country in a question, an option or a step. Always give `competenceSteps`: if the excerpt does not state which member country is responsible, give an empty `competenceSteps` list.",
   "",
   "`intake`: a short title, card title and introduction for the questions, in plain words, only if you list questions.",
   "",
@@ -227,6 +235,9 @@ const OPTIONAL_SCHEMAS = new WeakSet<object>();
  * nullable value is a union; an optional property is not. Absent is read as
  * null by `parseRubricOutput`, so everything downstream still sees the same
  * `T | null` shape. (First run of #112: 22 unions were rejected with HTTP 400.)
+ * (#456) An optional property is not free either: the provider's page says each
+ * one "roughly doubles a portion of the grammar's state space". See the size
+ * note above `buildIntakeOutputSchema` (the published limits, quoted).
  */
 function optional(schema: Record<string, unknown>): Record<string, unknown> {
   const copy = { ...schema };
@@ -318,20 +329,60 @@ export function buildRubricOutputSchema(severityLevels: readonly string[]): Reco
   });
 }
 
+// ----------------------------------------------------------------------------
+// (#456) Size of the intake schema. Read this before adding a field to it.
+// ----------------------------------------------------------------------------
+// The schema below is compiled by the provider into a grammar. Its published
+// limits (the provider's structured-outputs page, platform.claude.com at
+// docs/en/build-with-claude/structured-outputs, section "Schema complexity
+// limits"; written without its scheme because this module may hold no URL, see
+// rubric-generic.test.ts): 20 strict tools, 24 optional parameters and 16
+// parameters with union types per request, AND an internal limit on the size of
+// the compiled grammar. In the page's words, union types "are especially
+// expensive because they create exponential compilation cost", optional
+// parameters, union types and nested objects "interact with each other in ways
+// that can make the compiled grammar disproportionately large", and "each
+// optional parameter roughly doubles a portion of the grammar's state space".
+// Its advice: make parameters required where possible, and flatten nested
+// structures with optional fields.
+//
+// The v13 intake schema (13 optional, 3 union-typed `value`s, each three levels
+// deep inside arrays of objects) met every explicit limit and was still refused
+// with HTTP 400 "The compiled grammar is too large" (#335, 2026-11-21). The
+// pre-#235 schema (11 optional, 2 unions) was accepted. So, from v14:
+//  - NO union types at all: a condition's `value` is a STRING. Code converts it
+//    to the type the stored rulebook keeps (a boolean for a `yes_no` question,
+//    a number for a `number` question, a string otherwise) and refuses a value
+//    that does not fit (`typeConditionValues` below, and the merge);
+//  - `competenceSteps` is REQUIRED (an empty list = none), and `optionsFrom` is
+//    REQUIRED with `"none"` for an ordinary question (read back as null).
+// A unit test (rubric-intake-schema-size.test.ts) measures this schema and
+// fails above 0 unions, 11 optional parameters or a nesting depth of 5.
+
+/**
+ * (#456) The `optionsFrom` value of an ordinary question (its options, if any,
+ * are the ones it lists). Required in the schema so the property is not one
+ * more optional parameter; `parseRubricOutput` reads it back as null, so the
+ * typed answer is what it was before v14.
+ */
+export const OPTIONS_FROM_NONE = "none";
+
 /**
  * JSON Schema of the model's answer for call 2 (intake questions and
- * evidence items) of one chunk.
+ * evidence items) of one chunk. See the size note above: no unions, at most
+ * 11 optional parameters.
  */
 export function buildIntakeOutputSchema(): Record<string, unknown> {
   // (#207) "This rule applies when the answer to `questionId` is one of
-  // `answerValues`." No union types here: the provider caps those at 16 per
-  // schema, and this schema already has two (the show-when `value`).
+  // `answerValues`." Values are strings, like every condition value below.
   const ruleTrigger = object({ criterionRef: STRING, questionId: STRING, answerValues: STRINGS });
-  // "Show when the answer to `questionId` is `value`."
+  // "Show when the answer to `questionId` is `value`." (#456) `value` is a
+  // STRING (it was `anyOf: [string, number, boolean]`): "true" / "false" for a
+  // yes_no question, digits for a number question. Code types and checks it.
   const condition = object({
     questionId: STRING,
     op: { type: "string", enum: ["eq", "neq"] },
-    value: { anyOf: [STRING, { type: "number" }, BOOLEAN] },
+    value: STRING,
   });
   const intakeQuestion = object({
     id: STRING,
@@ -349,7 +400,8 @@ export function buildIntakeOutputSchema(): Record<string, unknown> {
     showWhenAnyOf: { type: "array", items: condition },
     // (#235) A choice question whose options are the route's member countries,
     // listed by the program when it is asked (never by the model).
-    optionsFrom: optional({ type: "string", enum: ["route_destinations"] }),
+    // (#456) Required: `"none"` for every other question (no extra optional parameter).
+    optionsFrom: { type: "string", enum: [OPTIONS_FROM_NONE, "route_destinations"] },
   });
 
   const evidenceItem = object({
@@ -364,8 +416,8 @@ export function buildIntakeOutputSchema(): Record<string, unknown> {
     showWhenAnyOf: { type: "array", items: condition },
   });
 
-  // (#235) One case of the competence rule, in the excerpt's order. No union
-  // types here (the provider caps those): the conditions reuse `condition`.
+  // (#235) One case of the competence rule, in the excerpt's order. The
+  // conditions reuse `condition` (a string `value`, no union).
   const competenceStep = object({ criterionRef: STRING, restsOn: STRING, questionId: STRING, whenAllOf: { type: "array", items: condition } });
 
   return object({
@@ -373,9 +425,9 @@ export function buildIntakeOutputSchema(): Record<string, unknown> {
     intakeQuestions: { type: "array", items: intakeQuestion },
     evidenceItems: { type: "array", items: evidenceItem },
     ruleTriggers: { type: "array", items: ruleTrigger },
-    // Optional: an answer that leaves it out (every excerpt with no competence
-    // rule, and every answer recorded before v12) reads as "none".
-    competenceSteps: optional({ type: "array", items: competenceStep }),
+    // (#456) Required: an excerpt with no competence rule answers an EMPTY
+    // list, which `parseRubricOutput` reads exactly as "no competence steps".
+    competenceSteps: { type: "array", items: competenceStep },
     suspiciousPassages: SUSPICIOUS,
   });
 }
@@ -834,8 +886,13 @@ export function parseRubricOutput(text: string, schema: Record<string, unknown>)
   for (const key of ["criteria", "intakeQuestions", "evidenceItems", "ruleTriggers", "suspiciousPassages"]) if (!(key in out)) out[key] = [];
   for (const key of ["intentPolarity", "intake"]) if (!(key in out)) out[key] = null;
   // (#235) No competence steps is the same as an empty list: leave the key out
-  // so an answer without them reads exactly as before v12.
-  if (out.competenceSteps === null) delete out.competenceSteps;
+  // so an answer without them reads exactly as before v12. (#456) From v14 the
+  // intake schema REQUIRES the list, so "none" arrives as `[]`: it is read the
+  // same way (key left out), and downstream code sees the shape it always saw.
+  if (out.competenceSteps === null || (Array.isArray(out.competenceSteps) && out.competenceSteps.length === 0)) delete out.competenceSteps;
+  // (#456) `optionsFrom` is required from v14, with "none" for an ordinary
+  // question: read "none" as null, the value an absent optional had before.
+  for (const q of out.intakeQuestions as Record<string, unknown>[]) if (q.optionsFrom === OPTIONS_FROM_NONE) q.optionsFrom = null;
   // `citations` (reviewer aids) are not asked for any more.
   for (const c of (out.criteria as Record<string, unknown>[])) c.citations = [];
   return parsed as RawRubricOutput;
@@ -868,4 +925,102 @@ function fillAbsentOptionalsWithNull(value: unknown, schema: Record<string, unkn
       else fillAbsentOptionalsWithNull(obj[key], sub);
     }
   }
+}
+
+// ============================================
+// (#456) Condition values: typed in code, not by the schema
+// ============================================
+//
+// Up to v13 a condition `value` (a question's show-when, an evidence item's
+// trigger, a competence step's `whenAllOf`) was `anyOf: [string, number,
+// boolean]` in the schema. The provider refused the grammar that made (see the
+// size note above `buildIntakeOutputSchema`), so from v14 the schema asks for a
+// STRING and the checks move here. Nothing is weakened:
+//  - a missing or wrongly typed field is still refused by `validateAgainstSchema`
+//    (a non-string `value` now fails it, as a non-scalar one did before);
+//  - a value that does not fit its question's answer type is refused: not
+//    "true" / "false" for a `yes_no` question, not a finite number for a
+//    `number` question. Before v14 such a value was stored as the model wrote it;
+//  - what is stored keeps the shape it had: a boolean for `yes_no`, a number
+//    for `number`, a string for every other answer type.
+// A refused value makes the whole answer a FAILED answer (`RubricOutputError`,
+// so `invalid_model_output`, exactly as a schema mismatch), never a partial
+// pass, and a problem line carries a path only, never the model's text.
+
+/** A condition value after typing: what the stored rulebook keeps. */
+export type ConditionValue = string | number | boolean;
+
+/**
+ * The stored value of a condition on a question of `answerType`, or
+ * `undefined` when `value` does not fit that type. Idempotent: an already
+ * typed value that fits (a boolean for yes_no, a number for number) is
+ * returned unchanged, so the merge can call it again on any value.
+ *
+ * @param value      the condition's value (a string from a v14 answer)
+ * @param answerType the answer type of the question the condition reads
+ */
+export function conditionValueFor(value: unknown, answerType: string): ConditionValue | undefined {
+  if (answerType === "yes_no") {
+    // Only the two literal words the prompt asks for (no "yes", no "1"): a
+    // looser reading would guess what the model meant.
+    if (typeof value === "boolean") return value;
+    if (value === "true") return true;
+    if (value === "false") return false;
+    return undefined;
+  }
+  if (answerType === "number") {
+    // `number` is not one of the drafted answer types today, but a question
+    // already in a rulebook may carry it (answer types are stored as strings):
+    // its conditions are numbers, as the schema's number branch allowed before.
+    if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+    if (typeof value !== "string") return undefined;
+    const t = value.trim();
+    // Plain decimal notation only: no hex, no exponent, no empty string (which
+    // `Number("")` would read as 0).
+    if (!/^[+-]?(\d+(\.\d+)?|\.\d+)$/.test(t)) return undefined;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  // Every other answer type (choices, text, dates, amounts) compares strings.
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * Type every condition value of a schema-valid intake answer (call 2), in
+ * place, against the answer type of the question it reads, and refuse the
+ * answer when one does not fit.
+ *
+ * The question is looked up among the questions this answer drafts and the
+ * ones already asked (`known`, the questions the request listed). A
+ * condition that names neither is left as it is: the merge resolves it once
+ * every excerpt is in (it may name a question of a later excerpt), types it
+ * there with the same `conditionValueFor`, and treats a misfit like a
+ * condition on an unknown question (rubric-extraction.service.ts).
+ *
+ * @throws RubricOutputError (paths only) when a value does not fit its question
+ */
+export function typeConditionValues(raw: RawRubricOutput, known: readonly Pick<KnownQuestionView, "id" | "answerType">[] = []): RawRubricOutput {
+  // The answer type of each question id: a question already asked wins, as
+  // the merge keeps the first wording of a question asked twice.
+  const types = new Map<string, string>();
+  for (const q of raw.intakeQuestions) if (!types.has(q.id)) types.set(q.id, q.answerType);
+  for (const q of known) types.set(q.id, q.answerType);
+  const problems: string[] = [];
+  /** Type one list of conditions, recording the path of each misfit. */
+  const typeAll = (conds: { questionId: string; value: ConditionValue }[] | undefined, path: string) => {
+    (conds ?? []).forEach((c, i) => {
+      const answerType = types.get(c.questionId);
+      if (answerType === undefined) return; // resolved (and typed) at merge time
+      const typed = conditionValueFor(c.value, answerType);
+      if (typed === undefined) problems.push(`${path}[${i}].value: does not fit the answer type of the question it reads`);
+      else c.value = typed;
+    });
+  };
+  raw.intakeQuestions.forEach((q, i) => typeAll(q.showWhenAnyOf, `$.intakeQuestions[${i}].showWhenAnyOf`));
+  raw.evidenceItems.forEach((e, i) => typeAll(e.showWhenAnyOf, `$.evidenceItems[${i}].showWhenAnyOf`));
+  (raw.competenceSteps ?? []).forEach((st, i) => typeAll(st.whenAllOf, `$.competenceSteps[${i}].whenAllOf`));
+  if (problems.length > 0) {
+    throw new RubricOutputError(`the model's answer does not follow the output schema (${problems.length} problem(s))`, problems.slice(0, 20));
+  }
+  return raw;
 }
