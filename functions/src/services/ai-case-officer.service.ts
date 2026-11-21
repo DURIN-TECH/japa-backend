@@ -1115,7 +1115,10 @@ export class AiCaseOfficerService {
     // ---- facts the checks may read ----
     const facts: Facts = {
       ...Object.fromEntries(Object.entries(loaded.intake).map(([k, v]) => [`intake.${k}`, v as Facts[string]])),
-      ...deriveHolderFact(loaded.applicantName, extractions),
+      // (#418 fix round 1) Only a bank statement gives the holder fact; a
+      // document of unknown kind only when `accountHolder` was asked as an
+      // objective field (the pre-#418 behaviour). See deriveHolderFact.
+      ...deriveHolderFact(loaded.applicantName, extractions, { holderAskedAsObjective: fields.includes("accountHolder") }),
     };
 
     // ---- stage 2 evaluation: code decides ----
@@ -1168,7 +1171,9 @@ export class AiCaseOfficerService {
     // (#408) Its values are kept as values (field, unit) so the narrative's
     // FIGURE check can read a money value in its currency; they are exactly
     // the values in the text, in order.
-    const summary = buildExtractionSummary(documentList, extractions);
+    // (#418 fix round 1) `fields` (the objective-check fields) are kept
+    // first when a document has to give up values for its share of the block.
+    const summary = buildExtractionSummary(documentList, extractions, { objectiveFields: fields });
     const summarisedValues = summary.values;
     const extractionSummary = summary.text;
     if (batches.length > 0 && (extractions.length > 0 || statementText.trim().length > 0)) {

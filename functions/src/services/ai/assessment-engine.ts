@@ -374,7 +374,13 @@ export const CASEWORKER_FIELDS: readonly CaseworkerField[] = [
   { field: "statementPeriodStart", meaning: "the first day a statement covers", money: false, perItem: false },
   { field: "statementPeriodEnd", meaning: "the last day a statement covers", money: false, perItem: false },
   // ---- who holds it and who issued it ----
-  { field: "accountHolder", meaning: "the name of the account holder or the person the document is about", money: false, perItem: false },
+  // `accountHolder` is ALSO an objective-check field (`funds.holderIsApplicant`
+  // is derived from it, see `deriveHolderFact`), so its meaning stays the
+  // pre-#418 one: the ACCOUNT holder only. A passport or payslip must never
+  // report the applicant's name here (fix round 1: that let a passport
+  // satisfy the holder check). "Who the document is about" is its own field.
+  { field: "accountHolder", meaning: "the name of the holder of the account the document is a statement of (a bank or savings account); leave it out for any other document", money: false, perItem: false },
+  { field: "documentSubjectName", meaning: "the name of the person the document is about or issued to (for example the passport holder, the employee or the person a letter names)", money: false, perItem: false },
   { field: "issuer", meaning: "who issued the document: the bank, employer, authority, landlord or institution", money: false, perItem: false },
   // ---- balances and totals ----
   { field: "openingBalance", meaning: "the balance at the start of the period", money: true, perItem: false },
@@ -810,15 +816,47 @@ function normaliseName(name: string): string {
     .join(" ");
 }
 
+/** (#418 fix round 1) Options of `deriveHolderFact`. */
+export interface HolderFactOptions {
+  // True when `accountHolder` was in the objective fields the extraction asked
+  // for (`documentFieldsFor(rubric)` holds it, i.e. the rulebook checks
+  // `funds.holderIsApplicant`). Decides whether a document of unknown kind
+  // may give the holder fact. Defaults to true (the pre-#418 behaviour).
+  holderAskedAsObjective?: boolean;
+}
+
 /**
  * Derive the holder fact from extracted `accountHolder` values: true when the
  * holder's name matches the applicant's, false when it does not. Absent when no
  * holder was read. The check reads `funds.holderIsApplicant`.
+ * (#418 fix round 1) Read only from bank statements (or, with no known kind,
+ * when the field was an objective field); the first such holder wins.
  */
-export function deriveHolderFact(applicantName: string | null, docs: readonly DocumentExtraction[]): Facts {
+export function deriveHolderFact(
+  applicantName: string | null,
+  docs: readonly DocumentExtraction[],
+  opts: HolderFactOptions = {}
+): Facts {
   if (!applicantName) return {};
+  // (#418 fix round 1) Was `accountHolder` asked as an objective-check field?
+  // Defaults to true, so a caller that does not say (the bulk path, older
+  // tests) keeps the pre-#418 behaviour exactly.
+  const askedAsObjective = opts.holderAskedAsObjective ?? true;
   for (const d of docs) {
     if (!d.readable || d.failed || d.suspicious) continue;
+    // (#418 fix round 1) Only a document that IS a bank statement gives the
+    // holder fact. A document of any other known kind (a passport, a payslip,
+    // a CAS) is skipped, even if the model reported an `accountHolder` on it:
+    // otherwise a passport in the applicant's name, uploaded first, would make
+    // the check pass while the statement is in someone else's name. A document
+    // whose kind is NOT known (`documentKind` undefined: no caseworker read,
+    // e.g. the bulk path; or null: the model gave none) counts only when the
+    // field was asked as an objective field, which is the pre-#418 behaviour.
+    if (d.documentKind != null) {
+      if (d.documentKind !== "bank_statement") continue;
+    } else if (!askedAsObjective) {
+      continue;
+    }
     for (const v of d.values) {
       if (v.field === "accountHolder" && typeof v.value === "string" && v.value.trim()) {
         return { "funds.holderIsApplicant": normaliseName(v.value) === normaliseName(applicantName) };
@@ -886,6 +924,26 @@ export function unreadReasonOf(d: DocumentExtraction): DocumentUnreadReason | nu
 }
 
 /**
+ * (#418 fix round 1) Make an applicant-supplied name safe as ONE field of ONE
+ * list line. The name can be the applicant's typed file name, and the
+ * sanitiser keeps newlines and `|`, so a name like "x\nD9 | read: yes" could
+ * otherwise add a fake "read" line to the list the prompts tell the model to
+ * trust. So, BEFORE the 80-character cut:
+ *  - every run of whitespace (newlines, tabs, line and paragraph separators)
+ *    becomes one space;
+ *  - the list's field delimiter `|` (and the summary's `[`/`]` code brackets)
+ *    become `/`, `(` and `)`.
+ */
+function flattenListName(name: string): string {
+  return name
+    .replace(/[\s\u2028\u2029]+/g, " ")
+    .replace(/[|¦｜]/g, "/")
+    .replace(/\[/g, "(")
+    .replace(/\]/g, ")")
+    .trim();
+}
+
+/**
  * (#418) The document list, one entry per upload, in the order of
  * `documents` (the job passes its extractions, one per loaded upload, so the
  * list holds EVERY upload, read or not).
@@ -898,7 +956,7 @@ export function documentListOf(documents: readonly DocumentExtraction[], names: 
     return {
       code: `D${i + 1}`,
       documentId: d.documentId,
-      name: ((names[d.documentId] ?? "").trim() || d.label || "document").slice(0, MAX_DOCUMENT_LABEL),
+      name: flattenListName((names[d.documentId] ?? "").trim() || d.label || "document").slice(0, MAX_DOCUMENT_LABEL),
       kind: read ? (d.documentKind ?? null) : null,
       read,
       reason: unreadReasonOf(d),
@@ -924,8 +982,14 @@ export function documentsReadOf(entries: readonly DocumentListEntry[]): Document
   return entries.map((e) => ({ documentId: e.documentId, documentKind: e.kind, readable: e.read, reason: e.reason, valueCount: e.valueCount }));
 }
 
-/** (#418) Longest item description (a per-item field's quote) shown in the summary. A longer one is left out whole. */
-const MAX_ITEM_DESCRIPTION_CHARS = 120;
+/**
+ * (#418, fix round 1) Longest item description (a per-item field's quote)
+ * shown in the summary. Was 120 and a longer one was left out: one statement
+ * at the value cap could then take 6-7k of the 20k block. Now a longer
+ * description is cut at a word boundary to this length and marked with "…"
+ * (the value itself is never cut).
+ */
+const MAX_ITEM_DESCRIPTION_CHARS = 60;
 
 /** (#418) Characters kept free under MAX_UNTRUSTED_CHARS for the "values left out" note. */
 const SUMMARY_NOTE_RESERVE = 400;
@@ -936,17 +1000,57 @@ export interface ExtractionSummary {
   text: string;
   // The values in `text`, in order: the narrative's figure facts.
   values: ExtractedValue[];
-  // Code ids of read documents whose values were left out for length.
+  // Code ids of read documents some (or all) of whose values were left out for length.
   leftOut: string[];
+}
+
+/** (#418 fix round 1) Options of `buildExtractionSummary`. */
+export interface ExtractionSummaryOptions {
+  // The objective-check fields (`documentFieldsFor`): their values are the
+  // LAST a document gives up when it has to shrink to its share.
+  objectiveFields?: readonly string[];
+}
+
+/** (#418 fix round 1) An item description cut to MAX_ITEM_DESCRIPTION_CHARS, at a word boundary when there is one. */
+function shortDescription(description: string): string {
+  const flat = description.replace(/\s+/g, " ").trim();
+  if (flat.length <= MAX_ITEM_DESCRIPTION_CHARS) return flat;
+  const cut = flat.slice(0, MAX_ITEM_DESCRIPTION_CHARS - 1);
+  const space = cut.lastIndexOf(" ");
+  // Cut at the last space if it keeps at least half the text, else mid-word.
+  return `${(space >= MAX_ITEM_DESCRIPTION_CHARS / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
 }
 
 /** (#418) One value as a summary line: `field: value unit (page n)`, plus an item's description. */
 function summaryLine(v: ExtractedValue): string {
   const base = `${v.field}: ${String(v.value)}${v.unit ? ` ${v.unit}` : ""}${v.page ? ` (page ${v.page})` : ""}`;
   // A per-item field (a recurring payment, a deposit) is meaningless without
-  // what it is: its description, as printed, follows the amount.
+  // what it is: its description, as printed (shortened), follows the amount.
   const description = v.quote?.trim();
-  return CASEWORKER_PER_ITEM_FIELDS.has(v.field) && description && description.length <= MAX_ITEM_DESCRIPTION_CHARS ? `${base} | described as: ${description}` : base;
+  return CASEWORKER_PER_ITEM_FIELDS.has(v.field) && description ? `${base} | described as: ${shortDescription(description)}` : base;
+}
+
+/**
+ * (#418 fix round 1) How much a value matters when a document must shrink to
+ * its share of the block. Lower is kept first:
+ *  0 - an objective-check field (it decides a rule);
+ *  1 - any other single-value field (dates, holder, balances, totals, employer...);
+ *  2 - a per-item field (each recurring payment or deposit).
+ */
+function valuePriority(v: ExtractedValue, objective: ReadonlySet<string>): number {
+  if (objective.has(v.field)) return 0;
+  return CASEWORKER_PER_ITEM_FIELDS.has(v.field) ? 2 : 1;
+}
+
+/** (#418 fix round 1) One read document's candidate lines for the summary. */
+interface SummaryDoc {
+  code: string;
+  // The `[D1]` header and the values with their lines and sanitised sizes (+1 newline each).
+  header: string;
+  headerSize: number;
+  items: Array<{ value: ExtractedValue; line: string; size: number; priority: number; index: number }>;
+  // The whole block's size, header included.
+  fullSize: number;
 }
 
 /**
@@ -956,35 +1060,87 @@ function summaryLine(v: ExtractedValue): string {
  * Only cleanly read documents add values (an unread or suspicious one adds
  * none, as before).
  *
- * LENGTH: the summary goes into one wrapped block, which is cut at
- * MAX_UNTRUSTED_CHARS. To never cut a document's values in the middle, whole
- * documents are left out in code when the next one would not fit (measured on
- * the sanitised text), and a closing note names them. They stay in the
- * document list, marked read.
+ * LENGTH (fix round 1: a FAIR SHARE per document): the summary goes into one
+ * wrapped block, which is cut at MAX_UNTRUSTED_CHARS. Before, documents were
+ * added first come first served and later ones lost ALL their values, so on a
+ * statement-heavy case the newest statements could be the ones left out. Now:
+ *  - the budget is shared out between the read documents ("water filling"):
+ *    a document smaller than an equal share keeps all its values and leaves
+ *    the rest of its share to the others; a larger one gets the share;
+ *  - a document over its share drops its lowest-priority values WHOLE
+ *    (per-item lines first, then other caseworker values; objective-check
+ *    values last, see `valuePriority`), never cutting a value, and keeps its
+ *    kept values in their original order;
+ *  - every read document with values keeps its header and as many values as
+ *    its share holds, so none loses all its values to earlier long ones;
+ *  - a closing note names the documents that gave up values. They stay in
+ *    the document list, marked read.
+ * Sizes are measured on the sanitised text (what is actually sent).
  *
  * @param entries the document list (for the code ids), in the same order as `documents`
  */
-export function buildExtractionSummary(entries: readonly DocumentListEntry[], documents: readonly DocumentExtraction[]): ExtractionSummary {
+export function buildExtractionSummary(
+  entries: readonly DocumentListEntry[],
+  documents: readonly DocumentExtraction[],
+  opts: ExtractionSummaryOptions = {}
+): ExtractionSummary {
   const budget = MAX_UNTRUSTED_CHARS - SUMMARY_NOTE_RESERVE;
-  const blocks: string[] = [];
-  const values: ExtractedValue[] = [];
-  const leftOut: string[] = [];
-  let used = 0;
+  const objective = new Set(opts.objectiveFields ?? []);
+
+  // ---- the candidate lines of each read document ----
+  const docs: SummaryDoc[] = [];
   documents.forEach((d, i) => {
     if (!isCleanlyRead(d) || d.values.length === 0) return;
     const code = entries[i]?.code ?? `D${i + 1}`;
-    const block = [`[${code}]`, ...d.values.map(summaryLine)].join("\n");
-    // +1 for the newline that joins blocks.
-    const size = sanitizeUntrusted(block).length + 1;
-    if (used + size > budget) {
-      leftOut.push(code);
-      return;
-    }
-    used += size;
-    blocks.push(block);
-    values.push(...d.values);
+    const header = `[${code}]`;
+    // +1 for the newline that joins lines (and blocks).
+    const headerSize = sanitizeUntrusted(header).length + 1;
+    const items = d.values.map((value, index) => {
+      const line = summaryLine(value);
+      return { value, line, size: sanitizeUntrusted(line).length + 1, priority: valuePriority(value, objective), index };
+    });
+    docs.push({ code, header, headerSize, items, fullSize: headerSize + items.reduce((n, it) => n + it.size, 0) });
   });
-  const note = leftOut.length > 0 ? `\n(values of ${leftOut.join(", ")} are not shown here: too many values to send; these documents were read)` : "";
+
+  // ---- each document's share of the budget (water filling) ----
+  // Smallest documents first: each takes min(its size, an equal share of what
+  // is left), so what a small document does not use goes to the larger ones.
+  const share = new Map<string, number>();
+  let left = budget;
+  const bySize = [...docs].sort((a, b) => a.fullSize - b.fullSize);
+  bySize.forEach((doc, k) => {
+    const fair = Math.floor(left / (bySize.length - k));
+    const given = Math.min(doc.fullSize, fair);
+    share.set(doc.code, given);
+    left -= given;
+  });
+
+  // ---- fit each document into its share ----
+  const blocks: string[] = [];
+  const values: ExtractedValue[] = [];
+  const leftOut: string[] = [];
+  for (const doc of docs) {
+    const allowed = share.get(doc.code) ?? 0;
+    let kept = doc.items;
+    if (doc.fullSize > allowed) {
+      // Keep values by priority (then original order) while they fit; a
+      // value that does not fit is dropped whole, a smaller later one may
+      // still fit. Then restore the original order.
+      let used = doc.headerSize;
+      const chosen: typeof doc.items = [];
+      for (const it of [...doc.items].sort((a, b) => a.priority - b.priority || a.index - b.index)) {
+        if (used + it.size > allowed) continue;
+        used += it.size;
+        chosen.push(it);
+      }
+      kept = chosen.sort((a, b) => a.index - b.index);
+      leftOut.push(doc.code);
+    }
+    if (kept.length === 0) continue;
+    blocks.push([doc.header, ...kept.map((it) => it.line)].join("\n"));
+    values.push(...kept.map((it) => it.value));
+  }
+  const note = leftOut.length > 0 ? `\n(some values of ${leftOut.join(", ")} are not shown here: too many values to send; these documents were read)` : "";
   return { text: blocks.join("\n") + note, values, leftOut };
 }
 
@@ -1023,9 +1179,23 @@ interface KindPhrase {
  * reviews). `other` has none: nothing can be said to be missing about it.
  */
 const DOCUMENT_KIND_PHRASES: Readonly<Record<DocumentKind, readonly KindPhrase[]>> = {
+  // NOTE: "identity document" is listed under BOTH `passport` and
+  // `identity_card` on purpose: a narrative uses it for either, so a read
+  // passport OR a read identity card makes "there is no identity document" a
+  // false claim. Listing it twice only means either kind can trigger it.
   passport: [{ source: "passport(?![-\\s]*photo)" }, { source: "travel\\s+document" }, { source: "identity\\s+document" }],
   identity_card: [{ source: "identity\\s+card" }, { source: "ID\\s+card", caseSensitive: true }, { source: "identity\\s+document" }],
-  bank_statement: [{ source: "bank\\s+statement" }, { source: "statement\\s+of\\s+account" }, { source: "account\\s+statement" }],
+  bank_statement: [
+    { source: "bank\\s+statement" },
+    { source: "statement\\s+of\\s+account" },
+    { source: "account\\s+statement" },
+    // (fix round 1) "statements" on its own, PLURAL only ("there are no
+    // statements to show your funds"): a narrative means bank statements by
+    // it. The singular "statement" is the applicant's own written statement
+    // in this product, so it is never a bank-statement phrase. The plural
+    // suffix the check allows adds nothing here.
+    { source: "statements" },
+  ],
   payslip: [{ source: "pay\\s*slip" }, { source: "salary\\s+slip" }, { source: "pay\\s+stub" }],
   employment_letter: [
     { source: "employer(?:'s|’s)?\\s+letter" },
@@ -1062,46 +1232,148 @@ const DOCUMENT_KIND_PHRASES: Readonly<Record<DocumentKind, readonly KindPhrase[]
   other: [],
 };
 
-/**
- * (#418) After a kind phrase, these verbs say what the document SHOWS, not
- * that it is missing ("no bank statement shows a salary"): a "no <phrase>"
- * followed by one of them is not a missing-document claim.
- */
-const CONTENT_VERB_AFTER = "(?!\\s+(?:shows?|records?|mentions?|covers?|names?|lists?|includes?|contains?|confirms?|gives?|states?|explains?)\\b)";
+// ----- (#418 fix round 1) The grammar of a "this document is missing" claim -----
+//
+// Round 0 used wide character windows ("<phrase> ... up to 60 characters ...
+// not provided") and a loose "no <up to 2 words> <phrase>", and so dropped
+// ordinary caseworker reasoning: "the bank statements do not appear to show a
+// regular salary", "there are no passport stamps", "the source of the deposit
+// has not been provided", "your bank statement is missing the last two
+// months". A dropped conclusion nulls the whole narrative, so PRECISION
+// matters more than recall here: the prompt rule (DOCUMENT_LIST_RULES) is the
+// first line of defence, this check only catches the plain claims.
+//
+// So each pattern below is grammar-shaped: the kind phrase is the SUBJECT or
+// OBJECT, DIRECTLY next to the absence words (at most a determiner before it,
+// "itself"/"also"/"still" after it), and the claim must END there (end of
+// sentence or clause, or "in/among/from your uploads"). A content noun after
+// the phrase ("passport STAMPS", "bank statement ENTRIES", "CAS NUMBER"), an
+// adjective before it ("a more RECENT bank statement", "a bank statement
+// DATED within 31 days"), an object after "is missing" ("is missing THE LAST
+// TWO MONTHS") or a coverage tail ("not included FOR MARCH") all break the
+// match, so those sentences are kept. A qualified recency/coverage ask is
+// real advice while the 31-day check (#444) is open.
+
+/** A negation: " not", "n't" (isn't, wasn't, hasn't, haven't, didn't, couldn't, can't...) or " never". */
+const NEG = "(?:\\s+not|n['’]t|\\s+never)";
+
+/** A determiner allowed directly before the kind phrase ("your", "a", "any"...). */
+const DET = "(?:(?:a|an|any|your|the|their|his|her|its|this|these|those)\\s+)";
 
 /**
- * (#418) Words after a kind phrase (in the same sentence, a short way on)
- * that say it is absent: "is not included", "are missing", "has not been
- * provided", "could not be found", "does not appear". "could not be read" is
- * deliberately NOT here: a second, unread document of a kind that was also
- * read may be described that way, and is allowed.
+ * Where a SUBJECT may start: the start of the text or of a clause (after
+ * . ! ? ; : , ( or a newline), or after a conjunction. Lookbehinds, so the
+ * phrase stays group 1. Requiring this (instead of "anywhere") is what keeps
+ * "a more recent bank statement is missing" and "the source of the deposit
+ * has not been provided" from matching.
  */
-const ABSENT_AFTER =
-  "[^.!?;\\n]{0,60}?\\b(?:(?:is|are|was|were|has|have)\\s+(?:not|never)\\s+(?:been\\s+)?(?:included|provided|sent|uploaded|attached|supplied|given|submitted)|(?:is|are)\\s+missing|(?:could|can)\\s+not\\s+be\\s+found|(?:does|do|did)\\s+not\\s+appear)\\b";
+const SUBJECT_START =
+  "(?:^|(?<=[.!?;:,(\\n]\\s*)|(?<=\\b(?:and|but|or|so|because|while|although|since|that|if|when|whereas|also|however)\\s+))";
 
-/** (#418) Words before a kind phrase that say it is absent: "no", "without (your)", "missing", "the absence of". */
-const ABSENT_BEFORE = "\\b(?:no|without(?:\\s+(?:a|an|any|your|the))?|missing|absence\\s+of(?:\\s+(?:a|an|any|your|the))?)\\s+(?:[A-Za-z-]+\\s+){0,2}?";
+/** Words allowed between the subject phrase and its verb ("the CAS itself is not included"). */
+const SUBJECT_TAIL = "(?:\\s+(?:itself|themselves|also|still))?";
+
+/** The participles of "sending" a document ("not included", "not provided"...). */
+const SENT_VERB = "(?:included|provided|sent|uploaded|attached|supplied|submitted|given|received|enclosed)";
+
+/**
+ * The absence predicates after a subject phrase:
+ *  - "is/are/was/were/has/have/had not (been) <sent verb>" and contractions
+ *    ("isn't included", "hasn't been uploaded", "has never been sent");
+ *  - "is/are/was/were missing/absent" (only with nothing after it but the
+ *    end, see CLAIM_END: "is missing the last two months" is a gap, kept);
+ *  - "could not / cannot / can't be found";
+ *  - "does/do/did not appear" (only when it ends the claim: "does not appear
+ *    among your uploads"; "does not appear to show" is kept).
+ */
+const ABSENT_PREDICATE =
+  `(?:(?:is|are|was|were|has|have|had)${NEG}(?:\\s+been)?(?:\\s+yet)?\\s+${SENT_VERB}` +
+  "|(?:is|are|was|were)\\s+(?:missing|absent)" +
+  `|(?:(?:could|can)${NEG}|\\s*cannot)\\s+be\\s+(?:found|located)` +
+  `|(?:does|do|did)${NEG}\\s+appear)`;
+
+/**
+ * The end of a missing claim: optional "yet / either / at all", then the end
+ * of the text, a clause mark, a conjunction, or a "where" tail naming the
+ * uploads ("in your upload", "among what you sent", "from the file", "with
+ * your application"). Anything else after it (an object, "for March", "to
+ * show ...") means the sentence is about content or coverage, and is kept.
+ */
+const CLAIM_END =
+  "(?:\\s+(?:yet|either|at\\s+all))?" +
+  "(?=\\s*(?:$|[.,;:!?)\\n—–-]|\\b(?:so|and|but|or|which|because)\\b" +
+  "|\\b(?:in|with|among|from|to|for)\\s+(?:your|the|this|what|any)\\s+(?:uploads?|application|documents?|files?|submission|pack|bundle|evidence|you)\\b))";
+
+/** A looser end after "there is no <phrase>": also a purpose tail ("there are no statements to show your funds"). */
+const THERE_IS_NO_END = `(?:${CLAIM_END}|(?=\\s+to\\s+(?:show|prove|support|confirm|back|evidence|check)\\b))`;
+
+/** The end after "without your <phrase>": a clause mark or a new subject ("without your bank statements we cannot..."). */
+const WITHOUT_END = "(?=\\s*(?:$|[.,;:!?)\\n]|\\b(?:we|you|it|they|there|this|i|nothing|no\\s+one|the\\s+officer|an?\\s+officer)\\b))";
+
+/** Active verbs of sending or finding a document ("you did not include", "we could not find"). */
+const ACTIVE_VERB =
+  "(?:include|included|send|sent|provide|provided|upload|uploaded|attach|attached|submit|submitted|supply|supplied|receive|received|see|seen|saw|find|found|locate|located)";
 
 /**
  * (#418) A compiled "this kind is missing" pattern for one phrase. The
  * regex is case-insensitive (sentence case, capitals) and captures the
- * phrase as written; an acronym phrase is then also checked in its own
- * capitals (`exact`), so "CAS" counts and "cas" does not.
+ * phrase as written in group 1; an acronym phrase is then also checked in
+ * its own capitals (`exact`), so "CAS" counts and "cas" does not.
  */
 interface KindMissingPattern {
   re: RegExp;
   exact: RegExp | null;
 }
 
-/** (#418) The two patterns ("no <phrase>", "<phrase> ... is not included") for one phrase. */
+/**
+ * (#418, rewritten in fix round 1) The grammar-shaped patterns for one
+ * phrase (K), each a whole-document absence claim:
+ *  1. subject:  "<det> K (itself) <absent predicate> <end>"
+ *               ("the CAS itself is not included", "your bank statement isn't
+ *               included", "a bank statement does not appear among your uploads");
+ *  2. there:    "there is/are/was/were (been) no K <end>" and "there isn't a /
+ *               aren't any K <end>" ("there is no passport or other identity
+ *               document", "there are no bank statements, payslips, ...");
+ *  3. no+verb:  "no K (was/were/has been/have been) <sent verb|found|seen> <end>"
+ *               ("no bank statement was uploaded", "no letter from your
+ *               employer was provided");
+ *  4. no+appear: "no K ... appear(s) among/in what you sent / your uploads"
+ *               (the "where" tail is strong enough to allow a short gap:
+ *               "no bank statements from Crestway Bank Plc appear among what you sent");
+ *  5. bare no:  "no K" ending the sentence ("we found no bank statement.");
+ *  6. active:   "you/we (still) did not / have not / could not / can't / never
+ *               <active verb> <det> K <end>" ("you did not include a payslip",
+ *               "we have not received your bank statements", "we could not
+ *               find a bank statement", "we did not see any bank statements in your upload");
+ *  7. without:  "without your/any/a/the K" + a clause mark or a new subject
+ *               ("without your bank statements we cannot check the funds";
+ *               "without a doubt your bank statement ..." does not match);
+ *  8. listing:  "K: none / missing / not provided".
+ */
 function kindMissingPatterns(p: KindPhrase): KindMissingPattern[] {
   // A trailing plural is allowed ("bank statements", "payslips"). Group 1 is the phrase as written.
-  const phrase = `((?:${p.source})(?:e?s)?)\\b`;
+  const K = `((?:${p.source})(?:e?s)?)\\b`;
   const exact = p.caseSensitive ? new RegExp(`^(?:${p.source})(?:e?s)?$`) : null;
-  return [
-    { re: new RegExp(`${ABSENT_BEFORE}${phrase}${CONTENT_VERB_AFTER}`, "gi"), exact },
-    { re: new RegExp(`\\b${phrase}${ABSENT_AFTER}`, "gi"), exact },
+  const sources = [
+    // 1. subject + absence predicate
+    `${SUBJECT_START}${DET}?${K}${SUBJECT_TAIL}\\s+${ABSENT_PREDICATE}${CLAIM_END}`,
+    // 2. there is no K / there isn't a K
+    `\\bthere\\s+(?:is|are|was|were|has\\s+been|have\\s+been)\\s+no\\s+${K}${THERE_IS_NO_END}`,
+    `\\bthere\\s+(?:is|are|was|were)${NEG}\\s+(?:a|an|any)\\s+${K}${THERE_IS_NO_END}`,
+    // 3. no K was/were <sent verb>
+    `\\bno\\s+${K}${SUBJECT_TAIL}\\s+(?:was|were|is|are|has\\s+been|have\\s+been|had\\s+been)\\s+(?:yet\\s+)?(?:${SENT_VERB}|found|seen)${CLAIM_END}`,
+    // 4. no K ... appear(s) among what you sent
+    `\\bno\\s+${K}[^.!?;\\n]{0,60}?\\s+appear(?:s|ed)?\\s+(?:among|in)\\s+(?:what\\s+you\\s+(?:sent|uploaded|provided)|your\\s+(?:uploads|documents|files|application))\\b`,
+    // 5. bare "no K" at the end of a sentence
+    `\\bno\\s+${K}(?=\\s*(?:$|[.;!?]))`,
+    // 6. active forms
+    `\\b(?:you|we|i)\\s+(?:still\\s+)?(?:(?:did|do|does|have|has|had|could|can|were|was)${NEG}|cannot|never)\\s+(?:yet\\s+)?${ACTIVE_VERB}\\s+${DET}?${K}${CLAIM_END}`,
+    // 7. without your K, ...
+    `\\bwithout\\s+(?:your|any|a|an|the)\\s+${K}${WITHOUT_END}`,
+    // 8. K: none
+    `${K}\\s*:\\s*(?:none|missing|absent|not\\s+(?:provided|sent|uploaded|included))\\b`,
   ];
+  return sources.map((src) => ({ re: new RegExp(src, "gi"), exact }));
 }
 
 /** (#418) True when one pattern finds a match (in the phrase's own capitals, for an acronym). */
@@ -1117,23 +1389,33 @@ const KIND_MISSING_PATTERNS: ReadonlyMap<DocumentKind, KindMissingPattern[]> = n
   DOCUMENT_KINDS.map((k) => [k, DOCUMENT_KIND_PHRASES[k].flatMap(kindMissingPatterns)])
 );
 
+/** The documents as a whole: "documents", "uploads", "files" (never "evidence", see NOTHING_READ_RES). */
+const ALL_DOCS = "(?:documents?|uploads?|files?)";
+
 /**
- * (#418) Sentences that say NO document at all was read, sent or uploaded.
- * Only a false claim when at least one document WAS read. A sentence about
- * ONE upload that could not be read ("your second upload could not be read
- * because it is password protected") matches none of these.
+ * (#418, tightened in fix round 1) Sentences that say NO document at all was
+ * read, sent or uploaded. Only a false claim when at least one document WAS
+ * read. A sentence about ONE upload that could not be read ("your second
+ * upload could not be read because it is password protected") matches none.
+ *
+ * Fix round 1: the subject must be the documents / uploads / files AS A
+ * WHOLE: never "evidence" ("no evidence has been provided to explain the cash
+ * deposits" is a point about the deposits), never with a word in between
+ * ("no OTHER documents were provided to support the sponsor's income", "no
+ * SUPPORTING documents"), and the claim must end there (CLAIM_END: "no
+ * documents were provided TO SUPPORT ..." is about one point, and is kept).
  */
 const NOTHING_READ_RES: readonly RegExp[] = [
   // "no documents could be read", "no documents were sent", "no files have been uploaded"
-  /\bno\s+(?:\w+\s+)?(?:documents?|uploads?|files?|evidence)\s+(?:could|can|were|was|have|has|had)\s+(?:not\s+)?(?:be\s+|been\s+)?(?:read|opened|found|seen|sent|uploaded|provided|submitted|received)\b/i,
-  // "none of your documents could be read"
-  /\bnone\s+of\s+(?:your|the)\s+(?:\w+\s+)?(?:documents|uploads|files)\s+(?:could|can|were|was|have|has)\b/i,
-  // "we could not read any of your documents", "could not read your documents"
-  /\b(?:could|can)\s*(?:not|n't)\s+read\s+(?:any\s+(?:of\s+)?)?(?:your|the)?\s*(?:documents|uploads|files)\b/i,
-  // "you have not sent any documents", "you did not upload any documents"
-  /\b(?:have|has|did|do)\s*(?:not|n't)\s+(?:sent|send|uploaded|upload|provided|provide|included|include|submitted|submit)\s+any\s+(?:\w+\s+)?(?:documents|files|uploads|evidence)\b/i,
+  new RegExp(`\\bno\\s+${ALL_DOCS}\\s+(?:could|can|were|was|have|has|had)(?:\\s+not|n['’]t)?\\s+(?:be\\s+|been\\s+)?(?:read|opened|found|seen|sent|uploaded|provided|submitted|received)${CLAIM_END}`, "i"),
+  // "none of your documents could be read / were sent"
+  new RegExp(`\\bnone\\s+of\\s+(?:your|the)\\s+(?:documents|uploads|files)\\s+(?:could|can|were|was|have|has)(?:\\s+not|n['’]t)?\\s+(?:be\\s+|been\\s+)?(?:read|opened|used|sent|uploaded|provided|received)${CLAIM_END}`, "i"),
+  // "we could not read any of your documents", "cannot open your files"
+  new RegExp(`\\b(?:could|can)(?:\\s*not|n['’]t)\\s+(?:read|open)\\s+(?:any\\s+(?:of\\s+)?)?(?:your|the)\\s+(?:documents|uploads|files)${CLAIM_END}`, "i"),
+  // "you have not sent any documents", "you did not upload any files"
+  new RegExp(`\\b(?:have|has|did|do)(?:\\s+not|n['’]t)\\s+(?:sent|send|uploaded|upload|provided|provide|included|include|submitted|submit)\\s+any\\s+(?:documents|files|uploads)${CLAIM_END}`, "i"),
   // "you have sent no documents"
-  /\b(?:sent|uploaded|provided|submitted|included)\s+no\s+(?:\w+\s+)?(?:documents|files|uploads)\b/i,
+  new RegExp(`\\b(?:sent|uploaded|provided|submitted|included)\\s+no\\s+(?:documents|files|uploads)${CLAIM_END}`, "i"),
   // "nothing could be read", "nothing was read from"
   /\bnothing\s+(?:could\s+be|was|has\s+been|can\s+be)\s+read\b/i,
 ];

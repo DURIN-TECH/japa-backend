@@ -31,7 +31,7 @@ export interface DocumentCheckRecord {
   rubricVersion: number | null;
   /** Model id that read the document; null when no model call was made. */
   model: string | null;
-  /** Version of the extraction prompt (ASSESSMENT_PROMPT_VERSION). */
+  /** Version of the extraction prompt (DOCUMENT_CHECK_PROMPT_VERSION since #418). */
   promptVersion: string;
   /** sha256 of the file bytes; lets an identical re-upload reuse the extraction. */
   fileHash: string | null;

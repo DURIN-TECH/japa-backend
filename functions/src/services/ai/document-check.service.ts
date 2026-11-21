@@ -13,7 +13,9 @@ import { readAiSettings, type AiSettingsRead } from "./ai-settings";
 import { CHECK_FIELDS, COULD_NOT_CHECK_MESSAGES, evaluateDocumentCheck, expectationsFor, hasFix, maskName, rawFactsOf, type CouldNotCheckCode, type RawFacts } from "./document-check-engine";
 import { extractOneDocument, type ExtractionFailureCode } from "./document-extraction";
 import { AnthropicLlmProvider, type LlmProvider } from "./llm-provider";
-import { ASSESSMENT_PROMPT_VERSION } from "./prompt-safety";
+// (#418 fix round 1) The check has its own prompt version (its request did not
+// change with the #418 assessment prompt bump), so stored checks stay reusable.
+import { DOCUMENT_CHECK_PROMPT_VERSION } from "./prompt-safety";
 
 // ============================================
 // DOCUMENT CHECK SERVICE — the I/O half (issue #115)
@@ -269,7 +271,7 @@ export class DocumentCheckService {
           checklistItemId: request.checklistItemId!,
           rubricVersion: null,
           model: null,
-          promptVersion: ASSESSMENT_PROMPT_VERSION,
+          promptVersion: DOCUMENT_CHECK_PROMPT_VERSION,
           fileHash: null,
           reusedFromDocumentId: null,
           status: "queued",
