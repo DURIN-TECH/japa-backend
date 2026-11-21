@@ -32,3 +32,22 @@ export function refundDocId(reference: string): string {
 export function feeDebitDocId(reference: string): string {
   return `feedebit_${createHash("sha256").update(reference).digest("hex")}`;
 }
+
+/**
+ * Issue #413 (mismatch resolution): the doc id of the ONE top-up refund a
+ * charge can ever get (`refundtopup_` + the SHA-256 of its Paystack
+ * reference), sent when Paystack refunded less than planned and the admin
+ * put the gap on the agent. Deterministic and written with `tx.create`, so
+ * a second resolve can never send a second top-up.
+ */
+export function mismatchTopUpDocId(reference: string): string {
+  return `refundtopup_${createHash("sha256").update(reference).digest("hex")}`;
+}
+
+/**
+ * Issue #413 (mismatch resolution): the doc id of the ONE agent adjustment a
+ * charge can ever get (`refundadj_` + the SHA-256 of its reference).
+ */
+export function mismatchAdjustmentDocId(reference: string): string {
+  return `refundadj_${createHash("sha256").update(reference).digest("hex")}`;
+}

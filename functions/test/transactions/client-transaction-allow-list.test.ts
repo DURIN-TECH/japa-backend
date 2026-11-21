@@ -187,6 +187,15 @@ const FULL_ROW: Required<Transaction> = {
   // ---- Issue #382: the freeze of a fee whose client reported a missed meeting (hidden) ----
   feeHoldFrozenByReportId: "HIDDEN-no-show-report-id",
   feeHoldFrozenByReportAt: Timestamp.fromMillis(1_755_555_567_000),
+  // ---- Issue #413: a resolved refund mismatch, its top-up and the agent adjustment (hidden) ----
+  refundMismatchResolution: {
+    carriedBy: "agent", providerRefundId: "HIDDEN-adopted-refund-id", refundedMinor: 1, plannedMinor: 2,
+    agentAdjustmentMinor: 0, resolvedBy: "HIDDEN-resolving-admin", resolvedAt: Timestamp.fromMillis(1_755_555_568_000),
+  },
+  plannedAmountMinor: 31_313,
+  refundTopUpOf: "HIDDEN-original-refund-row",
+  refundTopUpExcludes: ["HIDDEN-excluded-refund-id"],
+  adjustmentDirection: "credit",
 };
 
 /**
@@ -294,6 +303,12 @@ const HIDDEN_FIELDS: readonly (keyof Transaction)[] = [
   // Issue #382: the no-show report's freeze.
   "feeHoldFrozenByReportId",
   "feeHoldFrozenByReportAt",
+  // Issue #413: the mismatch resolution's bookkeeping.
+  "refundMismatchResolution",
+  "plannedAmountMinor",
+  "refundTopUpOf",
+  "refundTopUpExcludes",
+  "adjustmentDirection",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */

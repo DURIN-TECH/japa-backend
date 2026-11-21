@@ -23,6 +23,8 @@ const TRANSACTION_TYPES: Transaction["type"][] = [
   "consultation_fee", "service_fee", "government_fee", "refund", "escrow_release", "withdrawal",
   // Issue #354: Paystack's fee on a refunded payment, taken from the agent.
   "paystack_fee_debit",
+  // Issue #413: an agent's adjustment when a refund mismatch is resolved.
+  "refund_adjustment",
 ];
 
 /** Issue #395: every Paystack-fee status, for the admin `paystackFeeStatus` list filter. */

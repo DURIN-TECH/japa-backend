@@ -1678,7 +1678,15 @@ export type TransactionType =
   // outflow: lowers revenue and the available balance of its currency from
   // the moment it is written, never `heldBalance`; may take it below zero.
   // Never shown to the client.
-  | "paystack_fee_debit";
+  | "paystack_fee_debit"
+  // Issue #413 (mismatch resolution, decision 2026-11-21): an adjustment of
+  // the AGENT's balance when an admin resolves a refund Paystack paid in a
+  // different amount than planned. `amount` > 0 with `adjustmentDirection`
+  // ("credit": the agent gets it, "debit": it is taken). Settled when
+  // written (`completed`); counts in revenue and the available balance of its
+  // currency, never `heldBalance`. One per reference
+  // (`mismatchAdjustmentDocId`, `tx.create`). Never shown to the client.
+  | "refund_adjustment";
 
 export type TransactionStatus = 
   | "pending"
@@ -1775,7 +1783,43 @@ export type RefundClosedOutcome = "nothing_to_refund";
  *    the row carries no `agentId` at all. The money given back is exactly
  *    the money that came in on that reference.
  */
-export type RefundFundedFrom = "hold" | "available" | "unapplied_payment";
+export type RefundFundedFrom =
+  | "hold"
+  | "available"
+  | "unapplied_payment"
+  // Issue #413 (mismatch resolution): the TOP-UP refund sent when Paystack
+  // refunded less than planned and the admin put the gap on the agent. The
+  // agent already gave back the planned amount on the original row, so the
+  // top-up is neutral for the agent's balances and revenue: it is money Seli
+  // was holding for the client, sent on to them.
+  | "mismatch_top_up";
+
+/**
+ * Issue #413 (mismatch resolution): what an admin decided for a refund row
+ * flagged `provider_refund_mismatch`, stored on that row (it is then final).
+ * X is what Paystack really refunded (read from Paystack, `processed`), P
+ * what the row planned for the client. Minor units of the row's currency.
+ */
+export interface RefundMismatchResolution {
+  /** Who carries the difference (no default). */
+  carriedBy: PaystackFeeBorneBy;
+  /** Paystack's refund that was adopted (its id, as read from Paystack). */
+  providerRefundId: string;
+  /** X. */
+  refundedMinor: number;
+  /** P. */
+  plannedMinor: number;
+  /** The top-up refund row (`mismatchTopUpDocId`), when one was sent (X < P, agent). */
+  topUpRefundId?: string;
+  /** G = P - X, when a top-up was sent. */
+  topUpMinor?: number;
+  /** The agent's adjustment row (`mismatchAdjustmentDocId`), when one was written. */
+  adjustmentId?: string;
+  /** Signed effect of that adjustment on the agent (+ credit, - debit), 0 when none. */
+  agentAdjustmentMinor: number;
+  resolvedBy: string;
+  resolvedAt: Timestamp;
+}
 
 /**
  * Issue #390 (decision 2026-11-16, "whoever caused the refund carries
@@ -2103,6 +2147,21 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   refundClosedBy?: string;
   /** Issue #413 (B): what it was closed as. */
   refundClosedOutcome?: RefundClosedOutcome;
+  // ---- Issue #413: resolving a mismatch-flagged refund ----
+  /** On the flagged row once an admin resolved it (see RefundMismatchResolution). */
+  refundMismatchResolution?: RefundMismatchResolution;
+  /** On a resolved row whose `amount` was set to what Paystack refunded: the amount it planned. */
+  plannedAmountMinor?: number;
+  /** On a top-up refund row: the original refund row it completes. */
+  refundTopUpOf?: string;
+  /**
+   * On a top-up refund row: Paystack refund ids of the same charge that are
+   * NOT this row's (the original refund, earlier attempts). The engine and
+   * the poll never adopt or match them.
+   */
+  refundTopUpExcludes?: string[];
+  /** On a `refund_adjustment`: whether the agent is credited or debited `amount`. */
+  adjustmentDirection?: "credit" | "debit";
 
   createdAt: Timestamp;
   updatedAt: Timestamp;

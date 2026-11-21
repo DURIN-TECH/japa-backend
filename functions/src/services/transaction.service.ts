@@ -20,6 +20,8 @@ import type { ChargeSnapshot, CurrencyCode } from "../types/money";
 import {
   // Issue #413 (K): the one copy of "what a refund takes off the agent".
   agentReversalOf,
+  // Issue #413: an agent adjustment of a resolved refund mismatch.
+  agentAdjustmentOf,
   CurrencyBuckets,
   // Issue #354: Paystack-fee debits from the agent.
   isAgentDebit,
@@ -348,6 +350,8 @@ class TransactionService {
       // `userId` is the agent, so the query above never returns it to a
       // client); filtered again so no future change can show it to one.
       .filter((txn) => txn.type !== "paystack_fee_debit")
+      // Issue #413: an agent's adjustment is the agent's money, never the client's.
+      .filter((txn) => txn.type !== "refund_adjustment")
       .filter((txn) => this.matchesFilters(txn, filters));
   }
 
@@ -555,6 +559,13 @@ class TransactionService {
         available.add(currency, -txn.amount);
         continue;
       }
+      // ---- Issue #413: an agent adjustment of a resolved refund mismatch ----
+      // Settled when written: a credit raises, a debit lowers the available
+      // balance of its currency (may go below zero); never `heldBalance`.
+      if (txn.type === "refund_adjustment") {
+        available.add(currency, agentAdjustmentOf(txn));
+        continue;
+      }
 
       // ---- Issue #317: available vs held ----
       if (txn.type === "refund") {
@@ -563,6 +574,9 @@ class TransactionService {
           // back. It was never credited, so it is debited from nothing.
           // (Such a row has no agentId, so it is not even in an agent's
           // query; this keeps an all-rows admin total right too.)
+        } else if (txn.refundFundedFrom === "mismatch_top_up") {
+          // Issue #413: the top-up of a resolved mismatch. The agent already
+          // gave the planned amount back on the original row: neutral.
         } else if (txn.refundFundedFrom === "hold") {
           // Paid out of a held fee: that fee is already out of both balances.
         } else if (txn.refundFundedFrom === "available") {

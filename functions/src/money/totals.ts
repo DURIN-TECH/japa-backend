@@ -179,6 +179,9 @@ export function revenueEffect(
     Partial<Pick<Transaction, "refundFundedFrom" | "paystackFeeStatus" | "paystackFeeMinor" | "agentReversalMinor">>
 ): number {
   if (txn.type === "withdrawal") return 0;
+  // Issue #413 (mismatch resolution): the agent's adjustment, settled when
+  // written: + a credit, - a debit, in its own currency.
+  if (txn.type === "refund_adjustment") return agentAdjustmentOf(txn);
   // Issue #413 (J): a consultation refund out of the hold or from available
   // is owed from the moment it is written (see the rule list above), so it
   // takes what it takes off the AGENT at every status, settled or not.
@@ -188,6 +191,9 @@ export function revenueEffect(
   // gives back money that was never counted as revenue (no fee Transaction
   // was written for it), so it subtracts nothing either.
   if (isUnappliedPaymentRefund(txn)) return 0;
+  // Issue #413: a top-up refund is money Seli held for the client; the agent
+  // already gave the planned amount back on the original row: neutral.
+  if (isMismatchTopUp(txn)) return 0;
   // Issue #354: Paystack's fee on a refunded payment the agent side caused,
   // taken from the agent. An outflow, like a refund: it lowers revenue in its
   // own currency (computeStats takes it off the available balance too).
@@ -232,6 +238,31 @@ export function agentReversalOf(txn: Pick<Transaction, "amount"> & Partial<Pick<
 }
 
 /**
+ * Issue #413 (mismatch resolution): true for the top-up refund of a charge
+ * Paystack refunded less than planned (`refundFundedFrom: "mismatch_top_up"`).
+ * Neutral for every agent balance and revenue figure. Pure.
+ */
+export function isMismatchTopUp(
+  txn: Pick<Transaction, "type"> & Partial<Pick<Transaction, "refundFundedFrom">>
+): boolean {
+  return txn.type === "refund" && txn.refundFundedFrom === "mismatch_top_up";
+}
+
+/**
+ * Issue #413 (mismatch resolution): the signed effect of a
+ * `refund_adjustment` on the agent (+ credit, - debit), 0 for any other row
+ * or a malformed one. Pure.
+ */
+export function agentAdjustmentOf(
+  txn: Pick<Transaction, "type" | "amount"> & Partial<Pick<Transaction, "adjustmentDirection">>
+): number {
+  if (txn.type !== "refund_adjustment" || !Number.isSafeInteger(txn.amount) || txn.amount <= 0) return 0;
+  if (txn.adjustmentDirection === "credit") return txn.amount;
+  if (txn.adjustmentDirection === "debit") return -txn.amount;
+  return 0;
+}
+
+/**
  * Issue #354: true for a debit of Paystack's processing fee from the agent
  * (`paystack_fee_debit`). Money going OUT of the agent's balance: never an
  * incoming payment, never pending revenue. Pure.
@@ -259,7 +290,8 @@ export function isUnappliedPaymentRefund(
  */
 export function isPendingIncoming(txn: Pick<Transaction, "type" | "status">): boolean {
   // Issue #354: a fee debit is an outflow too.
-  if (txn.type === "withdrawal" || txn.type === "refund" || isAgentDebit(txn)) return false;
+  // Issue #413: an agent adjustment is bookkeeping, never a pending payment.
+  if (txn.type === "withdrawal" || txn.type === "refund" || isAgentDebit(txn) || txn.type === "refund_adjustment") return false;
   return PENDING_STATUSES.includes(txn.status);
 }
 

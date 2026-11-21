@@ -1403,6 +1403,115 @@ export class ConsultationController {
   }
 
   /**
+   * POST /consultations/:id/refund/resolve-mismatch (issue #413, ADMIN only;
+   * decision 2026-11-21). Body `{ refundId, carriedBy: "client" | "agent" }`,
+   * both required, no default.
+   *
+   * Resolves a refund row flagged `provider_refund_mismatch`: X (what
+   * Paystack really refunded) is READ from Paystack by the flagged refund's
+   * id, never typed in, and only once it is `processed`. Then, in one
+   * Firestore transaction (Seli's net per reference asserted 0):
+   *  - X < P, agent: a top-up refund of P - X is sent (once ever);
+   *  - X < P, client: the client keeps X; the agent is credited P - X;
+   *  - X > P on an agent-caused refund, agent: the agent is debited X - P;
+   * and the row is adopted as X (`completed`). See `planMismatchResolution`.
+   *
+   *  - no token: 401 (verifyAuth); not an admin: 403 before any read;
+   *  - a bad body: 400 VALIDATION_ERROR;
+   *  - no such refund of THIS booking: 404;
+   *  - not flagged as a mismatch: 409 NOT_MISMATCH;
+   *  - Paystack's refund not processed yet: 409 PROVIDER_REFUND_NOT_PROCESSED;
+   *  - X > P on an agent-caused refund with `carriedBy: "client"`: 409 CARRIED_BY_NOT_ALLOWED;
+   *  - X > P on a client-caused refund, another currency, several refunds at
+   *    Paystack, an unapplied payment's refund: 409 NEEDS_MANUAL_RESOLUTION
+   *    (it stays flagged and listed);
+   *  - Paystack unreachable: 502 PAYSTACK_ERROR;
+   *  - resolved before: 200 with `alreadyResolved: true`, nothing new written;
+   *  - resolved now: 200 `{ refund, refundId, resolution, topUp, adjustment, alreadyResolved: false }`.
+   */
+  async resolveRefundMismatch(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      if (req.authz?.role !== ROLES.ADMIN) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      const body = (req.body ?? {}) as { refundId?: unknown; carriedBy?: unknown };
+      if (typeof body.refundId !== "string" || !/^refund_[0-9a-f]{64}$/.test(body.refundId)) {
+        sendError(res, "VALIDATION_ERROR", "refundId must be a refund id");
+        return;
+      }
+      if (body.carriedBy !== "client" && body.carriedBy !== "agent") {
+        sendError(res, "VALIDATION_ERROR", "carriedBy is required and must be client or agent");
+        return;
+      }
+      const outcome = await consultationRefundService.resolveProviderMismatch({
+        consultationId: req.params.id,
+        refundId: body.refundId,
+        carriedBy: body.carriedBy,
+        adminUid: req.userId!,
+      });
+      switch (outcome.kind) {
+      case "not_found":
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      case "not_mismatch":
+        sendError(res, "NOT_MISMATCH", "This refund is not waiting for a mismatch to be resolved.", 409);
+        return;
+      case "not_processed":
+        res.status(409).json({
+          success: false,
+          error: "PROVIDER_REFUND_NOT_PROCESSED",
+          message: "Paystack's refund is not final yet. Try again once Paystack reports it processed.",
+          data: { providerStatus: outcome.providerStatus },
+        });
+        return;
+      case "carried_by_not_allowed":
+        sendError(res, "CARRIED_BY_NOT_ALLOWED", "The client was refunded more than planned on a refund the agent caused: only the agent can carry it.", 409);
+        return;
+      case "needs_manual":
+        res.status(409).json({
+          success: false,
+          error: "NEEDS_MANUAL_RESOLUTION",
+          message: "This refund can't be settled here. It stays flagged for a person to sort out.",
+          data: { reason: outcome.why },
+        });
+        return;
+      case "paystack_unavailable":
+        sendError(res, "PAYSTACK_ERROR", "Paystack could not be reached. Try again in a moment.", 502);
+        return;
+      case "already_resolved":
+        sendSuccess(res, {
+          refund: refundSummary(outcome.refund),
+          refundId: outcome.refund.id,
+          resolution: outcome.refund.refundMismatchResolution,
+          topUp: outcome.topUp ? refundSummary(outcome.topUp) : null,
+          alreadyResolved: true,
+        });
+        return;
+      case "resolved":
+        sendSuccess(res, {
+          refund: refundSummary(outcome.refund),
+          refundId: outcome.refund.id,
+          resolution: outcome.refund.refundMismatchResolution,
+          topUp: outcome.topUp ? { ...refundSummary(outcome.topUp), refundId: outcome.topUp.id } : null,
+          adjustment: outcome.adjustment
+            ? {
+              id: outcome.adjustment.id,
+              direction: outcome.adjustment.adjustmentDirection,
+              amount: { amountMinor: outcome.adjustment.amount, currency: outcome.adjustment.currency },
+            }
+            : null,
+          alreadyResolved: false,
+        });
+        return;
+      }
+    } catch (error) {
+      console.error("Error resolving a refund mismatch:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * POST /consultations/:id/refund/close (issue #413 B, ADMIN only;
    * decision 2026-11-21).
    *

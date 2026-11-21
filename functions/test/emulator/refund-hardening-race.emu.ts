@@ -223,6 +223,41 @@ describe("no-show reports under concurrent requests (#382)", () => {
   });
 });
 
+describe("resolving a refund mismatch under concurrent requests (#413, decision 2026-11-21)", () => {
+  test("two admins resolve one flagged refund at once (agent vs client): one outcome written, Seli's net 0", async () => {
+    await seedStartedBooking("mb1", "hagent4", "hclient", { startedAgoMin: -7 * 24 * 60 });
+    const { collections } = await import("../../src/utils/firebase");
+    const { consultationRefundService } = await import("../../src/services/consultation-refund.service");
+    // The agent cancels. Then it turns out the only refund Paystack really
+    // holds for the charge is a manual dashboard one of ₦5,000 (the stub's
+    // own create is dropped), and the engine's next look-up flags the row.
+    assert.equal((await api.call("PUT", "/consultations/mb1/status", tokens.hagent4, { status: "cancelled" })).status, 200);
+    const [row] = await refundsOf("mb1");
+    paystackRefunds.set("cons-mb1-ref", [{ id: "manual-mb1", status: "processed", transactionReference: "cons-mb1-ref", amount: 500_000, currency: "NGN" }]);
+    await collections.transactions.doc(row.id).update({ status: "pending", refundProviderCalls: 1, refundLeaseUntil: Timestamp.fromMillis(0) });
+    await consultationRefundService.processRefund(row.id);
+    const flagged = (await collections.transactions.doc(row.id).get()).data()!;
+    assert.equal(flagged.refundFailureReason, "provider_refund_mismatch", JSON.stringify(flagged));
+    const callsBefore = refundCalls.length;
+    const results = await Promise.all([
+      api.call("POST", "/consultations/mb1/refund/resolve-mismatch", tokens.hadmin, { refundId: row.id, carriedBy: "agent" }),
+      api.call("POST", "/consultations/mb1/refund/resolve-mismatch", tokens.hadmin, { refundId: row.id, carriedBy: "client" }),
+    ]);
+    assert.deepEqual(results.map((r) => r.status), [200, 200], JSON.stringify(results.map((r) => r.body)));
+    assert.deepEqual(results.map((r) => r.body.data.alreadyResolved).sort(), [false, true]);
+    const all = (await collections.transactions.where("consultationId", "==", "mb1").get()).docs.map((d) => d.data());
+    const topUps = all.filter((t) => t.refundTopUpOf);
+    const adjustments = all.filter((t) => t.type === "refund_adjustment");
+    assert.equal(topUps.length + adjustments.length, 1, "exactly one outcome written");
+    assert.ok(refundCalls.length - callsBefore <= 1, "at most the one top-up");
+    // Seli's net for the reference: A - F - refunded - the agent's total, through the real stats route.
+    const refunded = (paystackRefunds.get("cons-mb1-ref") ?? []).filter((r) => r.status !== "failed").reduce((s, r) => s + r.amount, 0);
+    const stats = await api.call("GET", "/transactions/stats", tokens.hagent4);
+    const ngn = stats.body.data.byCurrency.find((r: any) => r.currency === "NGN");
+    assert.equal(A - F - refunded - (ngn.heldBalance + ngn.availableBalance), 0);
+  });
+});
+
 describe("the held refund close and the refund attempts under concurrent requests (#413, #383, #381)", () => {
   test("two admins close one held client-cancel refund (fee >= charge) at once: closed once", async () => {
     // A future slot (the client may cancel 24 h+ ahead), and Paystack's fee is the whole charge.
