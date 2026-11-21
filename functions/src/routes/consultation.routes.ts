@@ -39,6 +39,13 @@ router.get("/no-show-reports", verifyAuth, (req, res) =>
   consultationController.listNoShowReports(req, res)
 );
 
+// Issue #411: admin list of bookings the abandoned-booking sweep set aside.
+// Before /:id, so "sweep-review" is never read as a booking id. 401 without
+// a token (verifyAuth); the controller answers 403 for anyone but an admin.
+router.get("/sweep-review", verifyAuth, (req, res) =>
+  consultationController.listSweepReview(req, res)
+);
+
 router.get("/:id", verifyAuth, (req, res) =>
   consultationController.getConsultation(req, res)
 );
@@ -94,6 +101,16 @@ router.post("/:id/refund/resolve-mismatch", verifyAuth, (req, res) =>
 // anyone but an admin, before anything is read.
 router.post("/:id/payment-exceptions/:exceptionId/close", verifyAuth, (req, res) =>
   consultationController.closePaymentException(req, res)
+);
+
+// Issue #411: an admin looks a set-aside booking up again (settling a paid
+// checkout only through settlePayment), or cancels it with the sweep's own
+// safety checks. Admin only: the controller answers 403 before any read.
+router.post("/:id/sweep-review/check", verifyAuth, (req, res) =>
+  consultationController.recheckSweepReview(req, res)
+);
+router.post("/:id/sweep-review/cancel", verifyAuth, (req, res) =>
+  consultationController.cancelSweepReview(req, res)
 );
 
 router.delete("/:id", verifyAuth, (req, res) =>
