@@ -831,6 +831,8 @@ export interface HolderFactOptions {
  * holder was read. The check reads `funds.holderIsApplicant`.
  * (#418 fix round 1) Read only from bank statements (or, with no known kind,
  * when the field was an objective field); the first such holder wins.
+ * (#418 fix round 3) When the field was an objective field, a document read
+ * as `other` counts too (e.g. a fixed-deposit certificate).
  */
 export function deriveHolderFact(
   applicantName: string | null,
@@ -852,8 +854,15 @@ export function deriveHolderFact(
     // whose kind is NOT known (`documentKind` undefined: no caseworker read,
     // e.g. the bulk path; or null: the model gave none) counts only when the
     // field was asked as an objective field, which is the pre-#418 behaviour.
+    //
+    // (#418 fix round 3) A document read as `other` (a fixed-deposit
+    // certificate, an investment statement: a holding the rulebook may accept
+    // as funds) also counts when the field was asked as an objective field,
+    // as it did before #418. An identity or other known kind (passport,
+    // payslip, CAS...) never does.
     if (d.documentKind != null) {
-      if (d.documentKind !== "bank_statement") continue;
+      const holderKind = d.documentKind === "bank_statement" || (askedAsObjective && d.documentKind === "other");
+      if (!holderKind) continue;
     } else if (!askedAsObjective) {
       continue;
     }
@@ -1254,8 +1263,16 @@ const DOCUMENT_KIND_PHRASES: Readonly<Record<DocumentKind, readonly KindPhrase[]
 // match, so those sentences are kept. A qualified recency/coverage ask is
 // real advice while the 31-day check (#444) is open.
 
-/** A negation: " not", "n't" (isn't, wasn't, hasn't, haven't, didn't, couldn't, can't...) or " never". */
+/**
+ * A negation added AFTER a verb: " not", "n't" (isn't, wasn't, hasn't,
+ * haven't, didn't, couldn't...) or " never". It cannot spell "can't" (that
+ * would be "can" + "n't" = "cann't"), so every place that takes "can" also
+ * takes CANT below (#418 fix round 3).
+ */
 const NEG = "(?:\\s+not|n['’]t|\\s+never)";
+
+/** (#418 fix round 3) "can't", with a straight or a curly apostrophe: the one contraction NEG cannot make. */
+const CANT = "can['’]t";
 
 /** A determiner allowed directly before the kind phrase ("your", "a", "any"...). */
 const DET = "(?:(?:a|an|any|your|the|their|his|her|its|this|these|those)\\s+)";
@@ -1289,7 +1306,7 @@ const SENT_VERB = "(?:included|provided|sent|uploaded|attached|supplied|submitte
 const ABSENT_PREDICATE =
   `(?:(?:is|are|was|were|has|have|had)${NEG}(?:\\s+been)?(?:\\s+yet)?\\s+${SENT_VERB}` +
   "|(?:is|are|was|were)\\s+(?:missing|absent)" +
-  `|(?:(?:could|can)${NEG}|\\s*cannot)\\s+be\\s+(?:found|located)` +
+  `|(?:(?:could|can)${NEG}|\\s*cannot|${CANT})\\s+be\\s+(?:found|located)` +
   `|(?:does|do|did)${NEG}\\s+appear)`;
 
 /**
@@ -1341,7 +1358,7 @@ interface KindMissingPattern {
  *               (the "where" tail is strong enough to allow a short gap:
  *               "no bank statements from Crestway Bank Plc appear among what you sent");
  *  5. bare no:  "no K" ending the sentence ("we found no bank statement.");
- *  6. active:   "you/we (still) did not / have not / could not / can't / never
+ *  6. active:   "you/we (still) did not / have not / could not / can't (CANT) / never
  *               <active verb> <det> K <end>" ("you did not include a payslip",
  *               "we have not received your bank statements", "we could not
  *               find a bank statement", "we did not see any bank statements in your upload");
@@ -1367,7 +1384,7 @@ function kindMissingPatterns(p: KindPhrase): KindMissingPattern[] {
     // 5. bare "no K" at the end of a sentence
     `\\bno\\s+${K}(?=\\s*(?:$|[.;!?]))`,
     // 6. active forms
-    `\\b(?:you|we|i)\\s+(?:still\\s+)?(?:(?:did|do|does|have|has|had|could|can|were|was)${NEG}|cannot|never)\\s+(?:yet\\s+)?${ACTIVE_VERB}\\s+${DET}?${K}${CLAIM_END}`,
+    `\\b(?:you|we|i)\\s+(?:still\\s+)?(?:(?:did|do|does|have|has|had|could|can|were|was)${NEG}|cannot|${CANT}|never)\\s+(?:yet\\s+)?${ACTIVE_VERB}\\s+${DET}?${K}${CLAIM_END}`,
     // 7. without your K, ...
     `\\bwithout\\s+(?:your|any|a|an|the)\\s+${K}${WITHOUT_END}`,
     // 8. K: none
@@ -1410,8 +1427,9 @@ const NOTHING_READ_RES: readonly RegExp[] = [
   new RegExp(`\\bno\\s+${ALL_DOCS}\\s+(?:could|can|were|was|have|has|had)(?:\\s+not|n['’]t)?\\s+(?:be\\s+|been\\s+)?(?:read|opened|found|seen|sent|uploaded|provided|submitted|received)${CLAIM_END}`, "i"),
   // "none of your documents could be read / were sent"
   new RegExp(`\\bnone\\s+of\\s+(?:your|the)\\s+(?:documents|uploads|files)\\s+(?:could|can|were|was|have|has)(?:\\s+not|n['’]t)?\\s+(?:be\\s+|been\\s+)?(?:read|opened|used|sent|uploaded|provided|received)${CLAIM_END}`, "i"),
-  // "we could not read any of your documents", "cannot open your files"
-  new RegExp(`\\b(?:could|can)(?:\\s*not|n['’]t)\\s+(?:read|open)\\s+(?:any\\s+(?:of\\s+)?)?(?:your|the)\\s+(?:documents|uploads|files)${CLAIM_END}`, "i"),
+  // "we could not read any of your documents", "cannot open your files",
+  // "we can't read any of your documents" (CANT: fix round 3)
+  new RegExp(`\\b(?:(?:could|can)(?:\\s*not|n['’]t)|${CANT})\\s+(?:read|open)\\s+(?:any\\s+(?:of\\s+)?)?(?:your|the)\\s+(?:documents|uploads|files)${CLAIM_END}`, "i"),
   // "you have not sent any documents", "you did not upload any files"
   new RegExp(`\\b(?:have|has|did|do)(?:\\s+not|n['’]t)\\s+(?:sent|send|uploaded|upload|provided|provide|included|include|submitted|submit)\\s+any\\s+(?:documents|files|uploads)${CLAIM_END}`, "i"),
   // "you have sent no documents"

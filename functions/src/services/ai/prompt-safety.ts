@@ -126,3 +126,14 @@ export const ASSESSMENT_PROMPT_VERSION = "assessment-2026-11-21.1";
  * (EXTRACTION_SYSTEM, CHECK_FIELDS, its schema) changes.
  */
 export const DOCUMENT_CHECK_PROMPT_VERSION = "assessment-2026-11-16.1";
+
+/**
+ * (#418 fix round 3) Version of the extraction request the bulk reassessment
+ * (`ai-bulk-reassessment.service.ts`) sends. Part of its `documentExtractions`
+ * cache key (`extractionKeyFor`). Kept at the pre-#418 value for the same
+ * reason as DOCUMENT_CHECK_PROMPT_VERSION: #418 does not change the bulk
+ * request (it does not opt in to the caseworker read), so following
+ * ASSESSMENT_PROMPT_VERSION would re-pay every stored bulk extraction once.
+ * Bump THIS only when the bulk extraction request itself changes.
+ */
+export const BULK_EXTRACTION_PROMPT_VERSION = "assessment-2026-11-16.1";
