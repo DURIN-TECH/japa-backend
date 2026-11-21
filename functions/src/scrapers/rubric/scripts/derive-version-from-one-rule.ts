@@ -86,6 +86,9 @@ import { fromFirestoreRest, placeQuestions } from "./redraft-competence-rule";
  *    `base_has_competence`, `version_file_split`: version 1 is not the one rulebook and version this tool is for;
  *  - `snapshot_hash_mismatch`, `snapshot_not_cited`: the snapshot is not what the rules cite;
  *  - `out_not_kept:<why>`: the `--out` file holds no kept result;
+ *  - `replayed_result` (#455): the `--out` file does not say `replayed: false` (a `--replay` run's file, or
+ *    one older than #455); `not_live`: it records no request made. Only a live run's result may become version 2;
+ *  - `page_unreadable` (#455 fix round 1): the `--page` file holds no snapshot text (another document);
  *  - `out_rule_mismatch`, `out_rule_not_in_version`, `out_other_rulebook`, `out_rule_not_in_snapshot`,
  *    `out_questions_not_placed`: the result does not belong to this version 1;
  *  - `competence_problems_on_version:<codes>`: the block fails the code check on the built version 2;
@@ -156,6 +159,12 @@ export function projectProblem(project: string | undefined, env: Record<string, 
  */
 export function keptResultOf(out: any): { ok: true; result: KeptResult; ruleId: string | undefined; routeKey: string | undefined } | { ok: false; code: string } {
   if (!out || typeof out !== "object") return { ok: false, code: "out_not_kept:unreadable" };
+  // (#455) A `--replay` re-runs the code steps on SAVED answers (0 requests) to diagnose a stop; its
+  // `--out` file is never a result. Only a live run's result may become version 2 (owner decision).
+  // (#455 fix round 1) Only a file PROVEN live passes: `replayed` must be exactly false (a missing
+  // field, an older file or a hand-edited replay is refused), and at least one request was made.
+  if (out.replayed !== false) return { ok: false, code: "replayed_result" };
+  if (typeof out.requests !== "number" || !(out.requests >= 1)) return { ok: false, code: "not_live" };
   if (out.refusedOffline) return { ok: false, code: "out_not_kept:refused_offline" };
   if (out.liveFailed) return { ok: false, code: "out_not_kept:live_failed" };
   const r = "result" in out ? out.result : out;
@@ -205,6 +214,10 @@ export function deriveVersion(v1: VisaRubric, out: any, snapshot: GuidanceSnapsh
   if (!Array.isArray(v1.criteria) || (v1 as any).contentStorage !== undefined) return refuse("version_file_split");
 
   // ---- the snapshot is the one the rules cite ----
+  // (#455 fix round 1) A `--page` file that is not a stored snapshot (no `text`: the snapshot's metadata
+  // document, the head, a version) is refused with a code word, instead of `sha256(undefined)` throwing
+  // a TypeError that the command line can only report by its class.
+  if (!snapshot || typeof snapshot.text !== "string") return refuse("page_unreadable");
   if (sha256(snapshot.text) !== snapshot.contentHash) return refuse("snapshot_hash_mismatch");
 
   // ---- the `--out` file holds a kept result for a rule of this version 1 ----

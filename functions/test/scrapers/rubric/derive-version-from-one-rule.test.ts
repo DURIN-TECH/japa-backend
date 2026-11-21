@@ -373,3 +373,35 @@ describe("(#440 fix round 1) a rule whose list lines changed is asked again", ()
     assert.equal(rec?.reuse?.totals.rulesReused, 20);
   });
 });
+
+describe("(#455) only a live result may become version 2", () => {
+  test("an --out file written by a --replay run is refused (`replayed_result`), and builds nothing", async () => {
+    const out = await outFor();
+    // A replay re-runs the code steps on SAVED answers to diagnose a stop: never a result to keep.
+    assert.deepEqual(deriveVersion(version1(), { ...out, replayed: true }, PAGE), { ok: false, refusal: "replayed_result" });
+    assert.deepEqual(keptResultOf({ ...out, replayed: true }), { ok: false, code: "replayed_result" });
+    // The same file from the live run is still kept.
+    assert.equal(out.replayed, false);
+    assert.equal(keptResultOf(out).ok, true);
+  });
+});
+
+describe("(#455 fix round 1) only a file PROVEN live passes, and a page that is not a snapshot is refused", () => {
+  test("`replayed` missing (an older file, or removed by hand) is `replayed_result`; no request made is `not_live`", async () => {
+    const out = await outFor();
+    const { replayed: _r, ...noFlag } = out;
+    assert.deepEqual(keptResultOf(noFlag), { ok: false, code: "replayed_result" });
+    assert.deepEqual(keptResultOf({ ...out, replayed: "false" }), { ok: false, code: "replayed_result" });
+    assert.deepEqual(keptResultOf({ ...out, requests: 0 }), { ok: false, code: "not_live" });
+    assert.deepEqual(keptResultOf({ ...out, requests: undefined }), { ok: false, code: "not_live" });
+    assert.deepEqual(deriveVersion(version1(), { ...out, requests: 0 }, PAGE), { ok: false, refusal: "not_live" });
+    assert.equal(out.requests >= 1, true);
+    assert.equal(keptResultOf(out).ok, true);
+  });
+
+  test("a --page file with no snapshot text is `page_unreadable`, never a TypeError", async () => {
+    const out = await outFor();
+    assert.deepEqual(deriveVersion(version1(), out, { contentHash: PAGE.contentHash } as any), { ok: false, refusal: "page_unreadable" });
+    assert.deepEqual(deriveVersion(version1(), out, undefined as any), { ok: false, refusal: "page_unreadable" });
+  });
+});
