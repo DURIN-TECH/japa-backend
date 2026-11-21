@@ -26,6 +26,9 @@
 //     limit and the review limit are one decision, from the file's own bytes;
 //   - files adding up to more than the total attached-bytes limit end
 //     `review_too_large` before any model call.
+//   - (#444) on the Standard Visitor v2 rulebook fixture, one `general`
+//     bank-statement upload read as financial evidence, dated 10 days before
+//     the (injected) review date, stores FIN 7.1 as a pass with `measuredOn`.
 
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -33,7 +36,9 @@ import { randomUUID } from "node:crypto";
 
 import { resetEmulators, rulesEnv, RunningApi, signUp, startApi, TestAccount } from "./helpers";
 import { clearBucket, objectExists, recordSigning, SigningRecorder, storageRulesEnv, withClaims } from "./storage-helpers";
-import { criterion, fictionalRubric, routeARubric, ScriptedProvider } from "../ai-case-officer/harness";
+import { criterion, fictionalRubric, routeARubric, ScriptedProvider, type Responder } from "../ai-case-officer/harness";
+// (#444) The live v2 rulebook (read-only fixture copy), for the dated-check case.
+import v2Fixture from "../ai-case-officer/fixtures/uk-standard-visitor-v2-308.json";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -368,6 +373,14 @@ interface ReviewFile {
   mb: number;
   /** The content type to store and declare. Default: the true one. */
   label?: string;
+  /** (#444) The checklist slot it is uploaded to. Default: `req-<key>`. */
+  requirementId?: string;
+}
+
+/** (#444) Optional overrides of the review run: the model's answers and the clock. */
+interface ReviewOptions {
+  respond?: Responder;
+  now?: () => Date;
 }
 
 /**
@@ -377,7 +390,7 @@ interface ReviewFile {
  * Storage download and metadata reads, real Firestore, the real settings
  * read), with only the model provider and the rulebook swapped for fakes.
  */
-async function registerAndReview(applicationId: string, uploads: ReviewFile[], rubric = fiveBatchRubric()) {
+async function registerAndReview(applicationId: string, uploads: ReviewFile[], rubric: any = fiveBatchRubric(), opts: ReviewOptions = {}) {
   await seedApplication(applicationId, { countryCode: "AA", visaTypeId: "route-a", mode: "self_service", title: applicationId, intake: { answers: {} } });
   const statuses: number[] = [];
   for (const u of uploads) {
@@ -385,7 +398,7 @@ async function registerAndReview(applicationId: string, uploads: ReviewFile[], r
     const path = await upload(applicationId, `${u.key}.bin`, fileBytes(u.kind, u.key, Math.round(u.mb * MB)), u.label ?? trueType);
     const res = await api.call("POST", "/documents", token, {
       applicationId,
-      requirementId: `req-${u.key}`,
+      requirementId: u.requirementId ?? `req-${u.key}`,
       fileName: `${u.key}.bin`,
       fileType: u.label ?? trueType,
       storagePath: path,
@@ -397,13 +410,17 @@ async function registerAndReview(applicationId: string, uploads: ReviewFile[], r
   const { AiCaseOfficerService, defaultDeps } = await import("../../src/services/ai-case-officer.service");
   assert.equal((await firebase.collections.appConfig.doc("aiSettings").get()).exists, false, "no settings document: the code defaults are what runs");
 
-  const provider = new ScriptedProvider((req) =>
-    req.role === "extraction"
-      ? JSON.stringify({ readable: true, values: [] })
-      : JSON.stringify({ findings: [], strengths: [], statementNotes: [], suspiciousPassages: [] })
+  const provider = new ScriptedProvider(
+    opts.respond ??
+      ((req) =>
+        req.role === "extraction"
+          ? JSON.stringify({ readable: true, values: [] })
+          : JSON.stringify({ findings: [], strengths: [], statementNotes: [], suspiciousPassages: [] }))
   );
   const service = new AiCaseOfficerService({
     ...defaultDeps(),
+    // (#444) A fixed clock when the case needs one (dates are never the real clock there).
+    ...(opts.now ? { now: opts.now } : {}),
     provider,
     rubrics: { getApprovedRubric: async () => rubric, approvedVersionOf: async () => rubric.version },
   });
@@ -474,6 +491,40 @@ describe("readiness review on the emulators", () => {
     const largestImage = Math.max(...provider.requests.filter((r) => r.documents?.[0]?.mediaType === "image/jpeg").map((r) => r.documents![0].data.length));
     assert.ok(largestImage > 5_000_000 && largestImage < 10_000_000);
     assert.equal(await reviewsCountedToday(), before + 1, "counted once against today's reviews");
+  });
+
+  test("(#444) v2 rulebook: one general bank statement read as financial evidence, dated 10 days before the review date: FIN 7.1 passes, measuredOn stored, no FIN 7.1 ground", async () => {
+    const FIN = "crit_a441f774ac3adf58";
+    const reviewNow = new Date("2026-11-21T09:00:00Z");
+    const rubric = v2Fixture.rubric as any;
+    // The financial evidence item's E-id, from the list the extraction request carries.
+    const respond: Responder = (req) => {
+      if (req.role === "extraction") {
+        const code = /(E\d+): Financial evidence/.exec(req.user)?.[1];
+        return JSON.stringify({
+          readable: true,
+          documentKind: "bank_statement",
+          values: [{ field: "statementPeriodEnd", value: "2026-11-11", unit: null, page: 1, quote: "to 11 Nov 2026" }],
+          evidenceItems: code ? [code] : [],
+        });
+      }
+      if (req.role === "judgement") return JSON.stringify({ findings: [], strengths: [], statementNotes: [], suspiciousPassages: [] });
+      const lead = /Required opening of the conclusion: "([^"]+)"/.exec(req.user)![1];
+      return JSON.stringify({ paragraphs: ["Your statement is recent."], conclusion: `${lead} your statement is recent.`, nextSteps: [] });
+    };
+    const { statuses, stored, provider } = await registerAndReview("app-dated-444", [{ key: "bank", kind: "pdf", mb: 1, requirementId: "general" }], rubric, { respond, now: () => reviewNow });
+    assert.deepEqual(statuses, [201]);
+    assert.equal(stored.status, "succeeded");
+    // No new call: one extraction, the rulebook's judgement batches, one narrative.
+    assert.equal(provider.callsFor("extraction"), 1);
+    const extraction = provider.requests.find((r) => r.role === "extraction")!;
+    assert.ok(!/Fields to report: [^\n]*mostRecentDaysBeforeApplication/.test(extraction.user), "the day count is never asked of the model");
+    assert.ok((extraction.schema as any).properties.evidenceItems, "the evidence items ride on the same call");
+    // FIN 7.1 passed: no refusal ground, no open item.
+    assert.equal(stored.refusalGrounds.some((g: any) => g.criterionId === FIN), false);
+    assert.equal(stored.insufficientInformation.some((i: any) => i.criterionId === FIN), false);
+    assert.equal(stored.measuredOn, "2026-11-21");
+    assert.deepEqual(stored.documentsRead.map((d: any) => [d.evidenceItems, d.documentDate]), [[["financial_evidence"], "2026-11-11"]]);
   });
 
   test("every mislabelled file the upload accepted is read by the review; none is left out for its size", async () => {
