@@ -184,6 +184,9 @@ const FULL_ROW: Required<Transaction> = {
   previousProviderRefundIds: ["HIDDEN-earlier-refund-id"],
   // ---- Issue #381: when the refund entered processing (hidden) ----
   processingSince: Timestamp.fromMillis(1_755_555_566_000),
+  // ---- Issue #382: the freeze of a fee whose client reported a missed meeting (hidden) ----
+  feeHoldFrozenByReportId: "HIDDEN-no-show-report-id",
+  feeHoldFrozenByReportAt: Timestamp.fromMillis(1_755_555_567_000),
 };
 
 /**
@@ -288,6 +291,9 @@ const HIDDEN_FIELDS: readonly (keyof Transaction)[] = [
   "previousProviderRefundIds",
   // Issue #381: the processing poll's age field.
   "processingSince",
+  // Issue #382: the no-show report's freeze.
+  "feeHoldFrozenByReportId",
+  "feeHoldFrozenByReportAt",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */

@@ -57,6 +57,11 @@ export const DEFAULT_CHANNELS_BY_TYPE: Record<NotificationType, NotificationChan
   // Issue #317: refunds are money moving back to the client: every channel.
   consultation_refunded: FULL,
   consultation_refund_delayed: FULL,
+  // Issue #382: a client reported a paid meeting did not happen (in-app +
+  // push to the agent and the client), and an admin's decision on it (money
+  // moves or is released: every channel).
+  consultation_no_show_reported: APP_ONLY,
+  consultation_no_show_resolved: FULL,
   // Payments
   payment_received: FULL,
   payment_request: FULL,

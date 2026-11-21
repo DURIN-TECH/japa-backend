@@ -126,7 +126,9 @@ export interface StatusChangeRefusal {
     | "INVALID_STATUS_TRANSITION"
     | "PAYMENT_IN_PROGRESS"
     | "FEE_RELEASED"
-    | "SLOT_NOT_STARTED";
+    | "SLOT_NOT_STARTED"
+    // Issue #382: the client's "the meeting didn't happen" report is open.
+    | "NO_SHOW_REPORT_OPEN";
   httpStatus: 400 | 403 | 409;
   message: string;
 }
@@ -1655,6 +1657,24 @@ class ConsultationService {
       const actor = actorFor(current);
       const decision = decideStatusChange(actor, current, status, at);
       if (!decision.ok) return { kind: "refused", refusal: decision };
+
+      // ---- Issue #382: an open no-show report blocks every cancel ----
+      // Only the admin's decision on the report moves money; read here, in
+      // the same transaction, so a report and a cancel never both commit.
+      if (status === "cancelled") {
+        const reportSnap = await tx.get(collections.noShowReports.doc(id));
+        if (reportSnap.exists && (reportSnap.data() as { status?: string }).status === "open") {
+          return {
+            kind: "refused",
+            refusal: {
+              ok: false,
+              code: "NO_SHOW_REPORT_OPEN",
+              httpStatus: 409,
+              message: "The client reported this consultation didn't happen. Seli is looking into it, so it can't be cancelled now.",
+            },
+          };
+        }
+      }
 
       const now = Timestamp.fromDate(at);
       const updates: Record<string, unknown> = { status, updatedAt: now };

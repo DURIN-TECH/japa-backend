@@ -180,6 +180,8 @@ export async function useHarness(): Promise<void> {
     // Issue #317: the refund rows take the agent's withdrawal lock, and the
     // hold tests withdraw (bank accounts).
     "withdrawalLocks", "bankAccounts",
+    // Issue #382: the client's "the meeting didn't happen" reports.
+    "noShowReports",
   ]) {
     firebase.collections[name] = fakeCollection(name);
   }

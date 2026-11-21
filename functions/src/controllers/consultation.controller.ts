@@ -62,7 +62,16 @@ import {
   // Issue #413: the admin refund answers, and the agent view's processing fee.
   AdminRefundOutcome,
   feeForRefund,
+  // Issue #382: pick each booking's fee out of a client's rows (one query).
+  pickFee,
 } from "../services/consultation-refund.service";
+// Issue #382: the client's "the meeting didn't happen" report and its admin queue.
+import {
+  NO_SHOW_NOTE_MAX_LENGTH,
+  NO_SHOW_REFUSAL_MESSAGES,
+  noShowReportRefusal,
+  noShowReportService,
+} from "../services/no-show-report.service";
 import { chargeRuntime } from "../services/charge-checkout.service";
 import { clientChargeFields } from "../money/client-charge";
 // Used to invite a freshly-provisioned client to set a password (claim their account).
@@ -76,6 +85,9 @@ import {
   Consultation,
   ConsultationType,
   NotificationType,
+  // Issue #382: an admin's decision on a no-show report.
+  NoShowReportDecision,
+  Transaction,
   // Issue #390: who carries Paystack's fee on an admin refund.
   PaystackFeeBorneBy,
 } from "../types";
@@ -210,7 +222,22 @@ export class ConsultationController {
 
       // (#332) Never the stored documents for a client: each booking is
       // answered in the shape this caller may see.
-      sendSuccess(res, consultations.map((c) => this.bookingFor(req, c)));
+      // Issue #382: a client view says whether a no-show report can be made
+      // now, from each booking's fee row (ONE query of the caller's rows).
+      const viewer = { uid: req.userId, role: req.authz?.role };
+      const clientViews = consultations.filter((c) => !seesFullConsultation(viewer, c) && isPaidWithMoney(c));
+      let myRows: Transaction[] = [];
+      if (clientViews.length > 0) {
+        const snap = await collections.transactions.where("userId", "==", userId).get();
+        myRows = snap.docs.map((d) => d.data() as Transaction);
+      }
+      const at = chargeRuntime.now();
+      sendSuccess(
+        res,
+        consultations.map((c) =>
+          this.bookingFor(req, c, clientViews.includes(c) ? { canReportNoShow: this.canReportNoShow(c, pickFee(myRows.filter((t) => t.consultationId === c.id), c), at) } : {})
+        )
+      );
     } catch (error) {
       console.error("Error getting consultations:", error);
       sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
@@ -321,11 +348,12 @@ export class ConsultationController {
         // The fee's hold holds the slot the client PAID for (review fix:
         // the window is never measured from a slot the agent moved earlier).
         const fee = isPaidWithMoney(consultation) ? await findFeeTransaction(consultation) : null;
-        const preview = cancellationRefundPreview(consultation, chargeRuntime.now(), fee);
-        if (preview) {
-          sendSuccess(res, { ...view, cancellationRefund: preview });
-          return;
-        }
+        const at = chargeRuntime.now();
+        // Issue #382: whether the client may report a missed meeting now.
+        const clientView = this.bookingFor(req, consultation, { canReportNoShow: this.canReportNoShow(consultation, fee, at) });
+        const preview = cancellationRefundPreview(consultation, at, fee);
+        sendSuccess(res, preview ? { ...clientView, cancellationRefund: preview } : clientView);
+        return;
       }
       sendSuccess(res, view);
     } catch (error) {
@@ -1230,6 +1258,151 @@ export class ConsultationController {
   }
 
   /**
+   * POST /consultations/:id/no-show-report (issue #382): the booking's
+   * CLIENT reports the meeting did not happen. Body: optional `note` (text of
+   * at most NO_SHOW_NOTE_MAX_LENGTH characters).
+   *
+   *  - no token: 401 (verifyAuth);
+   *  - an admin: 403 (admins resolve, they do not report), before any read;
+   *  - a bad note: 400 VALIDATION_ERROR;
+   *  - unknown booking: 404;
+   *  - not the booking's client (its agent, an owner, another client): 403;
+   *  - refused (one Firestore transaction re-checks every rule): 409 with
+   *    NO_SHOW_REPORT_EXISTS | FEE_NOT_HELD | NOT_PAID | ALREADY_REFUNDED |
+   *    MEETING_NOT_STARTED | BOOKING_CANCELLED, nothing written;
+   *  - otherwise 201: `{ noShowReport: { status: "open", createdAt },
+   *    consultation }` (the client view). The agent's fee is frozen until an
+   *    admin decides; agent and client are notified.
+   */
+  async reportNoShow(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      if (req.authz?.role === ROLES.ADMIN) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      const note = (req.body ?? {}).note as unknown;
+      if (note !== undefined && (typeof note !== "string" || note.length > NO_SHOW_NOTE_MAX_LENGTH)) {
+        sendError(res, "VALIDATION_ERROR", `note must be text of at most ${NO_SHOW_NOTE_MAX_LENGTH} characters`);
+        return;
+      }
+      const outcome = await noShowReportService.report({
+        consultationId: req.params.id,
+        clientUid: req.userId!,
+        note: typeof note === "string" && note.trim() ? note.trim() : undefined,
+      });
+      if (outcome.kind === "not_found") {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (outcome.kind === "forbidden") {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      if (outcome.kind === "refused") {
+        sendError(res, outcome.code, NO_SHOW_REFUSAL_MESSAGES[outcome.code], 409);
+        return;
+      }
+      sendCreated(
+        res,
+        {
+          noShowReport: { status: outcome.report.status, createdAt: outcome.report.createdAt },
+          consultation: this.bookingFor(req, outcome.booking, { canReportNoShow: false }),
+        },
+        "Report received"
+      );
+    } catch (error) {
+      console.error("Error reporting a consultation no-show:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * GET /consultations/no-show-reports?status=open|resolved (issue #382,
+   * ADMIN only; for #443). Default `open`; newest first. Each item: booking
+   * id, slot time, booking status, client and agent names, agency, amount and
+   * currency, note, status, decision, created and resolved times.
+   * Non-admin: 403 before any read; another status: 400.
+   */
+  async listNoShowReports(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      if (req.authz?.role !== ROLES.ADMIN) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      const status = (req.query.status as string | undefined) ?? "open";
+      if (status !== "open" && status !== "resolved") {
+        sendError(res, "VALIDATION_ERROR", "status must be open or resolved");
+        return;
+      }
+      sendSuccess(res, await noShowReportService.list(status));
+    } catch (error) {
+      console.error("Error listing no-show reports:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
+   * POST /consultations/:id/no-show-report/resolve (issue #382, ADMIN only;
+   * for #443). Body `{ decision: "agent_no_show" | "meeting_happened" }`,
+   * required, no default.
+   *
+   *  - not an admin: 403 before any read; another decision: 400;
+   *  - no report for the booking: 404;
+   *  - already resolved: 409 NO_SHOW_REPORT_RESOLVED, nothing written;
+   *  - `meeting_happened`: 200 `{ noShowReport }` (status `released`): no
+   *    refund, the freeze is lifted;
+   *  - `agent_no_show`: the admin refund (`admin_agent_no_show`, the agent
+   *    pays Paystack's fee): 200 `{ noShowReport, refund, refundId,
+   *    consultation }` with the report `refunded`; when the refund cannot be
+   *    written the report stays open and the refund's own answer is given
+   *    (409 PAYSTACK_FEE_UNKNOWN, 502 PAYSTACK_ERROR, ...).
+   */
+  async resolveNoShowReport(req: AuthenticatedRequest, res: Response): Promise<void> {
+    try {
+      if (req.authz?.role !== ROLES.ADMIN) {
+        sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
+        return;
+      }
+      const decision = (req.body ?? {}).decision as unknown;
+      if (decision !== "agent_no_show" && decision !== "meeting_happened") {
+        sendError(res, "VALIDATION_ERROR", "decision is required and must be agent_no_show or meeting_happened");
+        return;
+      }
+      const outcome = await noShowReportService.resolve({
+        consultationId: req.params.id,
+        adminUid: req.userId!,
+        decision: decision as NoShowReportDecision,
+      });
+      if (outcome.kind === "not_found") {
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      }
+      if (outcome.kind === "already_resolved") {
+        sendError(res, "NO_SHOW_REPORT_RESOLVED", "This report has already been resolved.", 409);
+        return;
+      }
+      if (outcome.kind === "released") {
+        sendSuccess(res, { noShowReport: outcome.report });
+        return;
+      }
+      if (outcome.report && outcome.outcome.kind === "created") {
+        sendSuccess(res, {
+          noShowReport: outcome.report,
+          refund: refundSummary(outcome.outcome.refund),
+          refundId: outcome.outcome.refund.id,
+          consultation: outcome.outcome.booking,
+        });
+        return;
+      }
+      // The refund could not be written: the report stays open; say why.
+      await this.sendAdminRefundOutcome(res, outcome.outcome);
+    } catch (error) {
+      console.error("Error resolving a no-show report:", error);
+      sendError(res, "INTERNAL_ERROR", ErrorMessages.INTERNAL_ERROR, 500);
+    }
+  }
+
+  /**
    * POST /consultations/:id/refund/close (issue #413 B, ADMIN only;
    * decision 2026-11-21).
    *
@@ -1508,6 +1681,21 @@ export class ConsultationController {
       return;
     case "closed":
       sendError(res, "REFUND_CLOSED", "This refund was closed with nothing to refund, so there is nothing to retry.", 409);
+      return;
+    // ---- Issue #382: the client's no-show report ----
+    case "no_show_report_open":
+      sendError(
+        res,
+        "NO_SHOW_REPORT_OPEN",
+        "The client reported this consultation didn't happen. Resolve that report to refund it.",
+        409
+      );
+      return;
+    case "no_show_report_not_found":
+      sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+      return;
+    case "no_show_report_resolved":
+      sendError(res, "NO_SHOW_REPORT_RESOLVED", "This report has already been resolved.", 409);
       return;
     case "retried":
     case "created": {
@@ -2343,8 +2531,17 @@ export class ConsultationController {
    * `seesFullConsultation` (consultations/client-consultation.ts). It only
    * picks the shape: each route has already decided the caller may read it.
    */
-  private bookingFor(req: AuthenticatedRequest, booking: Consultation) {
-    return consultationFor({ uid: req.userId, role: req.authz?.role }, booking);
+  private bookingFor(req: AuthenticatedRequest, booking: Consultation, extras: { canReportNoShow?: boolean } = {}) {
+    return consultationFor({ uid: req.userId, role: req.authz?.role }, booking, extras);
+  }
+
+  /**
+   * Issue #382: whether the booking's client may report now that the meeting
+   * did not happen (the report's own rule, `noShowReportRefusal`, at read
+   * time; the report and refund are known from the booking's mirrors).
+   */
+  private canReportNoShow(booking: Consultation, fee: Transaction | null, at: Date): boolean {
+    return noShowReportRefusal({ booking, fee, at, reportExists: false, refundExists: false }) === null;
   }
 
   /**

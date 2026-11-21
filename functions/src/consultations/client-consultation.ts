@@ -75,6 +75,9 @@ export const CLIENT_CONSULTATION_FIELDS = [
   "cancellationReason",
   // Issue #317: where the booking's refund stands (no ids, no Paystack data).
   "refundStatus",
+  // Issue #382: the "the meeting didn't happen" report (for #442).
+  "canReportNoShow",
+  "noShowReport",
   "createdAt",
   "updatedAt",
 ] as const;
@@ -142,6 +145,22 @@ export interface ClientConsultation extends ClientChargeFields {
   /** Issue #317: where the refund of this booking's fee stands, if one was started. */
   refundStatus?: Consultation["refundStatus"];
 
+  /**
+   * Issue #382: whether the client may report now that the meeting did not
+   * happen (`POST /consultations/:id/no-show-report`): paid, not cancelled,
+   * the fee still held, no refund, the slot started, no report yet. Worked
+   * out by the server at read time; false when it was not worked out (an
+   * answer that has no fee row at hand).
+   */
+  canReportNoShow: boolean;
+  /**
+   * Issue #382: the booking's report, or null when there is none. Its
+   * status only: "open" (Seli is looking into it), "refunded" (the agent did
+   * not show: full refund), "released" (the meeting happened). No admin id,
+   * no agent fee, no internal field.
+   */
+  noShowReport: { status: "open" | "refunded" | "released"; createdAt: Timestamp; resolvedAt?: Timestamp } | null;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -159,7 +178,11 @@ export interface ClientConsultation extends ClientChargeFields {
  * @param c - The full stored booking (the caller's own)
  * @returns The payer-safe view of that booking
  */
-export function toClientConsultation(c: Consultation): ClientConsultation {
+export function toClientConsultation(
+  c: Consultation,
+  /** Issue #382: what the server worked out at read time (see `canReportNoShow`). */
+  extras: { canReportNoShow?: boolean } = {}
+): ClientConsultation {
   // The fields every booking has.
   const out: ClientConsultation = {
     id: c.id,
@@ -175,6 +198,16 @@ export function toClientConsultation(c: Consultation): ClientConsultation {
     timezone: c.timezone,
     status: c.status,
     paymentStatus: c.paymentStatus,
+    // Issue #382: never true unless the caller worked it out (fails closed).
+    canReportNoShow: extras.canReportNoShow === true,
+    // Issue #382: the report's status and times only, field by field.
+    noShowReport: c.noShowReport
+      ? {
+        status: c.noShowReport.status,
+        createdAt: c.noShowReport.createdAt,
+        ...(c.noShowReport.resolvedAt ? { resolvedAt: c.noShowReport.resolvedAt } : {}),
+      }
+      : null,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
@@ -250,6 +283,11 @@ export function seesFullConsultation(viewer: ConsultationViewer, booking: Pick<C
  * @param viewer - The caller's uid and resolved role
  * @param booking - The full stored booking
  */
-export function consultationFor(viewer: ConsultationViewer, booking: Consultation): Consultation | ClientConsultation {
-  return seesFullConsultation(viewer, booking) ? booking : toClientConsultation(booking);
+export function consultationFor(
+  viewer: ConsultationViewer,
+  booking: Consultation,
+  /** Issue #382: read-time facts for the client view (ignored for the agent side). */
+  extras: { canReportNoShow?: boolean } = {}
+): Consultation | ClientConsultation {
+  return seesFullConsultation(viewer, booking) ? booking : toClientConsultation(booking, extras);
 }

@@ -1431,9 +1431,74 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
    * worked out (or closed: `refundStatus: "closed"` then says so).
    */
   refundHeldReason?: RefundHeldReason;
+  /**
+   * Issue #382: mirror of the booking's "the meeting didn't happen" report
+   * (`noShowReports/{bookingId}`), written in the same commit as the report
+   * and its resolution. What the client view shows (`noShowReport`); the
+   * admin-facing details stay on the report doc.
+   */
+  noShowReport?: ConsultationNoShowReportMirror;
   
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+/** Issue #382: where a no-show report stands. */
+export type NoShowReportStatus =
+  /** Reported, waiting for an admin; the agent's fee is frozen. */
+  | "open"
+  /** An admin decided the agent did not show: full refund, the agent pays Paystack's fee. */
+  | "refunded"
+  /** An admin decided the meeting happened: no refund, the fee follows its normal release. */
+  | "released";
+
+/** Issue #382: what an admin decided about a no-show report (no default). */
+export type NoShowReportDecision = "agent_no_show" | "meeting_happened";
+
+/** Issue #382: the booking's copy of its no-show report (see `Consultation.noShowReport`). */
+export interface ConsultationNoShowReportMirror {
+  status: NoShowReportStatus;
+  createdAt: Timestamp;
+  resolvedAt?: Timestamp;
+}
+
+/**
+ * Issue #382: a client's report that a PAID consultation did not happen,
+ * made while the agent's fee is still held. ONE per booking, at the
+ * deterministic id `noShowReports/{consultationId}` (`tx.create`). Backend
+ * only (firestore.rules denies every client). Nothing happens
+ * automatically: an admin decides (`NoShowReportDecision`).
+ */
+export interface NoShowReport {
+  /** = the booking id. */
+  id: string;
+  consultationId: string;
+  /** The booking's client (who reported). */
+  clientId: string;
+  /** The booking's agent (whose fee is frozen). */
+  agentId: string;
+  agencyId?: string;
+  /** Denormalised for the admin list. */
+  clientName?: string;
+  agentName?: string;
+  /** The booking's settled consultation_fee Transaction (frozen by this report). */
+  feeTransactionId: string;
+  /** What the client paid: minor units of `currency` (the fee row's own figures). */
+  amountMinor: number;
+  currency: string;
+  /** When the slot started (as it stood when reported). */
+  slotStartAt: Timestamp;
+  /** The client's note, if any (at most NO_SHOW_NOTE_MAX_LENGTH characters). */
+  note?: string;
+  status: NoShowReportStatus;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  /** Set when an admin decides. */
+  decision?: NoShowReportDecision;
+  resolvedAt?: Timestamp;
+  resolvedBy?: string;
+  /** The refund row written for `agent_no_show`. */
+  refundId?: string;
 }
 
 /**
@@ -1862,6 +1927,15 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   feeHoldFrozenByRefundId?: string;
   /** Issue #390: when the fee was frozen (see `feeHoldFrozenByRefundId`). */
   feeHoldFrozenAt?: Timestamp;
+  /**
+   * Issue #382: set while the booking's client has an OPEN "the meeting
+   * didn't happen" report (`noShowReports/{id}`, this is its id). The fee is
+   * FROZEN: held whatever the clock or a closed meeting say, so it is never
+   * available or withdrawable until an admin decides. Removed when they do.
+   */
+  feeHoldFrozenByReportId?: string;
+  /** Issue #382: when the report froze the fee. */
+  feeHoldFrozenByReportAt?: Timestamp;
 
   // ---- Issue #395: Paystack's fee on a consultation fee (type "consultation_fee") ----
   // Decision (user, 2026-11-17): on a paid consultation the AGENT pays
@@ -2200,6 +2274,10 @@ export type NotificationType =
   // the fee was given back), and a refund that is delayed (failed at Paystack).
   | "consultation_refunded"
   | "consultation_refund_delayed"
+  // Issue #382: a client reported a paid meeting did not happen (agent: the
+  // payment is paused; client: confirmation), and an admin decided it.
+  | "consultation_no_show_reported"
+  | "consultation_no_show_resolved"
   // Payments
   | "payment_received"
   | "payment_request"

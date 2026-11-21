@@ -128,6 +128,8 @@ import type { Transaction as FirestoreTransaction } from "firebase-admin/firesto
 import type {
   Consultation,
   ConsultationPaymentException,
+  // Issue #382: a client's "the meeting didn't happen" report.
+  NoShowReport,
   // Issue #390: who carries Paystack's fee, and why a refund is held.
   PaystackFeeBorneBy,
   RefundFundedFrom,
@@ -743,9 +745,10 @@ export interface RefundContext {
 /**
  * Pick the booking's fee Transaction out of its rows: a `consultation_fee`
  * that is `completed`, paid through Paystack with a reference, preferring
- * the one on the booking's own reference. Pure.
+ * the one on the booking's own reference. Pure. Exported (issue #382) so a
+ * client's booking list can pick each booking's fee out of ONE query.
  */
-function pickFee(rows: Transaction[], booking: Consultation): Transaction | null {
+export function pickFee(rows: Transaction[], booking: Consultation): Transaction | null {
   const fees = rows.filter(
     (t) =>
       t.type === "consultation_fee" &&
@@ -1123,7 +1126,16 @@ export type AdminRefundOutcome =
   /** Issue #390: Paystack could not be asked for the fee: nothing written (502). */
   | { kind: "paystack_unavailable" }
   /** Issue #413 (B): the refund was closed by an admin with nothing to refund: final (409 REFUND_CLOSED). */
-  | { kind: "closed"; refund: Transaction };
+  | { kind: "closed"; refund: Transaction }
+  /**
+   * Issue #382: the client reported the meeting did not happen and the
+   * report is still open: only its resolve moves money (409 NO_SHOW_REPORT_OPEN).
+   */
+  | { kind: "no_show_report_open" }
+  /** Issue #382 (resolve only): the booking has no report (404). */
+  | { kind: "no_show_report_not_found" }
+  /** Issue #382 (resolve only): the report was resolved meanwhile (409 NO_SHOW_REPORT_RESOLVED). */
+  | { kind: "no_show_report_resolved" };
 
 /**
  * What closing a HELD client-cancel refund as `nothing_to_refund` did
@@ -1256,6 +1268,14 @@ class ConsultationRefundService {
      * or another id: not_found).
      */
     onlyRefundId?: string;
+    /**
+     * Issue #382: this refund RESOLVES the booking's open no-show report
+     * (`agent_no_show`). The same transaction re-reads the report (it must
+     * still be open), and in the commit that writes the refund marks it
+     * `refunded` and lifts its freeze on the fee. Without this flag an open
+     * report refuses the refund (`no_show_report_open`).
+     */
+    noShowResolution?: boolean;
   }): Promise<AdminRefundOutcome> {
     const ref = collections.consultations.doc(input.consultationId);
 
@@ -1293,6 +1313,17 @@ class ConsultationRefundService {
       if (!snap.exists) return { kind: "not_found" };
       const booking = snap.data() as Consultation;
       const at = chargeRuntime.now();
+      // ---- Issue #382: the booking's no-show report, if any ----
+      const reportRef = collections.noShowReports.doc(booking.id);
+      const reportSnap = await tx.get(reportRef);
+      const report = reportSnap.exists ? (reportSnap.data() as NoShowReport) : null;
+      if (input.noShowResolution) {
+        if (!report) return { kind: "no_show_report_not_found" };
+        if (report.status !== "open") return { kind: "no_show_report_resolved" };
+      } else if (report?.status === "open") {
+        // Only the report's resolve may move money while it is open.
+        return { kind: "no_show_report_open" };
+      }
       if (!isPaidWithMoney(booking)) {
         return { kind: "nothing_to_refund", message: "This consultation was not paid for: there is nothing to refund." };
       }
@@ -1370,10 +1401,37 @@ class ConsultationRefundService {
         planned,
       });
       const fields = bookingRefundFields(written.row);
+      // ---- Issue #382: the refund resolves the open report, in this commit ----
+      let reportFields: Partial<Consultation> = {};
+      if (input.noShowResolution && report) {
+        tx.update(reportRef, {
+          status: "refunded",
+          decision: "agent_no_show",
+          resolvedAt: now,
+          resolvedBy: input.adminUid,
+          refundId: written.row.id,
+          updatedAt: now,
+        });
+        // The report's freeze is lifted with the refund (out of the hold the
+        // fee is "refunded" now; from available it releases as usual).
+        if (ctx.fee.feeHoldFrozenByReportId === report.id) {
+          tx.update(collections.transactions.doc(ctx.fee.id), {
+            feeHoldFrozenByReportId: FieldValue.delete(),
+            feeHoldFrozenByReportAt: FieldValue.delete(),
+            updatedAt: now,
+          });
+        }
+        reportFields = { noShowReport: { status: "refunded", createdAt: report.createdAt, resolvedAt: now } };
+      }
       // Issue #413: the booking's copy of a held reason goes when the held
       // row is worked out (the live row has none).
-      tx.update(ref, { ...fields, ...(booking.refundHeldReason ? { refundHeldReason: FieldValue.delete() } : {}), updatedAt: now });
-      const updated = { ...booking, ...fields, updatedAt: now };
+      tx.update(ref, {
+        ...fields,
+        ...reportFields,
+        ...(booking.refundHeldReason ? { refundHeldReason: FieldValue.delete() } : {}),
+        updatedAt: now,
+      });
+      const updated = { ...booking, ...fields, ...reportFields, updatedAt: now };
       delete updated.refundHeldReason;
       return existing
         ? { kind: "retried", refund: written.row, booking: updated, debit: written.debit, fromHeld: true }

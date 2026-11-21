@@ -52,6 +52,8 @@ function millisOf(value: unknown): number | null {
  *
  *  - (issue #390) frozen by a refund HELD for an admin
  *    (`feeHoldFrozenByRefundId`): HELD, unless it was already refunded;
+ *  - (issue #382) frozen by an open no-show report (`feeHoldFrozenByReportId`):
+ *    HELD, unless it was already refunded;
  *  - no `feeHold` (a fee written before #317 and not yet backfilled): HELD.
  *    The safe reading: it can be refunded from the hold, never withdrawn
  *    then cancelled. `npm run backfill:fee-holds` stamps every such fee
@@ -65,7 +67,7 @@ function millisOf(value: unknown): number | null {
  * @param at the server clock
  */
 export function feeHoldStatusAt(
-  fee: Pick<Transaction, "feeHold"> & Partial<Pick<Transaction, "feeHoldFrozenByRefundId">>,
+  fee: Pick<Transaction, "feeHold"> & Partial<Pick<Transaction, "feeHoldFrozenByRefundId" | "feeHoldFrozenByReportId">>,
   at: Date
 ): FeeHoldStatus {
   const hold = fee.feeHold;
@@ -73,6 +75,10 @@ export function feeHoldStatusAt(
   // Issue #390: a fee whose refund is HELD for an admin is frozen: held,
   // whatever the clock or a closed meeting say, until the refund is worked out.
   if (fee.feeHoldFrozenByRefundId) return "held";
+  // Issue #382: so is a fee whose client reported the meeting did not
+  // happen: frozen until an admin decides (the freeze wins over any release
+  // rule, the clock's and a closed meeting's alike).
+  if (fee.feeHoldFrozenByReportId) return "held";
   if (!hold) return "held";
   if (hold.state === "released") return "released";
   const now = at.getTime();
@@ -107,7 +113,7 @@ export const RELEASE_SKEW_MARGIN_MS = 2 * 60 * 1000;
  * #383). Pure. One clock: `at` is the time read once by the transaction.
  *
  *  - not held at `at` (released, refunded): false;
- *  - frozen (by a held refund, #390) since
+ *  - frozen (by a held refund, #390, or an open no-show report, #382) since
  *    before `releaseAt - margin`: true. The fee has counted as held ever
  *    since, so no withdrawal, on any clock, can have taken it;
  *  - no readable `releaseAt` (a pre-#317 fee not backfilled): true (held,
@@ -121,7 +127,7 @@ export const RELEASE_SKEW_MARGIN_MS = 2 * 60 * 1000;
  */
 export function refundFundableFromHold(
   fee: Pick<Transaction, "feeHold"> &
-    Partial<Pick<Transaction, "feeHoldFrozenByRefundId" | "feeHoldFrozenAt">>,
+    Partial<Pick<Transaction, "feeHoldFrozenByRefundId" | "feeHoldFrozenAt" | "feeHoldFrozenByReportId" | "feeHoldFrozenByReportAt">>,
   at: Date,
   lastWithdrawalAt: Date | null
 ): boolean {
@@ -132,6 +138,8 @@ export function refundFundableFromHold(
   // Frozen before the cutoff: held ever since, whatever the clocks say.
   const frozenAt = [
     fee.feeHoldFrozenByRefundId ? millisOf(fee.feeHoldFrozenAt) : null,
+    // Issue #382: an open no-show report freezes the fee too.
+    fee.feeHoldFrozenByReportId ? millisOf(fee.feeHoldFrozenByReportAt) : null,
   ].filter((v): v is number => v !== null);
   if (frozenAt.some((ms) => ms < cutoff)) return true;
   if (at.getTime() >= cutoff) return false;
