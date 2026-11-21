@@ -27,8 +27,8 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fromFirestoreRest, outFileProblem, placeQuestions, questionsTheBlockNeeds, runCompetenceRule } from "../../../src/scrapers/rubric/scripts/redraft-competence-rule";
 // (#455) The stop record, the answers file and the replay.
-import { ReplayProvider, answersFileProblem, answersFileWriter, answersPathFor, outFileOf, readAnswersFile, type CompetenceRuleRunSummary, type SavedAnswer } from "../../../src/scrapers/rubric/scripts/redraft-competence-rule";
-import { statSync } from "node:fs";
+import { ReplayProvider, requestHashOf, answersFileProblem, answersFileWriter, answersPathFor, outFileOf, readAnswersFile, type CompetenceRuleRunSummary, type SavedAnswer } from "../../../src/scrapers/rubric/scripts/redraft-competence-rule";
+import { readdirSync, statSync } from "node:fs";
 import type { LlmRequest, LlmResponse } from "../../../src/services/ai/llm-provider";
 import { DEFAULT_RUBRIC_SETTINGS } from "../../../src/scrapers/rubric/rubric-settings";
 import { DEFAULT_PUBLISH_SETTINGS } from "../../../src/scrapers/rubric/rubric-publish-settings";
@@ -578,10 +578,10 @@ describe("(#455) every model answer is kept locally, never printed", () => {
     const path = answersPathFor(out);
     assert.equal(path, `${out}.answers.json`);
     const write = answersFileWriter(path, ID);
-    const first: SavedAnswer = { kind: "answer", n: 1, step: "redraft", role: "judgement", response: { text: "a", stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 }, model: "m" } };
+    const first: SavedAnswer = { kind: "answer", n: 1, step: "redraft", role: "judgement", requestHash: "h1", response: { text: "a", stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 }, model: "m" } };
     write(first);
     assert.equal(statSync(path).mode & 0o777, 0o600);
-    write({ kind: "error", n: 2, step: "competence_steps", role: "judgement", errorClass: "LlmProviderError", message: "status=400 bad request" });
+    write({ kind: "error", n: 2, step: "competence_steps", role: "judgement", requestHash: "h2", errorClass: "LlmProviderError", message: "status=400 bad request" });
     assert.equal(statSync(path).mode & 0o777, 0o600);
     const back = readAnswersFile(JSON.parse(readFileSync(path, "utf8")));
     assert.equal(back.length, 2);
@@ -695,5 +695,131 @@ describe("(#455, owner decision 2026-11-21) the drafting calls use production dr
     const p = provider();
     await runCompetenceRule(PAGE, version(), ID, { live: true, verdicts: "uyayaa", provider: p, ...quiet });
     assert.deepEqual(p.requests.map((r) => `${r.role}:${r.maxOutputTokens}`), [`judgement:${drafting}`, `judgement:${drafting}`, `verification:${checking}`]);
+  });
+});
+
+// ============================================
+// (#455 fix round 1) QA and review: no key in a replay, a failed answers write, atomic writes, request hashes
+// ============================================
+
+describe("(#455 fix round 1) a replay never reads the API key", () => {
+  test("the command line replays a saved provider error with a fake key set: the key's value is never handed out", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "one-rule-replay-key-"));
+    // A saved run whose competence call failed twice transiently, then got no further: the replay
+    // re-throws those saved errors, which `describeAnthropicError` describes (and would redact the key in).
+    const live = await liveRun(failingAt("competence", "transient"));
+    assert.ok(live.answers.some((a) => a.kind === "error"));
+    const answersPath = join(dir, "result.json.answers.json");
+    writeFileSync(answersPath, JSON.stringify({ ruleId: ID, entries: live.answers }));
+    writeFileSync(join(dir, "page.json"), JSON.stringify(PAGE));
+    writeFileSync(join(dir, "version.json"), JSON.stringify(version()));
+    // The trap (preloaded before the script): logs every time the key's VALUE is read from the
+    // environment, and refuses every network call. Like QA's guard, but a read of the name after the
+    // key is gone (undefined) is not a read of the key.
+    const guard = join(dir, "guard.cjs");
+    const log = join(dir, "guard-log.json");
+    writeFileSync(guard, `
+      const real = process.env; const reads = [];
+      process.env = new Proxy(real, { get(t, k) { if (typeof k === "string" && /ANTHROPIC|API_KEY/.test(k) && t[k] !== undefined) reads.push(k); return t[k]; } });
+      const block = (name) => function () { reads.push("NET:" + name); throw new Error("network blocked"); };
+      for (const m of ["http", "https", "net", "tls"]) { const mod = require(m); for (const f of ["request", "connect", "get"]) if (mod[f]) mod[f] = block(m + "." + f); }
+      globalThis.fetch = block("fetch");
+      process.on("exit", () => require("fs").writeFileSync(${JSON.stringify(log)}, JSON.stringify(reads)));
+    `);
+    const script = join(__dirname, "..", "..", "..", "src", "scrapers", "rubric", "scripts", "redraft-competence-rule.ts");
+    const fakeKey = "sk-ant-fake-key-for-the-trap-0000000000";
+    const run = spawnSync(process.execPath, ["--require", guard, "--import", "tsx", script, "--page", join(dir, "page.json"), "--version", join(dir, "version.json"), "--rule", ID, "--verdicts", "uyayaa", "--replay", answersPath], { encoding: "utf8", env: { ...process.env, ANTHROPIC_API_KEY: fakeKey } });
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stdout, /stopped at competence_steps: provider_error\./);
+    assert.match(run.stdout, /0 request\(s\) made/);
+    assert.deepEqual(JSON.parse(readFileSync(log, "utf8")), []);
+    assert.ok(!run.stdout.includes(fakeKey) && !run.stderr.includes(fakeKey));
+  });
+});
+
+describe("(#455 fix round 1) a failed answers write is `answers_write_failed`, never `provider_error`", () => {
+  /** An onAnswer that fails like a full disk on the n-th entry. */
+  const failOn = (nth: number) => {
+    let n = 0;
+    return (_e: SavedAnswer): void => {
+      if (++n === nth) throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+    };
+  };
+
+  test("an answer that arrived and could not be kept stops the run, and nothing more is sent", async () => {
+    const p = provider();
+    // Entry 1 is the re-draft's answer; entry 2 is the competence answer: it fails.
+    const s = await runCompetenceRule(PAGE, version(), ID, { live: true, verdicts: "uyayaa", provider: p, onAnswer: failOn(2), ...quiet });
+    assert.deepEqual(s.stop, { step: "competence_steps", code: "answers_write_failed", problems: ["write:ENOSPC", "entry:answer"] });
+    assert.equal(p.requests.length, 2);
+    assert.equal(s.requests, 2);
+    assert.equal(s.checkLetters, null);
+  });
+
+  test("a provider error that could not be kept: the provider's error is still what the step saw, the stop names the write", async () => {
+    const p = failingAt("competence", "hard");
+    const s = await runCompetenceRule(PAGE, version(), ID, { live: true, verdicts: "uyayaa", provider: p, onAnswer: failOn(2), ...quiet });
+    assert.deepEqual(s.stop, { step: "competence_steps", code: "answers_write_failed", problems: ["write:ENOSPC", "entry:error"] });
+    assert.equal(p.requests.length, 2);
+  });
+
+  test("a failed write during the check stops sending too", async () => {
+    const p = provider();
+    const s = await runCompetenceRule(PAGE, version(), ID, { live: true, verdicts: "uyayaa", provider: p, onAnswer: failOn(3), ...quiet });
+    assert.deepEqual(s.stop, { step: "check", code: "answers_write_failed", problems: ["write:ENOSPC", "entry:answer"] });
+    assert.equal(p.requests.length, 3);
+  });
+});
+
+describe("(#455 fix round 1) the answers file is written atomically", () => {
+  const entry = (n: number): SavedAnswer => ({ kind: "answer", n, step: "redraft", role: "judgement", requestHash: `h${n}`, response: { text: `answer ${n}`, stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 }, model: "m" } });
+
+  test("each write replaces the whole file in one rename: no temporary file is left, the mode stays 0600", () => {
+    const dir = mkdtempSync(join(tmpdir(), "one-rule-atomic-"));
+    const path = join(dir, "result.json.answers.json");
+    const write = answersFileWriter(path, ID);
+    write(entry(1));
+    const firstInode = statSync(path).ino;
+    write(entry(2));
+    // A rename puts a NEW file in place (another inode): the old one was never truncated in place.
+    assert.notEqual(statSync(path).ino, firstInode);
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(dir), ["result.json.answers.json"]);
+    assert.deepEqual(readAnswersFile(JSON.parse(readFileSync(path, "utf8"))).map((e) => (e as any).n), [1, 2]);
+  });
+
+  test("a write that fails leaves the previous complete file in place", () => {
+    const dir = mkdtempSync(join(tmpdir(), "one-rule-atomic-"));
+    const path = join(dir, "result.json.answers.json");
+    const write = answersFileWriter(path, ID);
+    write(entry(1));
+    // Block the temporary file's name, so the next write fails before anything is renamed.
+    writeFileSync(`${path}.tmp-${process.pid}`, "");
+    assert.throws(() => write(entry(2)));
+    assert.deepEqual(readAnswersFile(JSON.parse(readFileSync(path, "utf8"))).map((e) => (e as any).n), [1]);
+  });
+
+  test("a file that appeared after the pre-flight check is never replaced", () => {
+    const dir = mkdtempSync(join(tmpdir(), "one-rule-atomic-"));
+    const path = join(dir, "result.json.answers.json");
+    writeFileSync(path, "earlier");
+    assert.throws(() => answersFileWriter(path, ID)(entry(1)));
+    assert.equal(readFileSync(path, "utf8"), "earlier");
+  });
+});
+
+describe("(#455 fix round 1) a replay hands an answer only to the request it answered", () => {
+  test("every saved answer carries its request's fingerprint", async () => {
+    const p = provider();
+    const { answers } = await liveRun(p);
+    const saved = answers.filter((a) => a.kind === "answer") as Extract<SavedAnswer, { kind: "answer" }>[];
+    assert.deepEqual(saved.map((a) => a.requestHash), p.requests.map((r) => requestHashOf(r)));
+  });
+
+  test("a replay with another route name (other prompts, same steps and roles) stops with `replay_mismatch`", async () => {
+    const live = await liveRun(provider());
+    const s = await runCompetenceRule(PAGE, version(), ID, { live: true, replay: true, routeName: "another route", verdicts: "uyayaa", provider: new ReplayProvider(live.answers), ...quiet });
+    assert.equal(s.stop?.code, "replay_mismatch");
+    assert.equal(s.requests, 0);
   });
 });

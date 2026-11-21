@@ -60,7 +60,8 @@
  *              writable (and new) before the first request like `--out`, NEVER printed. It holds model
  *              text, so it stays on the machine of the person who ran the script.
  *   --replay   (#455) `--replay <answers.json>`: re-run the code steps on the answers a live run saved,
- *              with 0 requests (no key needed, no provider built). The same validation decides, so the
+ *              with 0 requests (no provider built; (fix round 1) `ANTHROPIC_API_KEY` is deleted from the
+ *              process environment first, so not even the redaction of a replayed error reads it). The same validation decides, so the
  *              stop of a saved answer can be diagnosed without spend. Refused together with `--live`.
  *
  * Run (from functions/):
@@ -72,7 +73,7 @@
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { createHash } from "node:crypto";
-import { closeSync, fchmodSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, fchmodSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import type { AssessmentCriterion, CompetenceBlock, IntakeQuestion, VisaRubric } from "../../../types/rubric";
 import type { GuidanceSnapshotContent } from "../../guidance/types";
 import type { LlmProvider, LlmRequest, LlmResponse } from "../../../services/ai/llm-provider";
@@ -163,9 +164,34 @@ export interface RunStopRecord {
  * Only `answer` and `error` entries are replayed.
  */
 export type SavedAnswer =
-  | { kind: "answer"; n: number; step: LiveStep; role: AiModelRole; response: LlmResponse }
-  | { kind: "error"; n: number; step: LiveStep; role: AiModelRole; errorClass: string; message: string }
+  | { kind: "answer"; n: number; step: LiveStep; role: AiModelRole; requestHash: string; response: LlmResponse }
+  | { kind: "error"; n: number; step: LiveStep; role: AiModelRole; requestHash: string; errorClass: string; message: string }
   | { kind: "stop_detail"; step: LiveStep; code: string; detail: string };
+
+/**
+ * (#455 fix round 1) The fingerprint of a request: sha256 over its prompt (system and user text)
+ * and its answer schema. Saved with each answer, so a replay hands an answer back ONLY to the very
+ * request it answered: a replay with another page, version, verdicts or route name builds other
+ * prompts and stops with `replay_mismatch`, instead of quietly re-reading answers to other prompts.
+ */
+export function requestHashOf(request: Pick<LlmRequest, "system" | "user" | "schema">): string {
+  return createHash("sha256").update(JSON.stringify([request.system, request.user, request.schema ?? null])).digest("hex");
+}
+
+/**
+ * (#455 fix round 1) A write of the answers file that failed (disk full, permissions changed, ...).
+ * Kept on the counting provider so the stop says `answers_write_failed` instead of the
+ * `provider_error` the drafting code would make of the throw, and so no further request is sent
+ * once answers can no longer be kept.
+ */
+interface AnswersWriteFailure {
+  step: LiveStep;
+  // What was being written: an `answer` (a paid answer that arrived and could not be kept), an
+  // `error` (the provider had failed; its error is still the one thrown) or a `stop_detail`.
+  entry: SavedAnswer["kind"];
+  // The file-system error code (`ENOSPC`, `EACCES`, ...) or the error's class.
+  code: string;
+}
 
 /** One request a live run would send, as planned offline. */
 export interface PlannedRequest {
@@ -242,21 +268,48 @@ class CountingProvider implements LlmProvider {
    * SDK's own retry (`MAX_RETRIES` in services/ai/llm-provider.ts) could double every count unseen,
    * and a request that timed out after the server finished it can be billed.
    */
+  // (#455 fix round 1) The first failed write of the answers file, or null.
+  writeFailure: AnswersWriteFailure | null = null;
+
+  /**
+   * (#455 fix round 1) Hand one entry to `onAnswer`; a failed write is recorded in `writeFailure`
+   * (the first one wins) and re-thrown to the caller, which decides what to throw on.
+   */
+  keep(entry: SavedAnswer): void {
+    try {
+      this.onAnswer?.(entry);
+    } catch (e) {
+      this.writeFailure ??= { step: entry.step, entry: entry.kind, code: String((e as NodeJS.ErrnoException)?.code ?? (e as Error)?.constructor?.name ?? "unknown") };
+      throw e;
+    }
+  }
+
   async complete(request: LlmRequest): Promise<LlmResponse> {
+    // (#455 fix round 1) Once an answer could not be kept, nothing more is sent (and nothing is
+    // counted: this throw is not a send). The run stops with `answers_write_failed`.
+    if (this.writeFailure) throw new Error("answers_write_failed");
     this.requests += 1;
     const n = this.requests;
     const step = this.step;
+    const requestHash = requestHashOf(request);
     let response: LlmResponse;
     try {
       response = await this.inner.complete({ ...request, maxRetries: 0 });
     } catch (err) {
       // (#455) No answer, but the error is kept (class and REDACTED description) so a replay throws
       // the same error and the production retry rule makes the same decision.
-      this.onAnswer?.({ kind: "error", n, step, role: request.role, errorClass: (err as Error)?.constructor?.name ?? "unknown", message: this.describe(err) });
+      // (#455 fix round 1) If keeping it fails, the PROVIDER's error is still the one thrown (the
+      // failed write is recorded in `writeFailure`, and the stop names it).
+      try {
+        this.keep({ kind: "error", n, step, role: request.role, requestHash, errorClass: (err as Error)?.constructor?.name ?? "unknown", message: this.describe(err) });
+      } catch {
+        // recorded in `writeFailure`
+      }
       throw err;
     }
     // (#455) Kept BEFORE any validation reads it: whatever the code then decides, the paid answer is on file.
-    this.onAnswer?.({ kind: "answer", n, step, role: request.role, response });
+    // (#455 fix round 1) A failed write throws from here; the stop is `answers_write_failed`, never `provider_error`.
+    this.keep({ kind: "answer", n, step, role: request.role, requestHash, response });
     return response;
   }
 }
@@ -265,8 +318,9 @@ class CountingProvider implements LlmProvider {
  * (#455) A provider that sends NOTHING: it hands back, in order, the answers a live run saved in its
  * answers file, so `--replay` re-runs the production code steps on them with 0 requests.
  *
- * Each saved entry must be for the step and role now asking (the run is deterministic given the same
- * answers, so a mismatch means the inputs differ from the live run's). On a mismatch, or when the saved
+ * Each saved entry must be for the step and role now asking, and for the very same request (its
+ * `requestHash`: the same prompt and schema), so an answer is only ever handed to the request it
+ * answered; a replay with other inputs stops at the first request that differs. On a mismatch, or when the saved
  * answers run out, it records why in `problem` and throws; the run reports that problem as its stop
  * (`replay_mismatch` / `replay_exhausted`) instead of the provider error the drafting code turns it into.
  */
@@ -294,7 +348,8 @@ export class ReplayProvider implements LlmProvider {
       this.problem ??= "replay_exhausted";
       throw new Error("replay_exhausted");
     }
-    if (next.step !== this.stepOf() || next.role !== request.role) {
+    // (#455 fix round 1) The step, the role AND the request's fingerprint must all be the saved ones.
+    if (next.step !== this.stepOf() || next.role !== request.role || next.requestHash !== requestHashOf(request)) {
       this.problem ??= "replay_mismatch";
       throw new Error("replay_mismatch");
     }
@@ -523,7 +578,13 @@ export async function runCompetenceRule(snapshot: GuidanceSnapshotContent, versi
   const stopAt = (step: LiveStep, code: string, problems: readonly string[] = [], detail?: string): void => {
     if (summary.stop) return;
     summary.stop = { step, code, problems: [...problems] };
-    if (detail) opts.onAnswer?.({ kind: "stop_detail", step, code, detail });
+    if (detail) {
+      try {
+        provider.keep({ kind: "stop_detail", step, code, detail });
+      } catch {
+        // recorded in `provider.writeFailure`; `done()` names it as the stop
+      }
+    }
   };
   /** (#455) The stop of a throw inside a step: a `RunStop` names its own reason code; anything else its class. */
   const stopOnThrow = (step: LiveStep, e: unknown, RunStopClass: new (...a: any[]) => { reasonCode: string; message: string }): void => {
@@ -539,6 +600,14 @@ export async function runCompetenceRule(snapshot: GuidanceSnapshotContent, versi
       const rp = opts.provider;
       if (rp.problem) summary.stop = { step: summary.stop?.step ?? provider.step, code: rp.problem, problems: [] };
       else if (rp.left() > 0 && !summary.stop) summary.stop = { step: provider.step, code: "replay_answers_left", problems: [String(rp.left())] };
+    }
+    // (#455 fix round 1) A failed write of the answers file IS the stop, whatever the step then made of
+    // the throw (the drafting code wraps it as `provider_error`, the checker holds). Its problems say
+    // what failed (`write:<errno>`) and what was being kept (`entry:answer` = a paid answer arrived
+    // and is not on file; `entry:error` = the provider had failed; `entry:stop_detail`).
+    if (provider.writeFailure) {
+      const f = provider.writeFailure;
+      summary.stop = { step: f.step, code: "answers_write_failed", problems: [`write:${f.code}`, `entry:${f.entry}`] };
     }
     // (#455) The stop, as a printed line: step, code word and problem codes only (never model text).
     if (summary.stop) {
@@ -716,37 +785,60 @@ export function answersFileProblem(out: string): "answers_exists" | "answers_not
 }
 
 /**
- * (#455) A writer for the answers file. The file is created on the FIRST entry, exclusively ("wx")
- * and with mode 0600 (set again with `fchmod`, so a permissive umask cannot widen it); every later
- * entry rewrites the whole file (`{ ruleId, entries }`), so the answers received so far are on disk
- * even if the process is killed mid-run. It is never printed.
+ * (#455) A writer for the answers file. Every entry rewrites the whole file (`{ ruleId, entries }`).
+ *
+ * (#455 fix round 1) ATOMICALLY: the content goes to a temporary file in the same folder
+ * (`<path>.tmp-<pid>`, created exclusively with mode 0600, `fchmod` again so a permissive umask cannot
+ * widen it, flushed with `fsync`), which is then renamed over the answers file. A rename within one
+ * folder replaces the file in one step, so a crash leaves either the previous complete file or the
+ * new one, never an empty or half-written one, and the answers received earlier are never lost.
+ * On the FIRST entry the answers file itself is created exclusively ("wx", 0600), so a file that
+ * appeared after the pre-flight check is never replaced. It is never printed.
  *
  * @returns the `onAnswer` callback for `runCompetenceRule`
  */
 export function answersFileWriter(path: string, ruleId: string): (entry: SavedAnswer) => void {
   const entries: SavedAnswer[] = [];
-  let created = false;
+  let claimed = false;
+  const tmp = `${path}.tmp-${process.pid}`;
   return (entry) => {
     entries.push(entry);
-    const body = JSON.stringify({ ruleId, entries }, null, 2);
-    if (!created) {
+    if (!claimed) {
+      // Claim the name: fails if anything is there (the pre-flight check already proved it was not).
       const fd = openSync(path, "wx", 0o600);
       try {
         fchmodSync(fd, 0o600);
-        writeSync(fd, body);
       } finally {
         closeSync(fd);
       }
-      created = true;
-      return;
+      claimed = true;
     }
-    // The file exists with mode 0600; "w" truncates it and keeps its mode.
-    writeFileSync(path, body, { flag: "w" });
+    const fd = openSync(tmp, "wx", 0o600);
+    try {
+      fchmodSync(fd, 0o600);
+      writeSync(fd, JSON.stringify({ ruleId, entries }, null, 2));
+      fsyncSync(fd);
+    } catch (e) {
+      closeSync(fd);
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // nothing left to clean up
+      }
+      throw e;
+    }
+    closeSync(fd);
+    renameSync(tmp, path);
   };
 }
 
 /** The command line: read the files, build the real provider only for `--live`, write the outcome to `--out`. */
 async function main(): Promise<void> {
+  // (#455 fix round 1) A replay sends nothing and needs no key, so it never has one: the key is
+  // removed from this process's environment BEFORE anything else runs. (`npm run` loads `.env.local`
+  // into the environment; a replayed provider error is described by `describeAnthropicError`, which
+  // would otherwise read the key to redact it. The saved descriptions were redacted when they were saved.)
+  if (arg("replay") !== undefined) delete process.env.ANTHROPIC_API_KEY;
   const pagePath = arg("page");
   const versionPath = arg("version");
   const ruleId = arg("rule");
