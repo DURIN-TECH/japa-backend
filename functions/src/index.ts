@@ -571,6 +571,39 @@ export const retryConsultationRefunds = functions
   });
 
 /**
+ * Every 30 minutes: look up consultation refunds stuck in `processing`
+ * (issue #381).
+ *
+ * Paystack accepted the refund but its final webhook (`refund.processed` /
+ * `refund.failed`) never arrived. Each row older than
+ * REFUND_PROCESSING_POLL_AFTER_MINUTES is looked up at Paystack (by its
+ * current refund id, or among the charge's refunds with the exact amount and
+ * currency match) and moved FORWARD under the webhook's rules
+ * (`consultationRefundService.pollProcessingRefunds`). Never creates a
+ * refund, never writes money; a second run writes nothing.
+ *
+ * Secrets: PAYSTACK_SECRET_KEY (refund API), EMAIL_SECRETS (the "delayed"
+ * notice). Indexes: transactions(type, status, processingSince) and
+ * transactions(type, status, updatedAt).
+ */
+export const pollProcessingConsultationRefunds = functions
+  .runWith({ timeoutSeconds: 300, memory: "256MB", secrets: ["PAYSTACK_SECRET_KEY", ...EMAIL_SECRETS] })
+  .pubsub.schedule("*/30 * * * *")
+  .timeZone("UTC")
+  .onRun(async () => {
+    try {
+      const r = await consultationRefundService.pollProcessingRefunds();
+      console.log(
+        `Consultation refund processing poll: ${r.scanned} scanned, ${r.completed} completed, ${r.failed} failed, ` +
+          `${r.unchanged} unchanged, ${r.errors} errors`
+      );
+    } catch (error) {
+      // Logged, never thrown: the next run looks again.
+      console.error("Consultation refund processing poll failed:", error);
+    }
+  });
+
+/**
  * Every 15 minutes (same cadence as the refund retry): look Paystack's fee
  * up again for consultation payments whose fee was unknown at settle time
  * (issue #395).

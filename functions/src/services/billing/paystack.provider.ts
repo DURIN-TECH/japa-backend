@@ -433,6 +433,23 @@ export class PaystackProvider implements BillingProvider {
       .filter((r): r is PaystackRefund => r !== null);
   }
 
+  /**
+   * One refund by Paystack's refund id (issue #381): `GET /refund/:id`
+   * (Paystack's "Fetch Refund"). Used by the processing poll for a row that
+   * already knows its current attempt. The charge it belongs to is read from
+   * the answer (`transaction_reference`, or the nested `transaction`), so the
+   * caller can check it is the row's own.
+   *
+   * @param refundId Paystack's refund id (as stored on the row)
+   * @returns the refund, or null when Paystack's answer carries no refund
+   * @throws PaystackApiError (`PAYSTACK_ERROR: ...`) when Paystack refuses or
+   *   cannot be reached
+   */
+  async fetchRefund(refundId: string): Promise<PaystackRefund | null> {
+    const res = await this.client().get<{ data?: unknown }>(`/refund/${encodeURIComponent(refundId)}`);
+    return toPaystackRefund(res.data.data);
+  }
+
   async cancelSubscription(providerRef: string): Promise<void> {
     // providerRef is "subscriptionCode:emailToken" — Paystack requires both to disable.
     const [code, token] = providerRef.split(":");

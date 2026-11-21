@@ -2000,6 +2000,13 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   refundLeaseUntil?: Timestamp;
   /** The last error from Paystack, for admins. */
   refundLastError?: string;
+  /**
+   * Issue #381: when the row last ENTERED `processing` (Paystack accepted
+   * it). The processing poll picks rows that have sat there longer than
+   * REFUND_PROCESSING_POLL_AFTER_MINUTES. Rows that entered processing before
+   * #381 have none and are picked by `updatedAt` instead.
+   */
+  processingSince?: Timestamp;
   /** When Paystack reported the refund processed. */
   refundedAt?: Timestamp;
   /** When the row became `failed`. */

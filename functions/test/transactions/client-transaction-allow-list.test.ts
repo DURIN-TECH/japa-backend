@@ -182,6 +182,8 @@ const FULL_ROW: Required<Transaction> = {
   paystackFeeSetAsideAt: Timestamp.fromMillis(1_755_555_565_000),
   // ---- Issue #383: Paystack ids of the row's earlier refund attempts (hidden) ----
   previousProviderRefundIds: ["HIDDEN-earlier-refund-id"],
+  // ---- Issue #381: when the refund entered processing (hidden) ----
+  processingSince: Timestamp.fromMillis(1_755_555_566_000),
 };
 
 /**
@@ -284,6 +286,8 @@ const HIDDEN_FIELDS: readonly (keyof Transaction)[] = [
   "paystackFeeSetAsideAt",
   // Issue #383: Paystack refund ids.
   "previousProviderRefundIds",
+  // Issue #381: the processing poll's age field.
+  "processingSince",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */

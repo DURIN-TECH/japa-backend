@@ -178,6 +178,13 @@ export const REFUND_LEASE_MINUTES = 2;
 export const REFUND_RETRY_BATCH_SIZE = 100;
 /** Longest admin note stored, in characters. */
 export const MAX_REFUND_NOTE_LENGTH = 1000;
+/**
+ * Issue #381: how long a row may sit in `processing` (Paystack accepted it,
+ * no final webhook yet) before the poll asks Paystack, in minutes.
+ */
+export const REFUND_PROCESSING_POLL_AFTER_MINUTES = 60;
+/** Issue #381: the most rows one run of the processing poll looks at. */
+export const REFUND_PROCESSING_POLL_BATCH_SIZE = 100;
 
 /** Milliseconds in a minute and an hour. */
 const MINUTE_MS = 60 * 1000;
@@ -1142,6 +1149,20 @@ export const ADMIN_REFUND_REASONS: Record<string, RefundReason> = {
   other: "admin_other",
 };
 
+/** What one run of the processing poll did (issue #381). */
+export interface RefundPollResult {
+  /** Rows looked at. */
+  scanned: number;
+  /** Rows Paystack reported processed: now `completed`. */
+  completed: number;
+  /** Rows Paystack reported failed: now `failed` (client told once). */
+  failed: number;
+  /** Rows still on their way, not found, or whose refund did not match: nothing written. */
+  unchanged: number;
+  /** Rows whose Paystack lookup failed (logged; the others still ran). */
+  errors: number;
+}
+
 /** What one run of the retry job did. */
 export interface RefundRetryResult {
   scanned: number;
@@ -1310,6 +1331,8 @@ class ConsultationRefundService {
           // Issue #383: the failed attempt is over; its id is kept as an
           // earlier attempt, so its late webhooks change nothing.
           ...retireAttempt(existing),
+          // Issue #381: set again when the next attempt enters processing.
+          processingSince: FieldValue.delete(),
           updatedAt: now,
         };
         tx.update(ctx.refundRef!, retry);
@@ -1557,6 +1580,7 @@ class ConsultationRefundService {
         // Issue #413 (A) / #383: as for a booking's refund.
         refundFailureReason: FieldValue.delete(),
         ...retireAttempt(row),
+        processingSince: FieldValue.delete(),
         updatedAt: now,
       });
       if (exceptionSnap.exists) tx.update(exceptionRef, { status: "open", updatedAt: now });
@@ -2042,6 +2066,8 @@ class ConsultationRefundService {
         ...(extra.providerRefundStatus ? { providerRefundStatus: extra.providerRefundStatus } : {}),
         ...(target === "completed" ? { refundedAt: now } : {}),
         ...(target === "failed" ? { refundFailedAt: now } : {}),
+        // Issue #381: when it entered processing (the poll's age field).
+        ...(target === "processing" ? { processingSince: now } : {}),
       };
       tx.update(ref, update);
       const mirrored = mirror ? mirrorUpdate(mirror.kind, target, now) : null;
@@ -2110,6 +2136,130 @@ class ConsultationRefundService {
       source: "webhook",
     });
     return outcome.changed ? "applied" : "unchanged";
+  }
+
+  /**
+   * The processing poll (issue #381), run every 30 minutes
+   * (`pollProcessingConsultationRefunds` in index.ts). A refund Paystack
+   * accepted whose final webhook never arrives would sit in `processing`
+   * for ever; this asks Paystack and moves it forward under the SAME rules
+   * as the webhook.
+   *
+   * Picks `refund` rows in `processing` for more than
+   * REFUND_PROCESSING_POLL_AFTER_MINUTES, oldest first, at most
+   * REFUND_PROCESSING_POLL_BATCH_SIZE per run: by `processingSince` (index
+   * transactions(type, status, processingSince)), then, for rows that
+   * entered processing before #381 and have no such field, by `updatedAt`
+   * (index transactions(type, status, updatedAt)).
+   *
+   * Each row is looked up at Paystack:
+   *  - by its CURRENT attempt (`providerRefundId`, `fetchRefund`): that
+   *    refund must be of the row's charge and of exactly its amount and
+   *    currency, else nothing is applied;
+   *  - with no id yet, among the charge's refunds
+   *    (`findRefundsForTransaction`) with the #413 exact match
+   *    (`matchProviderRefund`): only a `match` is applied (it then becomes
+   *    the current attempt); a mismatch is left for the engine / an admin.
+   * The answer goes through `advanceRefundStatus` only (forward-only:
+   * processed -> completed, failed -> failed and the client told once,
+   * still pending / processing -> nothing written). The poll never calls
+   * `createRefund` and never writes a money row; a second run right after
+   * writes nothing. A held row, a non-refund row, a row no longer
+   * `processing` is skipped. One row's Paystack error is logged and counted;
+   * the others still run.
+   */
+  async pollProcessingRefunds(): Promise<RefundPollResult> {
+    const result: RefundPollResult = { scanned: 0, completed: 0, failed: 0, unchanged: 0, errors: 0 };
+    const cutoff = Timestamp.fromMillis(chargeRuntime.now().getTime() - REFUND_PROCESSING_POLL_AFTER_MINUTES * MINUTE_MS);
+    // ---- Pick: rows with the age field first, then older rows by updatedAt ----
+    const bySince = await collections.transactions
+      .where("type", "==", "refund")
+      .where("status", "==", "processing")
+      .where("processingSince", "<=", cutoff)
+      .orderBy("processingSince", "asc")
+      .limit(REFUND_PROCESSING_POLL_BATCH_SIZE)
+      .get();
+    const picked = new Map<string, Transaction>();
+    for (const doc of bySince.docs) picked.set(doc.id, doc.data() as Transaction);
+    if (picked.size < REFUND_PROCESSING_POLL_BATCH_SIZE) {
+      const byUpdated = await collections.transactions
+        .where("type", "==", "refund")
+        .where("status", "==", "processing")
+        .where("updatedAt", "<=", cutoff)
+        .orderBy("updatedAt", "asc")
+        .limit(REFUND_PROCESSING_POLL_BATCH_SIZE)
+        .get();
+      for (const doc of byUpdated.docs) {
+        const row = doc.data() as Transaction;
+        // Only the rows the first query cannot see (no age field yet).
+        if (row.processingSince || picked.has(doc.id)) continue;
+        if (picked.size >= REFUND_PROCESSING_POLL_BATCH_SIZE) break;
+        picked.set(doc.id, row);
+      }
+    }
+
+    for (const [id, row] of picked) {
+      // Belt and braces: never a held row, a row of another type, or one
+      // that is no longer processing.
+      if (row.type !== "refund" || row.status !== "processing" || row.refundHeldReason) continue;
+      result.scanned++;
+      try {
+        const answer = await this.lookUpForPoll(row);
+        if (!answer) {
+          result.unchanged++;
+          continue;
+        }
+        const outcome = await this.advanceRefundStatus(id, refundStatusFromPaystack(answer.refund.status), {
+          providerRefundId: answer.refund.id,
+          providerRefundStatus: answer.refund.status,
+          // The current attempt's own answer is checked like a webhook; a
+          // matched refund on a row with no id yet becomes its current one.
+          source: answer.byId ? "webhook" : "engine",
+        });
+        if (outcome.changed && outcome.row?.status === "completed") result.completed++;
+        else if (outcome.changed && outcome.row?.status === "failed") result.failed++;
+        else result.unchanged++;
+      } catch (error) {
+        // One row must not stop the run.
+        console.error(`[refund poll] ${id}: Paystack lookup failed:`, error);
+        result.errors++;
+      }
+    }
+    return result;
+  }
+
+  /**
+   * What Paystack says about one processing row, for the poll (issue #381),
+   * or null when nothing may be applied (no such refund, another charge's,
+   * not exactly the row's money, or a mismatch among the charge's refunds).
+   * Throws on a Paystack error (counted by the caller).
+   */
+  private async lookUpForPoll(row: Transaction): Promise<{ refund: PaystackRefund; byId: boolean } | null> {
+    const reference = row.providerTransactionId ?? "";
+    if (row.providerRefundId) {
+      const refund = await paystackProvider.fetchRefund(row.providerRefundId);
+      if (!refund || refund.id !== row.providerRefundId) return null;
+      // The refund must be this row's charge's (when Paystack names it) and
+      // exactly the row's money (#413): else it is not ours to apply.
+      if (refund.transactionReference && reference && refund.transactionReference !== reference) {
+        console.error(`[refund poll] ${row.id}: Paystack refund ${refund.id} names another charge; not applied`);
+        return null;
+      }
+      if (matchProviderRefund(row, [{ ...refund, status: "processing" }]).kind !== "match") {
+        console.error(`[refund poll] ${row.id}: Paystack refund ${refund.id} does not match the row's amount/currency; not applied`);
+        return null;
+      }
+      return { refund, byId: true };
+    }
+    if (!reference) return null;
+    const match = matchProviderRefund(row, await paystackProvider.findRefundsForTransaction(reference));
+    if (match.kind !== "match") {
+      if (match.kind === "mismatch") {
+        console.error(`[refund poll] ${row.id}: Paystack refund ${match.refund.id} does not match the row; not applied`);
+      }
+      return null;
+    }
+    return { refund: match.refund, byId: false };
   }
 
   /**
