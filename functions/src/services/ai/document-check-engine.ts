@@ -126,6 +126,21 @@ function evidenceItemFor(rubric: Pick<VisaRubric, "evidenceItems"> | null, check
 }
 
 /**
+ * (#444) The MAXIMUM AGE a criterion's check declares, or null. The one shape
+ * rule for "how old a document may be", shared by the per-upload check
+ * (`expectationsFor`, #115) and the review's date-relative checks
+ * (`dateRelativeChecksOf` in assessment-engine.ts, #444): an objective
+ * criterion whose check is `lte`, whose value is a positive number and whose
+ * unit is a duration (days, weeks, months, years). Reads only the rubric data.
+ */
+export function maxAgeOfCheck(c: Pick<VisaRubric["criteria"][number], "kind" | "check">): DeclaredDuration | null {
+  const check = c.check;
+  if (c.kind !== "objective" || !check || typeof check.value !== "number" || !(check.value > 0)) return null;
+  if (check.op !== "lte" || !check.unit || !DURATION_UNIT_SET.has(check.unit)) return null;
+  return { value: check.value, unit: check.unit as DurationUnit };
+}
+
+/**
  * The expectations for one checklist item. Reads ONLY the rubric: the item's
  * `expects`, and the checks of the criteria it evidences.
  *
@@ -157,9 +172,12 @@ export function expectationsFor(
         // `heldForDays`: the value is written in the criterion's own unit (days when none is stated).
         const unit = check.unit && DURATION_UNIT_SET.has(check.unit) ? (check.unit as DurationUnit) : "days";
         if (!requiredPeriod) requiredPeriod = { value: check.value, unit };
-      } else if (check.op === "lte" && check.unit && DURATION_UNIT_SET.has(check.unit)) {
+      } else {
         // An upper bound in a duration unit: how old the document may be.
-        if (!maxAge) maxAge = { value: check.value, unit: check.unit as DurationUnit };
+        // (#444) The shape rule lives in `maxAgeOfCheck`, which the review's
+        // date-relative checks (assessment-engine.ts) share; same outcome.
+        const age = maxAgeOfCheck(c);
+        if (age && !maxAge) maxAge = age;
       }
     }
   }
@@ -235,8 +253,11 @@ export function parseDocumentDate(raw: string | null | undefined): ParsedDate {
   return { ok: false, reason: "unreadable" };
 }
 
-/** Whole days since the epoch for an ISO date. */
-function dayNumber(isoDate: string): number {
+/**
+ * Whole days since the epoch for an ISO date.
+ * (#444) Exported so the review's date-relative checks count days the same way.
+ */
+export function dayNumber(isoDate: string): number {
   const [y, m, d] = isoDate.split("-").map(Number);
   return Math.floor(Date.UTC(y, m - 1, d) / 86_400_000);
 }

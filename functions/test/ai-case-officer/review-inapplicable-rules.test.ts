@@ -321,7 +321,9 @@ function replayFixture(opts: { docs?: DocumentExtraction[]; concerns?: boolean; 
   // The uploads: by default read cleanly, none of the checked fields in them.
   const docs = opts.docs ?? Array.from({ length: fixture.documentsUploaded }, (_, i) => doc(`d${i + 1}`));
   const intakeFacts: Facts = Object.fromEntries(Object.entries(fixture.intakeAnswers).map(([k, v]) => [`intake.${k}`, v as Facts[string]]));
-  const objective = evaluateObjective(rubric, intakeFacts, docs);
+  // (#444) The job measures date-relative checks against the application
+  // date (`barDateOf`); the replay uses the fixture's bar date, as the job would.
+  const objective = evaluateObjective(rubric, intakeFacts, docs, { applicationDate: fixture.barDate });
   const judgement: JudgementOutput = opts.concerns === false ? QUIET : { ...QUIET, findings: fixture.concernCriterionIds.map((criterionId) => ({ criterionId, detail: "A concern (fixture).", whatWouldHelp: "Add supporting evidence.", concern: true })) };
   const content = assembleContent({
     rubric, mandatoryHits: bars.hits, objective, judgement, documents: docs, statementReadable: true, score: opts.score === undefined ? fixture.before.score : opts.score, suspiciousDocumentIds: [], judgementFailed: false, notAssessed,
@@ -434,12 +436,24 @@ describe("#308 UK Standard Visitor v2, application wyPrIGfPVSMs8VbPivs9 (fixture
 //   1. one of the uploads could not be read, and no rule said so any more;
 //   2. the rulebook has no document items, so no objective rule was checked.
 
-/** The two fields the real rulebook's document items ask for, as a cleanly read upload. */
-const BOTH_ASKED_FOR = [{ field: "identityDocument", value: "P1234567" }, { field: "financialEvidence.mostRecentDaysBeforeApplication", value: 10, unit: "days" }];
+/**
+ * The two things the real rulebook's document items ask for, as a cleanly read upload.
+ *
+ * (#444, changed on purpose) This used to feed
+ * `financialEvidence.mostRecentDaysBeforeApplication: 10 days` as a read value.
+ * That field is now a DATE-RELATIVE check: the model is no longer asked for it
+ * and a value under it is ignored; code measures it from the document's own
+ * date. So the upload now carries what the review really reads: a statement
+ * period end 10 days before the fixture's bar date (2026-11-14), and the
+ * evidence item it was read as. The asserted outcomes are unchanged.
+ */
+const BOTH_ASKED_FOR = [{ field: "identityDocument", value: "P1234567" }, { field: "statementPeriodEnd", value: "2026-11-04" }];
+/** (#444) The evidence item the upload above was read as (the job's `evidenceItems` read). */
+const READ_AS_FINANCIAL_EVIDENCE: Partial<DocumentExtraction> = { evidenceItems: ["financial_evidence"] };
 
 describe("#308 an upload that could not be read is always said, and holds the result back", () => {
   test("QA reproduction 1 (fixture): one clean upload, one unreadable, every question answered, score 90, no concerns", () => {
-    const clean = doc("d1", BOTH_ASKED_FOR);
+    const clean = doc("d1", BOTH_ASKED_FOR, READ_AS_FINANCIAL_EVIDENCE);
     const unreadable = doc("d2", [], { label: "Bank statement", readable: false, failure: "file could not be read" });
 
     // Control: without the unreadable upload this applicant IS strong / high / clear.
@@ -579,7 +593,7 @@ describe("#308 nothing checked from documents is never a strong result", () => {
     const named = run(smallRubric(SMALL_ITEMS), [doc("d1", [{ field: "identityDocument", value: "P1234567" }, { field: "funds.balance", value: 5000, unit: "GBP" }])], QUIET).content;
     assert.deepEqual([named.readiness, named.confidence, named.internalCall], ["strong", "high", "would_approve"]);
     // The real rulebook, both asked-for documents read, every question answered, score 90: 33 marked rules, still strong / high.
-    const real = replayFixture({ docs: [doc("d1", BOTH_ASKED_FOR)], concerns: false, score: 90, everyQuestionAnswered: true }).content;
+    const real = replayFixture({ docs: [doc("d1", BOTH_ASKED_FOR, READ_AS_FINANCIAL_EVIDENCE)], concerns: false, score: 90, everyQuestionAnswered: true }).content;
     assert.equal(real.insufficientInformation.filter((i) => i.notAssessed === "not_in_documents").length, 33);
     assert.deepEqual([real.readiness, real.confidence, real.internalCall, real.stageOutcomes.objective], ["strong", "high", "would_approve", "clear"]);
   });

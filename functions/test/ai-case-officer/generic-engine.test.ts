@@ -151,6 +151,9 @@ describe("static check: no route, country or nationality text in the engine", ()
     "Pakistani", "Nigerian", "Indian", "Brazilian", "Ghanaian", "British",
     "route-a", "route-b", "visitor", "Visitor", "student", "Student",
     "Appendix V", "Standard Visitor", "INA 214", "R216",
+    // (#444) The date-relative check is found from the rulebook's data (the
+    // check's shape and its document items), never by its field or rule ref.
+    "financialEvidence", "mostRecentDaysBeforeApplication", "FIN 7",
   ];
 
   test("no listed term appears in the engine or prompt source", () => {

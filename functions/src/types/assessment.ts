@@ -360,6 +360,14 @@ export interface DocumentReadRecord {
   reason: DocumentUnreadReason | null;
   // How many read values were kept for this upload (after the per-document cap).
   valueCount: number;
+  // (#444) The rulebook evidence item KEYS the review read the upload as ([]
+  // when the rulebook has no date-relative check, or the upload was not read).
+  // Optional: records stored before #444 do not carry it.
+  evidenceItems?: string[];
+  // (#444) The upload's own date (the latest statement period end or document
+  // date read on it, YYYY-MM-DD), null when none was read. A date, not an
+  // amount or a name. Optional for records stored before #444.
+  documentDate?: string | null;
 }
 
 /** Usage of one stage, as the API reported it. */
@@ -458,6 +466,11 @@ export interface ApplicationAssessment {
   // every client-role response (tier-serializer.ts); absent on the bar and
   // nothing-to-read paths, on the bulk path and on documents stored before #418.
   documentsRead?: DocumentReadRecord[];
+  // (#444) Staff only: the application date (YYYY-MM-DD) the date-relative
+  // checks were measured against (`barDateOf`: `submittedAt`, else the review
+  // date). Stripped from every client-role response like `documentsRead`;
+  // absent where `documentsRead` is.
+  measuredOn?: string;
 
   // (#384) `narrative`: the model that wrote the narrative, when the call was
   // made (absent on documents without a narrative call).

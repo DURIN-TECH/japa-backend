@@ -801,10 +801,13 @@ describe("#418 the review job", () => {
     assert.equal(block(judgement[0].user, "extraction"), block(narrative[0].user, "extraction"));
 
     // The stored, staff-only record: one entry per upload, no read values.
+    // (#444, changed on purpose) Each entry also carries the evidence item
+    // keys read ([]: this rulebook has no date-relative check, so none are
+    // asked) and the document's own date (the statement's period end it read; null when unread).
     const byId = Object.fromEntries((stored.documentsRead as any[]).map((d) => [d.documentId, d]));
-    assert.deepEqual(byId["doc-bank"], { documentId: "doc-bank", documentKind: "bank_statement", readable: true, reason: null, valueCount: 5 });
-    assert.deepEqual(byId["doc-locked"], { documentId: "doc-locked", documentKind: null, readable: false, reason: "password protected", valueCount: 0 });
-    assert.deepEqual(byId["doc-big"], { documentId: "doc-big", documentKind: null, readable: false, reason: "too large", valueCount: 0 });
+    assert.deepEqual(byId["doc-bank"], { documentId: "doc-bank", documentKind: "bank_statement", readable: true, reason: null, valueCount: 5, evidenceItems: [], documentDate: "2026-10-31" });
+    assert.deepEqual(byId["doc-locked"], { documentId: "doc-locked", documentKind: null, readable: false, reason: "password protected", valueCount: 0, evidenceItems: [], documentDate: null });
+    assert.deepEqual(byId["doc-big"], { documentId: "doc-big", documentKind: null, readable: false, reason: "too large", valueCount: 0, evidenceItems: [], documentDate: null });
     assert.ok(!JSON.stringify(stored.documentsRead).includes("3000"), "no balance is stored in the record");
     assert.ok(!JSON.stringify(stored.documentsRead).includes("Ada"), "no name is stored in the record");
     assert.equal(stored.promptVersion, ASSESSMENT_PROMPT_VERSION);
@@ -956,7 +959,8 @@ describe("#418 the review job", () => {
     // Staff keep it, and nothing in it is a value.
     const staff: any = envelope(stored, "full", ROLES.AGENT, null).data;
     assert.deepEqual(staff.documentsRead, stored.documentsRead);
-    assert.deepEqual(Object.keys(staff.documentsRead[0]).sort(), ["documentId", "documentKind", "readable", "reason", "valueCount"]);
+    // (#444, changed on purpose) plus `evidenceItems` and `documentDate` (no value, no name).
+    assert.deepEqual(Object.keys(staff.documentsRead[0]).sort(), ["documentDate", "documentId", "documentKind", "evidenceItems", "readable", "reason", "valueCount"]);
     // A caller with no role never gets it either (fail closed).
     assert.equal("documentsRead" in (envelope(stored, "full", undefined, null, null, true).data as any), false);
   });

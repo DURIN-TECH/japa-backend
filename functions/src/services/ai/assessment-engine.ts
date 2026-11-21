@@ -21,6 +21,10 @@ import type { LlmRequest } from "./llm-provider";
 import { AI_MODELS } from "./ai-models";
 // (#234) Group matching from what the applicant holds (pure).
 import { decideGroups, factsFromNationality, groupsOf, needWords, type FactNeed, type FactsForRules, type MembershipOnDate } from "./applicant-groups";
+// (#444) The per-upload check's date helpers and its maximum-age shape rule,
+// reused (not copied) by the review's date-relative checks. document-check-
+// engine.ts imports only TYPES from this file, so there is no runtime cycle.
+import { dateWords, dayNumber, durationWords, maxAgeOfCheck, parseDocumentDate, shiftByDuration, type DeclaredDuration } from "./document-check-engine";
 import { DATA_ONLY_RULE, findBannedWording, findInjectionSignals, sanitizeUntrusted, wrapUntrusted, MAX_UNTRUSTED_CHARS } from "./prompt-safety";
 
 // ============================================
@@ -85,6 +89,12 @@ export interface DocumentExtraction {
   // the document was not read); ABSENT on every other path (the per-upload
   // document check, the bulk path), so their results are unchanged.
   documentKind?: DocumentKind | null;
+  // (#444) The rulebook evidence items (their KEYS, mapped back from the short
+  // E1, E2... ids in code) the model read this document as evidence for. Only
+  // on the caseworker read of a rulebook with a date-relative check (see
+  // `evidenceItemChoicesFor`); ABSENT everywhere else. It only says which
+  // document an upload is; code decides what that means for a rule.
+  evidenceItems?: string[];
 }
 
 /** Facts the objective checks may read, keyed by a dotted name. */
@@ -318,11 +328,22 @@ const DERIVED_FACTS: Record<string, string> = { "funds.holderIsApplicant": "acco
 /**
  * The document fields the model must read for the objective checks: the checked
  * field itself, or, for a derived fact, the field it is derived from.
+ *
+ * (#444) The field of a DATE-RELATIVE check (`dateRelativeChecksOf`) is left
+ * out, the same way a derived fact's own field is: no document states "how
+ * many days before the application" it is dated, so asking the model for it
+ * read nothing (and would ask the model to count days). Code measures it from
+ * the document's own dates instead. A field another, NOT date-relative check
+ * also reads is still asked for (that check adds it). Without `evidenceItems`
+ * no check is date-relative, so the list is exactly the pre-#444 one.
  */
-export function documentFieldsFor(rubric: Pick<VisaRubric, "criteria">): string[] {
+export function documentFieldsFor(rubric: Pick<VisaRubric, "criteria"> & Partial<Pick<VisaRubric, "evidenceItems">>): string[] {
   const fields = new Set<string>();
+  const dateRelative = dateRelativeChecksOf(rubric);
   for (const c of rubric.criteria) {
     if (c.kind !== "objective" || !c.check) continue;
+    // (#444) Measured by code from the read dates, never read as a value.
+    if (dateRelative.has(c.criterionId)) continue;
     const field = c.check.field;
     if (field.startsWith("intake.") || field.startsWith("applicant.")) continue;
     if (field in DERIVED_FACTS) fields.add(DERIVED_FACTS[field]);
@@ -347,12 +368,19 @@ export function documentFieldsFor(rubric: Pick<VisaRubric, "criteria">): string[
  *               value per item, e.g. each recurring payment). For these the
  *               model's quote is the item's description as printed, and the
  *               extraction summary shows it next to the amount.
+ *  - `datesDocument`: (#444) true when the field is a date that says HOW
+ *               RECENT the document is (the end of the period it covers, or
+ *               the date it was issued). A document's date for a
+ *               date-relative check is the latest of these (`documentDateOf`).
+ *               A period start, an expiry, a tenancy or an employment date is
+ *               a date on the document, not the document's own date.
  */
 export interface CaseworkerField {
   field: string;
   meaning: string;
   money: boolean;
   perItem: boolean;
+  datesDocument?: boolean;
 }
 
 /**
@@ -370,9 +398,10 @@ export interface CaseworkerField {
  */
 export const CASEWORKER_FIELDS: readonly CaseworkerField[] = [
   // ---- the document's own dates ----
-  { field: "documentDate", meaning: "the date the document was issued, printed or signed", money: false, perItem: false },
+  // (#444) `datesDocument`: these two say how recent the document is.
+  { field: "documentDate", meaning: "the date the document was issued, printed or signed", money: false, perItem: false, datesDocument: true },
   { field: "statementPeriodStart", meaning: "the first day a statement covers", money: false, perItem: false },
-  { field: "statementPeriodEnd", meaning: "the last day a statement covers", money: false, perItem: false },
+  { field: "statementPeriodEnd", meaning: "the last day a statement covers", money: false, perItem: false, datesDocument: true },
   // ---- who holds it and who issued it ----
   // `accountHolder` is ALSO an objective-check field (`funds.holderIsApplicant`
   // is derived from it, see `deriveHolderFact`), so its meaning stays the
@@ -417,6 +446,9 @@ export const CASEWORKER_FIELD_NAMES: readonly string[] = CASEWORKER_FIELDS.map((
 /** (#418) The caseworker fields that hold money (the `money` column). */
 export const CASEWORKER_MONEY_FIELDS: readonly string[] = CASEWORKER_FIELDS.filter((f) => f.money).map((f) => f.field);
 
+/** (#444) The caseworker fields that date the document itself (the `datesDocument` column). */
+export const DOCUMENT_DATE_FIELDS: readonly string[] = CASEWORKER_FIELDS.filter((f) => f.datesDocument === true).map((f) => f.field);
+
 /** (#418) The caseworker fields the model reports once per item (the `perItem` column). */
 const CASEWORKER_PER_ITEM_FIELDS = new Set(CASEWORKER_FIELDS.filter((f) => f.perItem).map((f) => f.field));
 
@@ -460,6 +492,44 @@ export interface ExtractionOptions {
   // review opts in; the per-upload document check (#115) and the bulk path do
   // NOT, so the request they send is exactly the one they sent before #418.
   caseworkerRead?: boolean;
+  // (#444) On the caseworker read only: the rulebook evidence items the model
+  // is asked to place the document under (`evidenceItemChoicesFor`). Empty or
+  // absent: not asked, and the request is exactly the #418 one. Ignored
+  // without `caseworkerRead` (the per-upload check and the bulk path).
+  evidenceItems?: readonly EvidenceItemChoice[];
+}
+
+/**
+ * (#444) One rulebook evidence item as the extraction call is shown it: a
+ * short code id (E1, E2... in rulebook order) and the rulebook's own title.
+ * The model answers with ids only; code maps them back to `key`.
+ */
+export interface EvidenceItemChoice {
+  code: string;
+  key: string;
+  title: string;
+}
+
+/**
+ * (#444) The evidence items the review's extraction call asks about, or none.
+ * Asked only when the (applicable) rulebook has at least one date-relative
+ * check: that is the only place the answer decides anything (which uploads
+ * are "the" evidence a dated rule is measured on). Every rulebook item is
+ * listed (not only the dated rule's), so the model can say a statement is
+ * something else; titles are rubric text, flattened to one line.
+ */
+export function evidenceItemChoicesFor(rubric: Pick<VisaRubric, "criteria"> & Partial<Pick<VisaRubric, "evidenceItems">>): EvidenceItemChoice[] {
+  if (dateRelativeChecksOf(rubric).size === 0) return [];
+  return (rubric.evidenceItems ?? []).map((item, i) => ({ code: `E${i + 1}`, key: item.key, title: item.title.replace(/[\s\u2028\u2029]+/g, " ").trim() }));
+}
+
+/** (#444) Schema options of stage 2. */
+export interface ExtractionSchemaOptions {
+  // (#418) Ask for the document's kind (the caseworker read).
+  documentKind?: boolean;
+  // (#444) The evidence item ids the answer may name (the caseworker read of a
+  // rulebook with a date-relative check). Empty or absent: no `evidenceItems`.
+  evidenceItemCodes?: readonly string[];
 }
 
 /**
@@ -470,7 +540,7 @@ export interface ExtractionOptions {
  * document's kind, a fixed `enum` (DOCUMENT_KINDS): a description of the
  * document, never a judgement of it.
  */
-export function extractionSchema(fields: readonly string[], opts: { documentKind?: boolean } = {}): Record<string, unknown> {
+export function extractionSchema(fields: readonly string[], opts: ExtractionSchemaOptions = {}): Record<string, unknown> {
   const valuesSchema = {
     type: "array",
     items: {
@@ -487,6 +557,24 @@ export function extractionSchema(fields: readonly string[], opts: { documentKind
     },
   };
   if (opts.documentKind) {
+    // (#444) The evidence items the document is evidence for, by id: a list
+    // of the listed ids only (possibly empty). A description of the document,
+    // like its kind; never whether it is good enough for a rule.
+    const codes = opts.evidenceItemCodes ?? [];
+    if (codes.length > 0) {
+      return {
+        type: "object",
+        additionalProperties: false,
+        required: ["readable", "documentKind", "values", "evidenceItems"],
+        properties: {
+          readable: { type: "boolean" },
+          documentKind: { type: "string", enum: [...DOCUMENT_KINDS] },
+          values: valuesSchema,
+          evidenceItems: { type: "array", items: { type: "string", enum: [...codes] } },
+        },
+      };
+    }
+    // Exactly the #418 caseworker-read schema.
     return {
       type: "object",
       additionalProperties: false,
@@ -535,6 +623,23 @@ const CASEWORKER_READ_RULES =
 const EXTRACTION_SYSTEM_CASEWORKER = `${EXTRACTION_SYSTEM}\n${CASEWORKER_READ_RULES}`;
 
 /**
+ * (#444) The extra rule when the call is also asked which evidence items the
+ * document is. Static text (the items themselves go in the user part), so the
+ * system prompt stays cacheable. The model places the document; it is never
+ * asked whether the document is recent enough or how many days old it is:
+ * code measures that from the dates it reported.
+ */
+const EVIDENCE_ITEMS_RULES =
+  "Also set evidenceItems to the ids of the listed evidence items this document is evidence for, read from its content " +
+  "(not from its label). A document can be evidence for several of the listed items: list every item it supports, not only " +
+  "the closest one (for example, a bank statement can be both financial evidence and bank statements). " +
+  "Give an empty list when it is evidence for none of them. This describes what the document is; " +
+  "it is not a judgement of whether it is good enough, recent enough or meets any rule. Do not count days or compare dates.";
+
+/** (#444) The system prompt of the caseworker read that also places the document under evidence items. */
+const EXTRACTION_SYSTEM_CASEWORKER_ITEMS = `${EXTRACTION_SYSTEM_CASEWORKER}\n${EVIDENCE_ITEMS_RULES}`;
+
+/**
  * The request for stage 2, one document. The label is code-written; the document is attached.
  *
  * (#418) `opts.caseworkerRead` asks the SAME call for the caseworker fields and
@@ -548,13 +653,19 @@ export function buildExtractionRequest(
   opts: ExtractionOptions = {}
 ): LlmRequest {
   const asked = opts.caseworkerRead ? caseworkerReadFields(fields) : [...fields];
+  // (#444) Evidence items only ride on the caseworker read, and only when given.
+  const items = opts.caseworkerRead ? (opts.evidenceItems ?? []) : [];
+  const system = items.length > 0 ? EXTRACTION_SYSTEM_CASEWORKER_ITEMS : opts.caseworkerRead ? EXTRACTION_SYSTEM_CASEWORKER : EXTRACTION_SYSTEM;
   return {
     role: "extraction",
-    system: opts.caseworkerRead ? EXTRACTION_SYSTEM_CASEWORKER : EXTRACTION_SYSTEM,
+    system,
     user:
       `Fields to report: ${asked.join(", ")}.\n` +
+      // (#444) Rubric titles (trusted rubric text, like the judgement call's
+      // rule titles), one per line, by code id.
+      (items.length > 0 ? `Evidence items (id: title):\n${items.map((e) => `${e.code}: ${e.title}`).join("\n")}\n` : "") +
       wrapUntrusted(doc.label, "document_label"),
-    schema: extractionSchema(asked, { documentKind: opts.caseworkerRead === true }),
+    schema: extractionSchema(asked, { documentKind: opts.caseworkerRead === true, evidenceItemCodes: items.map((e) => e.code) }),
     documents: [{ mediaType: doc.mediaType, data: doc.data }],
     maxOutputTokens: 4_000,
     timeoutMs: 120_000,
@@ -564,12 +675,24 @@ export function buildExtractionRequest(
 /** Result of checking one stage 2 answer against the contract. */
 export type ExtractionParse =
   // (#418) `documentKind` only on the caseworker read (null when the answer gave none).
-  | { ok: true; readable: boolean; values: ExtractedValue[]; documentKind?: DocumentKind | null }
+  // (#444) `evidenceItems` (item KEYS) only when the call was asked for them.
+  | { ok: true; readable: boolean; values: ExtractedValue[]; documentKind?: DocumentKind | null; evidenceItems?: string[] }
   | { ok: false; reason: string };
 
 const EXTRACTION_KEYS = new Set(["readable", "values"]);
 /** (#418) The top-level keys of a caseworker-read answer. */
 const EXTRACTION_KEYS_WITH_KIND = new Set(["readable", "documentKind", "values"]);
+/** (#444) The top-level keys of a caseworker-read answer that was also asked for evidence items. */
+const EXTRACTION_KEYS_WITH_ITEMS = new Set(["readable", "documentKind", "values", "evidenceItems"]);
+
+/** (#444) Options of `parseExtraction`. */
+export interface ExtractionParseOptions {
+  // (#418) The answer may carry `documentKind` (the caseworker read).
+  documentKind?: boolean;
+  // (#444) The evidence items the call listed. Non-empty (and with
+  // `documentKind`): the answer may carry `evidenceItems`, ids from this list only.
+  evidenceItems?: readonly EvidenceItemChoice[];
+}
 const VALUE_KEYS = new Set(["field", "value", "unit", "page", "quote"]);
 
 /**
@@ -585,7 +708,7 @@ const VALUE_KEYS = new Set(["field", "value", "unit", "page", "quote"]);
  * schema still marks it required, so a structured-output model always sends
  * it). Without the option, `documentKind` is an unexpected key, as before.
  */
-export function parseExtraction(text: string, fields: readonly string[], opts: { documentKind?: boolean } = {}): ExtractionParse {
+export function parseExtraction(text: string, fields: readonly string[], opts: ExtractionParseOptions = {}): ExtractionParse {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -593,7 +716,9 @@ export function parseExtraction(text: string, fields: readonly string[], opts: {
     return { ok: false, reason: "answer is not JSON" };
   }
   if (!isRecord(parsed)) return { ok: false, reason: "answer is not an object" };
-  const allowedKeys = opts.documentKind ? EXTRACTION_KEYS_WITH_KIND : EXTRACTION_KEYS;
+  // (#444) Evidence items were asked only on the caseworker read, with a list.
+  const items = opts.documentKind ? (opts.evidenceItems ?? []) : [];
+  const allowedKeys = items.length > 0 ? EXTRACTION_KEYS_WITH_ITEMS : opts.documentKind ? EXTRACTION_KEYS_WITH_KIND : EXTRACTION_KEYS;
   for (const key of Object.keys(parsed)) if (!allowedKeys.has(key)) return { ok: false, reason: `unexpected key ${key}` };
   if (typeof parsed.readable !== "boolean") return { ok: false, reason: "readable is not a boolean" };
   if (!Array.isArray(parsed.values)) return { ok: false, reason: "values is not an array" };
@@ -604,6 +729,21 @@ export function parseExtraction(text: string, fields: readonly string[], opts: {
       return { ok: false, reason: "documentKind is not a known kind" };
     }
     documentKind = parsed.documentKind as DocumentKind;
+  }
+  // (#444) The evidence items: absent reads as "evidence for none" (like a
+  // missing kind, it only describes the document); present must be a list of
+  // the LISTED ids. Anything else (not a list, not a string, an id that was
+  // not listed) breaks the contract and fails the extraction. Ids are mapped
+  // back to item keys here, in code, once each, in the order given.
+  const evidenceItems: string[] = [];
+  if (items.length > 0 && parsed.evidenceItems !== undefined) {
+    if (!Array.isArray(parsed.evidenceItems)) return { ok: false, reason: "evidenceItems is not an array" };
+    const byCode = new Map(items.map((e) => [e.code, e.key]));
+    for (const id of parsed.evidenceItems) {
+      const key = typeof id === "string" ? byCode.get(id) : undefined;
+      if (key === undefined) return { ok: false, reason: "evidenceItems holds an id that was not listed" };
+      if (!evidenceItems.includes(key)) evidenceItems.push(key);
+    }
   }
 
   const values: ExtractedValue[] = [];
@@ -626,6 +766,8 @@ export function parseExtraction(text: string, fields: readonly string[], opts: {
     });
   }
   // The kind key is only on the result of a caseworker read, so the other paths' results are unchanged.
+  // (#444) The evidence-items key likewise, only when they were asked for.
+  if (items.length > 0) return { ok: true, readable: parsed.readable, values, documentKind, evidenceItems };
   return opts.documentKind ? { ok: true, readable: parsed.readable, values, documentKind } : { ok: true, readable: parsed.readable, values };
 }
 
@@ -698,6 +840,234 @@ function documentItemTitlesByCriterion(rubric: Partial<Pick<VisaRubric, "evidenc
   return byCriterion;
 }
 
+// ============================================
+// (#444) Date-relative checks: measured by code from the dates read
+// ============================================
+//
+// A rule like "the most recent financial evidence is dated within 31 days of
+// the application" was checked by asking the model for a field no document
+// prints (how many days before the application it is dated). Nothing was
+// read, so every applicant whose uploads were all readable failed it with
+// "We couldn't find this in your documents". Now:
+//   - the model is never asked for that field (`documentFieldsFor`) and never
+//     counts days; it reads the document's own dates as written (#418's
+//     caseworker read) and, on the same call, which evidence items the
+//     document is (`evidenceItemChoicesFor`);
+//   - code picks the documents that count, takes each one's date, and
+//     measures it against the application date (`barDateOf` in the job)
+//     with the per-upload check's own date helpers (#115).
+// Decided from the rulebook's DATA only (the check's shape and its document
+// items): no field name, rule ref or route in this file.
+
+/** (#444) One date-relative check of the rulebook, as code measures it. */
+export interface DateRelativeCheck {
+  criterionId: string;
+  // The checked field (never asked of the model; kept for staff records only).
+  field: string;
+  // How old the most recent counted document may be, from the check itself.
+  maxAge: DeclaredDuration;
+  // The rulebook evidence items that name the rule (their keys and titles,
+  // applicant items first, as `documentItemTitlesByCriterion` orders them).
+  itemKeys: string[];
+  titles: string[];
+}
+
+/**
+ * (#444) The rulebook's date-relative checks, by criterion id. A criterion is
+ * one when:
+ *  - its check has the per-upload check's MAXIMUM-AGE shape (`maxAgeOfCheck`:
+ *    objective, `lte`, a positive number, a duration unit), the same rule
+ *    `expectationsFor` (#115) uses for how old a document may be;
+ *  - its field is not an intake or profile answer (`intake.`, `applicant.`):
+ *    those are answers, not document dates;
+ *  - at least one rulebook evidence item names it (`criterionIds`): only then
+ *    is there a document to measure. An `lte` duration check no item names
+ *    (a length of stay, say) is untouched: still a document field, as before.
+ * No evidence items: none.
+ */
+export function dateRelativeChecksOf(rubric: Pick<VisaRubric, "criteria"> & Partial<Pick<VisaRubric, "evidenceItems">>): Map<string, DateRelativeCheck> {
+  const out = new Map<string, DateRelativeCheck>();
+  const items = [...(rubric.evidenceItems ?? [])].sort((a, b) => Number(b.party === "applicant") - Number(a.party === "applicant"));
+  for (const c of rubric.criteria) {
+    const maxAge = maxAgeOfCheck(c);
+    if (!maxAge || !c.check) continue;
+    const field = c.check.field;
+    if (field.startsWith("intake.") || field.startsWith("applicant.")) continue;
+    const naming = items.filter((item) => (item.criterionIds ?? []).includes(c.criterionId));
+    if (naming.length === 0) continue;
+    out.set(c.criterionId, {
+      criterionId: c.criterionId,
+      field,
+      maxAge,
+      itemKeys: [...new Set(naming.map((i) => i.key))],
+      titles: [...new Set(naming.map((i) => i.title))],
+    });
+  }
+  return out;
+}
+
+/**
+ * (#444) A document's own date: the LATEST of its `datesDocument` values
+ * (statement period end, document date), each parsed with the per-upload
+ * check's `parseDocumentDate`. An ambiguous ("03/04/2026") or unreadable date
+ * is unknown and not used. With `onOrBefore` (the application date), a date
+ * after it is not used either: it is not evidence dated before the
+ * application. Null when no usable date, or the document was not read cleanly
+ * (a suspicious document's dates are never used).
+ */
+export function documentDateOf(d: DocumentExtraction, onOrBefore?: string): string | null {
+  if (!d.readable || d.failed || d.suspicious) return null;
+  let latest: string | null = null;
+  for (const v of d.values) {
+    if (!DOCUMENT_DATE_FIELDS.includes(v.field) || v.value === null || typeof v.value === "boolean") continue;
+    const p = parseDocumentDate(String(v.value));
+    if (!p.ok) continue;
+    if (onOrBefore !== undefined && dayNumber(p.iso) > dayNumber(onOrBefore)) continue;
+    if (latest === null || p.iso > latest) latest = p.iso;
+  }
+  return latest;
+}
+
+/** (#444) Options of `evaluateObjective`: what the date-relative checks are measured with. */
+export interface ObjectiveOptions {
+  // The application date (`barDateOf`: `submittedAt`, else the review date),
+  // YYYY-MM-DD. Absent: nothing can be measured, so every date-relative check
+  // is insufficient (never a fail); the bulk path today passes none.
+  applicationDate?: string;
+  // The checklist slot each upload was made to (`requirementId`), by document
+  // id. `ev-<key>` of a rulebook item decides which check an upload counts
+  // for; anything else (`general`, none) leaves it to the evidence items read.
+  uploadSlots?: Readonly<Record<string, string | undefined>>;
+}
+
+/** (#444) "19 days" / "1 day": a whole-day count in words. */
+function dayCountWords(days: number): string {
+  return `${days} ${days === 1 ? "day" : "days"}`;
+}
+
+/** (#444) How a document date sits before the application date, in words. */
+function datedWords(documentDate: string, applicationDate: string): string {
+  const gap = dayNumber(applicationDate) - dayNumber(documentDate);
+  if (gap === 0) return `is dated ${dateWords(documentDate)}, the same day as the application date`;
+  return `is dated ${dateWords(documentDate)}, ${dayCountWords(gap)} before ${dateWords(applicationDate)}`;
+}
+
+/** (#444) The code-written reason when no usable date was read on the counted documents. */
+export function noDocumentDateReason(title: string): string {
+  return `We couldn't read a date on your ${title}`;
+}
+
+/**
+ * (#444) The code-written reason when the check could not be measured at all
+ * because the caller gave no application date (the bulk path today).
+ */
+export function notMeasuredReason(title: string): string {
+  return `We couldn't check how recent your ${title} is in this review`;
+}
+
+/**
+ * (#444) The code-written reason when no upload counted for the check and
+ * some upload could not be read (or there are no uploads). Names the evidence
+ * item(s) by rulebook title, never the internal field path.
+ */
+export function notReadReason(titles: readonly string[]): string {
+  return `We couldn't read this in your documents: ${titles.join("; ")}`;
+}
+
+/**
+ * (#444) Decide ONE date-relative check in code. Never reads a model value
+ * under the check's field: only dates read on the documents that count.
+ *
+ * Which uploads count (for this check's items K):
+ *  - made to the slot `ev-<key>` of a rulebook item: counts when `key` is in
+ *    K (even with no evidence items read), never when it is another item's
+ *    slot (the passport slot is never the financial evidence, whatever was
+ *    read);
+ *  - made to any other slot (`general`, none): counts when the model read it
+ *    as evidence for an item in K;
+ *  - only a cleanly read upload adds a date.
+ *
+ * Outcome, in order:
+ *  - a usable date (on or before the application date) within the limit:
+ *    pass. The most recent counted document decides;
+ *  - usable dates, all too old: fail, unless an upload that could be this
+ *    evidence (its slot is not another item's) was not read cleanly. Then
+ *    insufficient: the unread one may be newer;
+ *  - counted documents with no usable date: insufficient, "We couldn't read a
+ *    date on your <item>" (never a fail: the date may be there);
+ *  - no application date (bulk): insufficient, "We couldn't check how recent
+ *    your <item> is in this review" (never a fail: nothing was measured);
+ *  - no counted document: the pre-#444 "field missing" rule: fail with "We
+ *    couldn't find this in your documents" when every upload was read
+ *    cleanly, else (an unread upload, or no uploads) insufficient, with the
+ *    item named in plain words (never the field path).
+ */
+function evaluateDateRelative(
+  c: AssessmentCriterion,
+  rule: DateRelativeCheck,
+  docs: readonly DocumentExtraction[],
+  complete: boolean,
+  rubricItemKeys: ReadonlySet<string>,
+  opts: ObjectiveOptions
+): ObjectiveResult {
+  const id = c.criterionId;
+  const keys = new Set(rule.itemKeys);
+  const title = rule.titles[0];
+  const appDate = opts.applicationDate;
+  // The rulebook item an upload's slot names, or null (`general`, none, unknown).
+  const slotItemOf = (d: DocumentExtraction): string | null => {
+    const slot = opts.uploadSlots?.[d.documentId];
+    if (!slot || !slot.startsWith("ev-")) return null;
+    const key = slot.slice(3);
+    return rubricItemKeys.has(key) ? key : null;
+  };
+  const counted: DocumentExtraction[] = [];
+  let unreadCouldCount = false;
+  for (const d of docs) {
+    const slotItem = slotItemOf(d);
+    // Made to another item's slot: never this evidence, read or not.
+    if (slotItem !== null && !keys.has(slotItem)) continue;
+    if (!isCleanlyRead(d)) {
+      unreadCouldCount = true;
+      continue;
+    }
+    // No application date: nothing can be measured, so nothing is counted.
+    if (appDate === undefined) continue;
+    if (slotItem !== null || (d.evidenceItems ?? []).some((k) => keys.has(k))) counted.push(d);
+  }
+
+  if (counted.length > 0 && appDate !== undefined) {
+    // The latest usable date over every counted document.
+    let best: string | null = null;
+    for (const d of counted) {
+      const dt = documentDateOf(d, appDate);
+      if (dt !== null && (best === null || dt > best)) best = dt;
+    }
+    if (best === null) return { criterionId: id, outcome: "insufficient", reason: noDocumentDateReason(title) };
+    const cutoff = shiftByDuration(appDate, rule.maxAge, -1);
+    const subject = `Your most recent ${title} ${datedWords(best, appDate)}.`;
+    // A date ON the cut-off passes (as the per-upload check's maximum age).
+    if (dayNumber(best) >= dayNumber(cutoff)) return { criterionId: id, outcome: "pass", reason: subject };
+    if (unreadCouldCount) {
+      return { criterionId: id, outcome: "insufficient", reason: `${subject} Another upload could not be read, so we couldn't tell whether it is newer.` };
+    }
+    return { criterionId: id, outcome: "fail", reason: `${subject} It must be within ${durationWords(rule.maxAge)}.` };
+  }
+
+  // No application date (the bulk re-assessment path passes none): nothing
+  // could be measured, so the evidence is not known to be missing. Fail safe
+  // with insufficient, never the "We couldn't find this" refusal ground (a
+  // later bulk run would otherwise flip a check the interactive review
+  // passed). The real fix is for bulk to read dates (#445).
+  if (appDate === undefined) return { criterionId: id, outcome: "insufficient", reason: notMeasuredReason(title) };
+
+  // No counted document: the pre-#444 rule for a missing field. The fail
+  // reason is unchanged; the not-read reason now names the evidence item in
+  // plain words instead of the internal field path (applicants see it).
+  if (complete) return { criterionId: id, outcome: "fail", reason: `We couldn't find this in your documents: ${rule.titles.join("; ")}` };
+  return { criterionId: id, outcome: "insufficient", reason: notReadReason(rule.titles) };
+}
+
 /** (#308) The stored reason of a rule that no document item names and no document mentions. */
 export const NOT_CHECKABLE_REASON = "not checked: the guidance names no document that would show this";
 
@@ -736,15 +1106,26 @@ export const NOT_CHECKABLE_REASON = "not checked: the guidance names no document
 export function evaluateObjective(
   rubric: Pick<VisaRubric, "criteria"> & Partial<Pick<VisaRubric, "evidenceItems">>,
   facts: Facts,
-  docs: readonly DocumentExtraction[]
+  docs: readonly DocumentExtraction[],
+  // (#444) The application date and upload slots the date-relative checks
+  // are measured with. Optional: absent, they get the "no counted document"
+  // outcome (see `evaluateDateRelative`), every other check is unchanged.
+  opts: ObjectiveOptions = {}
 ): ObjectiveResult[] {
   const complete = docs.length > 0 && docs.every((d) => d.readable && !d.failed && !d.suspicious);
   // (#308) Which rules the rulebook asks a document for, and that document's title.
   const itemTitles = documentItemTitlesByCriterion(rubric);
+  // (#444) The checks code measures from document dates, and the rulebook's item keys (for upload slots).
+  const dateRelative = dateRelativeChecksOf(rubric);
+  const rubricItemKeys = new Set((rubric.evidenceItems ?? []).map((i) => i.key));
   return rubric.criteria
     .filter((c) => c.kind === "objective" && c.check)
     .map((c) => {
       const check = c.check!;
+      // (#444) A date-relative check: decided from the dates read, never from
+      // a value the model gave under its field (that value is ignored).
+      const rule = dateRelative.get(c.criterionId);
+      if (rule) return evaluateDateRelative(c, rule, docs, complete, rubricItemKeys, opts);
       const got = lookup(check.field, facts, docs);
       if (!got.found) {
         // The field was listed by a document (or given as a fact) with no
@@ -909,6 +1290,11 @@ export interface DocumentListEntry {
   reason: DocumentUnreadReason | null;
   // Read values kept for this upload (0 when not read).
   valueCount: number;
+  // (#444) Staff record only (never in the list text sent to a model): the
+  // evidence item keys the upload was read as ([] when not asked, or not
+  // read), and its own date (`documentDateOf`, ISO; null when none was read).
+  evidenceItems: string[];
+  documentDate: string | null;
 }
 
 /** (#418) A document whose values may be used: read, not failed, not suspicious. */
@@ -970,6 +1356,10 @@ export function documentListOf(documents: readonly DocumentExtraction[], names: 
       read,
       reason: unreadReasonOf(d),
       valueCount: read ? d.values.length : 0,
+      // (#444) The date as read (not limited to the application date: staff
+      // see what the document says; the check itself drops a later date).
+      evidenceItems: read ? [...(d.evidenceItems ?? [])] : [],
+      documentDate: read ? documentDateOf(d) : null,
     };
   });
 }
@@ -988,7 +1378,17 @@ export function documentListText(entries: readonly DocumentListEntry[]): string 
 
 /** (#418) The stored staff-only record of the list: no read values, only counts and reasons. */
 export function documentsReadOf(entries: readonly DocumentListEntry[]): DocumentReadRecord[] {
-  return entries.map((e) => ({ documentId: e.documentId, documentKind: e.kind, readable: e.read, reason: e.reason, valueCount: e.valueCount }));
+  // (#444) Plus the evidence item keys and the document's date: still no read
+  // VALUE (no balance, no name), only what the dated checks were measured on.
+  return entries.map((e) => ({
+    documentId: e.documentId,
+    documentKind: e.kind,
+    readable: e.read,
+    reason: e.reason,
+    valueCount: e.valueCount,
+    evidenceItems: e.evidenceItems,
+    documentDate: e.documentDate,
+  }));
 }
 
 /**
@@ -2514,6 +2914,11 @@ export interface NarrativeFigureFacts {
   // The document fields an objective rubric check reads with a currency unit
   // (`moneyFieldsFor`). Only these take the declared currency.
   moneyFields: readonly string[];
+  // (#444) Reasons CODE wrote (the date-relative checks' "is dated 2 November
+  // 2026, 19 days before 21 November 2026"), so a paragraph repeating their
+  // dates or day counts is grounded. Code-written, never model text, so they
+  // are fair figure sources; they are not quote sources.
+  codeWritten?: readonly string[];
 }
 
 /** The trusted rule text of one finding: rubric wording only. */
@@ -2650,7 +3055,7 @@ export function narrativeGroundingOf(input: NarrativeRequestInput): NarrativeGro
   const figureExtraction = input.figureFacts
     ? labelExtractedValues(input.figureFacts, declaredCurrencyOf(input.intakeSummary))
     : input.extractionSummary;
-  const figureApplicant = [input.profileSummary, labelIntakeAmounts(input.intakeSummary), figureExtraction, input.statementText ?? ""];
+  const figureApplicant = [input.profileSummary, labelIntakeAmounts(input.intakeSummary), figureExtraction, input.statementText ?? "", ...(input.figureFacts?.codeWritten ?? [])];
   const rules: NarrativeRuleRef[] = ruled.map((r) => ({ ref: r.ruleRef ?? null, quote: r.sourceQuote || null }));
   // (#418) The document list is deliberately in NEITHER source list: a name or
   // file name the applicant typed is no proof of a figure, and quoting it is
