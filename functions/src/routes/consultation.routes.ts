@@ -3,6 +3,9 @@ import { consultationController } from "../controllers/consultation.controller";
 import { verifyAuth } from "../middleware/auth";
 import { requireFeature } from "../middleware/authz";
 import { FEATURES } from "@durin-tech/authz";
+// Issue #391: the guest pay-again link routes, and their per-IP brake.
+import { consultationPayLinkController } from "../controllers/consultation-pay-link.controller";
+import { payLinkRateLimit } from "../middleware/public-rate-limit";
 
 const router = Router();
 
@@ -10,6 +13,18 @@ const router = Router();
 // before "/:id" so "public" isn't matched as a consultation id.
 router.post("/public/verify", (req, res) =>
   consultationController.verifyPublicConsultation(req, res)
+);
+
+// Issue #391: PUBLIC — no auth. A guest's one-time pay-again link (emailed
+// after a refund caused by a reschedule): read that ONE booking's summary
+// and today's price, and open a checkout on it. Defined before "/:id" (both
+// are multi-segment "/public/..." paths, so "/:id" could never match them
+// anyway). Rate-limited per IP; the token never signs anyone in.
+router.get("/public/pay-links/:token", payLinkRateLimit, (req, res) =>
+  consultationPayLinkController.getPayLink(req, res)
+);
+router.post("/public/pay-links/:token/checkout", payLinkRateLimit, (req, res) =>
+  consultationPayLinkController.checkout(req, res)
 );
 
 // /stats must come before /:id to avoid "stats" matching as an id

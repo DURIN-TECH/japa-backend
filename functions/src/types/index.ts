@@ -1748,6 +1748,44 @@ export interface ConsultationPaymentException {
 }
 
 /**
+ * Issue #391: a one-time "pay again" link for a GUEST booking
+ * (`bookedVia: "public_page"`) whose payment on a checkout retired by a
+ * reschedule was refunded (`paid_for_rescheduled_slot`, #354). Emailed to
+ * the guest so they can pay for the new time without signing in.
+ *
+ * Collection `consultationPayLinks`, doc id = the hex SHA-256 of the raw
+ * token. The RAW token is never stored, logged or returned by any API: it
+ * exists only in the email. Backend only: firestore.rules denies every
+ * client (see services/consultation-pay-link.service.ts).
+ *
+ * A link is LIVE while `usedAt` and `supersededAt` are null and `expiresAt`
+ * is in the future, AND its booking is still `pending_payment`. Anything
+ * else is dead and every pay-link route answers the same 410.
+ */
+export interface ConsultationPayLink {
+  /** The doc id: hex SHA-256 of the raw token (also kept in `tokenHash`). */
+  id: string;
+  /** Hex SHA-256 of the raw token, compared in constant time on every lookup. */
+  tokenHash: string;
+  /** The ONE booking this link can pay for. */
+  consultationId: string;
+  /** The booking's agency, and its public slug at mint time (the link's path). */
+  agencyId: string;
+  agencySlug: string;
+  /** The Paystack reference of the refunded payment that caused this link. */
+  exceptionId: string;
+  createdAt: Timestamp;
+  /** The earlier of 72 h after minting and the booking's slot start. */
+  expiresAt: Timestamp;
+  /** Set (in the same transaction) when a payment confirmed the booking. */
+  usedAt: Timestamp | null;
+  /** The Paystack reference of the payment that used it up. */
+  usedByReference?: string;
+  /** Set when a newer link for the same booking was minted (at most one live link). */
+  supersededAt: Timestamp | null;
+}
+
+/**
  * Money we hold for a payment request that cannot be applied to it (issue
  * #181, same rules as ConsultationPaymentException): an exact payment on a
  * superseded checkout of a request that was already paid (a second charge),

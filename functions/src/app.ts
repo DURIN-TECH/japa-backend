@@ -80,6 +80,9 @@ import { adminRiskSignalRoutes } from "./routes/risk-signal.routes";
 // Issue #236: entry requirements ("do you need a visa at all") and their admin review data.
 import { entryRequirementsRoutes, adminEntryRuleRoutes } from "./entry-requirements";
 
+// Issue #391: keeps pay-link tokens out of the request log.
+import { redactPayLinkPath } from "./services/consultation-pay-link.service";
+
 // Create Express app
 const app = express();
 
@@ -95,9 +98,10 @@ app.use("/webhooks", webhooksRouter);
 app.use("/webhooks", verificationWebhookRoutes);
 app.use(express.json());
 
-// Request logging
+// Request logging. Issue #391: a guest pay-link token in the path is
+// replaced by "[token]", so a raw token never reaches the logs.
 app.use((req: Request, res: Response, next: NextFunction) => {
-  console.log(`${req.method} ${req.path}`);
+  console.log(`${req.method} ${redactPayLinkPath(req.path)}`);
   next();
 });
 

@@ -130,6 +130,9 @@ import type {
   ConsultationPaymentException,
   // Issue #382: a client's "the meeting didn't happen" report.
   NoShowReport,
+  // Issue #391: the channels of a refund notice (email left out when the
+  // guest's pay-link email already went).
+  NotificationChannel,
   // Issue #390: who carries Paystack's fee, and why a refund is held.
   PaystackFeeBorneBy,
   RefundFundedFrom,
@@ -3215,6 +3218,13 @@ class ConsultationRefundService {
       guestBooking?: boolean;
       /** Issue #411: the sweep cancelled the booking right after this refund (no "pay again"). */
       bookingCancelled?: boolean;
+      /**
+       * Issue #391: the guest was just emailed a pay-again link (which says
+       * the refund is on its way), so this notice skips its own email and
+       * the guest gets one email, the one with the link. In-app and push
+       * are unchanged (and never carry the link).
+       */
+      skipEmail?: boolean;
     } = {}
   ): Promise<void> {
     const currency = row.currency as Money["currency"];
@@ -3237,6 +3247,8 @@ class ConsultationRefundService {
         body,
         relatedEntityType: "consultation",
         relatedEntityId: exception.consultationId,
+        // Issue #391: no second email when the pay-link email went out.
+        ...(opts.skipEmail ? { channels: ["in_app", "push"] as NotificationChannel[] } : {}),
       })
       .catch((e) => console.error("[refund] unapplied-payment notify failed:", e));
   }
