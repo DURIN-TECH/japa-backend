@@ -1,4 +1,4 @@
-import type { DocumentExtraction } from "./assessment-engine";
+import type { DocumentExtraction, EvidenceItemChoice } from "./assessment-engine";
 import {
   buildExtractionRequest,
   capReadValues,
@@ -77,6 +77,13 @@ export interface ExtractOneInput {
    * before #418.
    */
   caseworkerRead?: boolean;
+  /**
+   * (#444) With `caseworkerRead` only: the rulebook evidence items the SAME
+   * call also places the document under (`evidenceItemChoicesFor`; ids E1...,
+   * mapped back to keys in code). Empty or absent: not asked (the #418
+   * request). Ignored without `caseworkerRead`.
+   */
+  evidenceItems?: readonly EvidenceItemChoice[];
   /** Page cap for a PDF. Absent means no cap (the assessment's behaviour). */
   maxPages?: number;
   /** Per-request wall-clock budget. Absent keeps the request builder's default. */
@@ -143,7 +150,9 @@ export async function extractOneDocument(input: ExtractOneInput): Promise<Extrac
 
   // ---- 3. the request: the SAME builder the assessment uses ----
   const caseworker = input.caseworkerRead === true;
-  const request = buildExtractionRequest({ label: input.label, mediaType, data: input.bytes.toString("base64") }, input.fields, { caseworkerRead: caseworker });
+  // (#444) Evidence items ride only on the caseworker read.
+  const evidenceItems = caseworker ? (input.evidenceItems ?? []) : [];
+  const request = buildExtractionRequest({ label: input.label, mediaType, data: input.bytes.toString("base64") }, input.fields, { caseworkerRead: caseworker, evidenceItems });
   // (#418) The fields the answer may carry: the requested ones, plus the caseworker fields on that read.
   const answerFields = caseworker ? caseworkerReadFields(input.fields) : input.fields;
   if (input.timeoutMs !== undefined) request.timeoutMs = input.timeoutMs;
@@ -156,7 +165,7 @@ export async function extractOneDocument(input: ExtractOneInput): Promise<Extrac
     if (res.stopReason === "refusal") {
       return done(failedExtraction(base, "the model declined to read the file", mediaType), "model_refused", res.usage, true, res.model);
     }
-    const parsed = parseExtraction(res.text, answerFields, { documentKind: caseworker });
+    const parsed = parseExtraction(res.text, answerFields, { documentKind: caseworker, evidenceItems });
     if (!parsed.ok) {
       return done(failedExtraction(base, `the answer broke the contract: ${parsed.reason}`, mediaType), "bad_answer", res.usage, true, res.model);
     }
@@ -168,7 +177,18 @@ export async function extractOneDocument(input: ExtractOneInput): Promise<Extrac
     // The other paths keep every value and get no `documentKind` key.
     const values = caseworker ? capReadValues(parsed.values, input.fields) : parsed.values;
     return done(
-      { ...base, mediaType, readable: parsed.readable, values, failed: false, failure: null, suspicious, ...(caseworker ? { documentKind: parsed.documentKind ?? null } : {}) },
+      {
+        ...base,
+        mediaType,
+        readable: parsed.readable,
+        values,
+        failed: false,
+        failure: null,
+        suspicious,
+        ...(caseworker ? { documentKind: parsed.documentKind ?? null } : {}),
+        // (#444) The item keys, only when the call was asked for them.
+        ...(evidenceItems.length > 0 ? { evidenceItems: parsed.evidenceItems ?? [] } : {}),
+      },
       null,
       res.usage,
       true,

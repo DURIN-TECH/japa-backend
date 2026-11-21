@@ -111,8 +111,12 @@ export function findBannedWording(text: string): boolean {
  * prompts, and their new rules. The per-upload document check (#115) sends
  * an unchanged request, so it records its own DOCUMENT_CHECK_PROMPT_VERSION
  * below (fix round 1), not this one.
+ * (#444) Bumped for the date-relative checks: the review's extraction call
+ * no longer asks for a date-relative check's field, and (on a rulebook with
+ * such a check) also asks which evidence items each document is. The
+ * per-upload check and the bulk path keep their own versions below.
  */
-export const ASSESSMENT_PROMPT_VERSION = "assessment-2026-11-21.1";
+export const ASSESSMENT_PROMPT_VERSION = "assessment-2026-11-21.2";
 
 /**
  * (#418 fix round 1) Version of the prompt the per-upload document check

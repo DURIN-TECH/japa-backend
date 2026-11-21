@@ -50,6 +50,9 @@ import {
   CASEWORKER_MONEY_FIELDS,
   documentListOf,
   documentsReadOf,
+  // (#444) Date-relative checks: the evidence items the extraction is asked about, and which checks are dated.
+  dateRelativeChecksOf,
+  evidenceItemChoicesFor,
   READ_DOCUMENT_SAID_MISSING_CHECK,
   type NarrativeRequestInput,
   type AssessmentContent,
@@ -239,7 +242,9 @@ export interface LoadedInputs {
   // what the APPLICANT recognises the upload by (display name, document type or
   // file name) and `requirementId` the checklist item it was uploaded to: both
   // are used only to title a "we couldn't read this upload" item, never sent
-  // to a model and not part of the input hash.
+  // to a model and not part of the input hash. (#444) `requirementId` also
+  // decides which date-relative check an upload counts for (its `ev-<key>`
+  // slot); still never sent to a model.
   documents: Array<{ id: string; path: string; updatedAtMs: number; sizeMb: number; label: string; name?: string; requirementId?: string }>;
   // `blocks` is one plain-text string per TOP-LEVEL ProseMirror block, in
   // document order (index = the block's index in `content`); `contentHash`
@@ -1038,7 +1043,12 @@ export class AiCaseOfficerService {
     await this.claimDailyCap(settings);
 
     // ---- stage 2: extraction, one call per document ----
+    // (#444) `rubric` carries the evidence items, so a date-relative check's
+    // field is left out (code measures it from the dates read).
     const fields = documentFieldsFor(rubric);
+    // (#444) When a date-relative check applies, the SAME extraction call also
+    // says which rulebook evidence items each document is (no extra call).
+    const evidenceItems = evidenceItemChoicesFor(rubric);
     const extractions: DocumentExtraction[] = [];
     const suspiciousContent: ApplicationAssessment["suspiciousContent"] = [];
     let extractUsage = zeroUsage();
@@ -1093,6 +1103,8 @@ export class AiCaseOfficerService {
         // (#418) Opt in to the caseworker read (general fields + document kind)
         // in the SAME call. The per-upload check (#115) does not opt in.
         caseworkerRead: true,
+        // (#444) Empty unless the rulebook has a date-relative check.
+        evidenceItems,
         beforeCall: (request) => {
           requests++;
           // (#310) TEXT only. The attached file's base64 data is not counted
@@ -1126,7 +1138,17 @@ export class AiCaseOfficerService {
     // (`{ ...fullRubric, criteria }` above), so it carries the rulebook's
     // `evidenceItems`: a missing field fails a rule only when one of those
     // document items names the rule; otherwise it is "not in documents".
-    const objective = evaluateObjective(rubric, facts, extractions);
+    // (#444) A date-relative check (e.g. "the most recent evidence dated
+    // within N days of the application") is measured by code from the dates
+    // read on the uploads that count, against the application date
+    // (`barDate`: `submittedAt`, else today) and the slot each upload was
+    // made to. The model never counts the days.
+    const uploadSlots = Object.fromEntries(loaded.documents.map((d) => [d.id, d.requirementId]));
+    const objective = evaluateObjective(rubric, facts, extractions, { applicationDate: barDate, uploadSlots });
+    // (#444) The code-written reasons of those checks: figure sources for the
+    // narrative, so it may repeat "19 days before" without being dropped.
+    const datedChecks = dateRelativeChecksOf(rubric);
+    const datedReasons = objective.filter((r) => datedChecks.has(r.criterionId)).map((r) => r.reason);
 
     // ---- stage 3: judgement, in as many calls as the rules need (#207) ----
     // The judgement rules that apply to this applicant are split by decision
@@ -1258,7 +1280,12 @@ export class AiCaseOfficerService {
         // money fields come from the rubric the documents were read for,
         // (#418) plus the caseworker money fields (a unitless closing balance
         // on a naira application then reads as NGN).
-        figureFacts: { values: summarisedValues, moneyFields: [...new Set([...moneyFieldsFor(rubric), ...CASEWORKER_MONEY_FIELDS])] },
+        figureFacts: {
+          values: summarisedValues,
+          moneyFields: [...new Set([...moneyFieldsFor(rubric), ...CASEWORKER_MONEY_FIELDS])],
+          // (#444) Code-written dates and day counts of the dated checks.
+          codeWritten: datedReasons,
+        },
       },
     });
     // A narrative string that addressed a model is stored as suspicious content (never shown).
@@ -1276,7 +1303,9 @@ export class AiCaseOfficerService {
       },
       suspiciousContent,
       // (#418) `documentsRead`: the staff-only record of the list (no read values).
-      { narrative: narrativeRun.narrative, documentsRead: documentsReadOf(documentList) }
+      // (#444) `measuredOn`: the application date the dated checks were
+      // measured against (staff only, like `documentsRead`).
+      { narrative: narrativeRun.narrative, documentsRead: documentsReadOf(documentList), measuredOn: barDate }
     );
   }
 

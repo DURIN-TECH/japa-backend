@@ -226,7 +226,11 @@ export function serializeFull(assessment: ApplicationAssessment, role: string | 
   // only. Removed for every other caller, a client or a missing role alike
   // (fail closed). The free and reading bodies are whitelists, so it never
   // reaches them in the first place.
-  if (!role || !STAFF_ROLES.includes(role)) delete visible.documentsRead;
+  // (#444) `measuredOn` (the date the dated checks were measured against) likewise.
+  if (!role || !STAFF_ROLES.includes(role)) {
+    delete visible.documentsRead;
+    delete visible.measuredOn;
+  }
   // A client-role caller never sees the verdict call, nor (issue #37) what the
   // rule change was or that an agent was asked to review: the applicant sees
   // the update only as the normal stale / updated state.
