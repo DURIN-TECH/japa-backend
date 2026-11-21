@@ -631,7 +631,9 @@ const EXTRACTION_SYSTEM_CASEWORKER = `${EXTRACTION_SYSTEM}\n${CASEWORKER_READ_RU
  */
 const EVIDENCE_ITEMS_RULES =
   "Also set evidenceItems to the ids of the listed evidence items this document is evidence for, read from its content " +
-  "(not from its label). Give an empty list when it is evidence for none of them. This describes what the document is; " +
+  "(not from its label). A document can be evidence for several of the listed items: list every item it supports, not only " +
+  "the closest one (for example, a bank statement can be both financial evidence and bank statements). " +
+  "Give an empty list when it is evidence for none of them. This describes what the document is; " +
   "it is not a judgement of whether it is good enough, recent enough or meets any rule. Do not count days or compare dates.";
 
 /** (#444) The system prompt of the caseworker read that also places the document under evidence items. */
@@ -929,9 +931,8 @@ export function documentDateOf(d: DocumentExtraction, onOrBefore?: string): stri
 /** (#444) Options of `evaluateObjective`: what the date-relative checks are measured with. */
 export interface ObjectiveOptions {
   // The application date (`barDateOf`: `submittedAt`, else the review date),
-  // YYYY-MM-DD. Absent: no document is counted for a date-relative check (a
-  // caller with no date, such as the bulk path today, gets the "no counted
-  // document" outcome, which is the pre-#444 one).
+  // YYYY-MM-DD. Absent: nothing can be measured, so every date-relative check
+  // is insufficient (never a fail); the bulk path today passes none.
   applicationDate?: string;
   // The checklist slot each upload was made to (`requirementId`), by document
   // id. `ev-<key>` of a rulebook item decides which check an upload counts
@@ -957,6 +958,23 @@ export function noDocumentDateReason(title: string): string {
 }
 
 /**
+ * (#444) The code-written reason when the check could not be measured at all
+ * because the caller gave no application date (the bulk path today).
+ */
+export function notMeasuredReason(title: string): string {
+  return `We couldn't check how recent your ${title} is in this review`;
+}
+
+/**
+ * (#444) The code-written reason when no upload counted for the check and
+ * some upload could not be read (or there are no uploads). Names the evidence
+ * item(s) by rulebook title, never the internal field path.
+ */
+export function notReadReason(titles: readonly string[]): string {
+  return `We couldn't read this in your documents: ${titles.join("; ")}`;
+}
+
+/**
  * (#444) Decide ONE date-relative check in code. Never reads a model value
  * under the check's field: only dates read on the documents that count.
  *
@@ -977,9 +995,12 @@ export function noDocumentDateReason(title: string): string {
  *    insufficient: the unread one may be newer;
  *  - counted documents with no usable date: insufficient, "We couldn't read a
  *    date on your <item>" (never a fail: the date may be there);
- *  - no counted document: exactly the pre-#444 "field missing" rule: fail
- *    with "We couldn't find this in your documents" when every upload was read
- *    cleanly, else (an unread upload, or no uploads) insufficient.
+ *  - no application date (bulk): insufficient, "We couldn't check how recent
+ *    your <item> is in this review" (never a fail: nothing was measured);
+ *  - no counted document: the pre-#444 "field missing" rule: fail with "We
+ *    couldn't find this in your documents" when every upload was read
+ *    cleanly, else (an unread upload, or no uploads) insufficient, with the
+ *    item named in plain words (never the field path).
  */
 function evaluateDateRelative(
   c: AssessmentCriterion,
@@ -1033,9 +1054,18 @@ function evaluateDateRelative(
     return { criterionId: id, outcome: "fail", reason: `${subject} It must be within ${durationWords(rule.maxAge)}.` };
   }
 
-  // No counted document: the pre-#444 rule for a missing field, unchanged.
+  // No application date (the bulk re-assessment path passes none): nothing
+  // could be measured, so the evidence is not known to be missing. Fail safe
+  // with insufficient, never the "We couldn't find this" refusal ground (a
+  // later bulk run would otherwise flip a check the interactive review
+  // passed). The real fix is for bulk to read dates (#445).
+  if (appDate === undefined) return { criterionId: id, outcome: "insufficient", reason: notMeasuredReason(title) };
+
+  // No counted document: the pre-#444 rule for a missing field. The fail
+  // reason is unchanged; the not-read reason now names the evidence item in
+  // plain words instead of the internal field path (applicants see it).
   if (complete) return { criterionId: id, outcome: "fail", reason: `We couldn't find this in your documents: ${rule.titles.join("; ")}` };
-  return { criterionId: id, outcome: "insufficient", reason: `${rule.field} could not be read` };
+  return { criterionId: id, outcome: "insufficient", reason: notReadReason(rule.titles) };
 }
 
 /** (#308) The stored reason of a rule that no document item names and no document mentions. */

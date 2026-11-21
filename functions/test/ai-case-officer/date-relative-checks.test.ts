@@ -214,6 +214,11 @@ describe("#444 which document an upload is evidence for (the evidence-items read
     assert.ok((req.schema as any).required.includes("evidenceItems"));
     assert.ok(req.system.includes("evidenceItems"));
     assert.ok(/Do not count days/.test(req.system));
+    // (#444 hardening) A document can be evidence for several items: the
+    // model is told to list every item it supports, with the bank-statement
+    // example (a statement is both financial evidence and bank statements).
+    assert.match(req.system, /A document can be evidence for several of the listed items: list every item it supports/);
+    assert.match(req.system, /a bank statement can be both financial evidence and bank statements/);
   });
 
   test("the parser accepts only listed ids, maps them back to item keys in code, and fails on an unknown id", () => {
@@ -403,19 +408,68 @@ describe("#444 missing or unparseable dates are unknown, never a fail", () => {
     assert.deepEqual([r.outcome, r.reason], ["fail", `We couldn't find this in your documents: ${FIN_TITLE}`]);
   });
 
-  test("no counted document and some upload could not be read: insufficient, as today", () => {
+  // (#444 hardening) The not-read reason names the evidence item in plain
+  // words; it used to be `<field path> could not be read`, which the
+  // applicant sees through the working.
+  test("no counted document and some upload could not be read: insufficient, the item named in plain words", () => {
     const r = fin([ext("d1", [], { documentKind: "passport", evidenceItems: [] }), ext("d2", [], { readable: false })]);
-    assert.deepEqual([r.outcome, r.reason], ["insufficient", `${FIN_FIELD} could not be read`]);
+    assert.deepEqual([r.outcome, r.reason], ["insufficient", `We couldn't read this in your documents: ${FIN_TITLE}`]);
   });
 
-  test("no uploads at all: the same outcome as today", () => {
+  test("no uploads at all: insufficient, as today, with the same plain reason", () => {
     const r = fin([]);
-    assert.deepEqual([r.outcome, r.reason], ["insufficient", `${FIN_FIELD} could not be read`]);
+    assert.deepEqual([r.outcome, r.reason], ["insufficient", `We couldn't read this in your documents: ${FIN_TITLE}`]);
   });
 
-  test("no application date (the bulk path today): no document is counted, so the 'no counted document' rules apply", () => {
-    assert.equal(fin([statement("d1", "2026-11-02")], {}).outcome, "fail");
-    assert.equal(fin([statement("d1", "2026-11-02"), ext("d2", [], { readable: false })], {}).outcome, "insufficient");
+  // (#444 hardening) The bulk path passes no application date. Nothing can be
+  // measured then, so the check fails SAFE: insufficient, never the "We
+  // couldn't find this in your documents" refusal ground.
+  test("no application date (the bulk path today): insufficient with a plain reason, never a fail", () => {
+    const expected = ["insufficient", `We couldn't check how recent your ${FIN_TITLE} is in this review`];
+    const cases: DocumentExtraction[][] = [
+      [statement("d1", "2026-11-02")], // read cleanly, would pass interactively
+      [statement("d1", "2026-08-01")], // read cleanly, would fail interactively
+      [ext("d1", [{ field: "documentDate", value: "2026-11-01" }], { documentKind: "passport", evidenceItems: ["passport"] })], // no counted doc, all read
+      [statement("d1", "2026-11-02"), ext("d2", [], { readable: false })],
+      [],
+    ];
+    for (const docs of cases) {
+      const r = fin(docs, {});
+      assert.deepEqual([r.outcome, r.reason], expected, JSON.stringify(docs.map((d) => d.documentId)));
+    }
+  });
+
+  test("with an application date the interactive outcomes are unchanged (pass, fail, couldn't find)", () => {
+    assert.equal(fin([statement("d1", "2026-11-02")]).outcome, "pass");
+    assert.equal(fin([statement("d1", "2026-08-01")]).outcome, "fail");
+    const passport = ext("d1", [{ field: "documentDate", value: "2026-11-01" }], { documentKind: "passport", evidenceItems: ["passport"] });
+    assert.deepEqual([fin([passport]).outcome, fin([passport]).reason], ["fail", `We couldn't find this in your documents: ${FIN_TITLE}`]);
+  });
+
+  // (#444 hardening) Applicant-visible reasons are code-written plain words:
+  // no internal dotted field path (such as `financialEvidence.mostRecent...`)
+  // on any path of the dated check.
+  test("no reason of the dated check contains a dotted field path", () => {
+    const dotted = /\b[a-z][A-Za-z0-9]*\.[a-z][A-Za-z0-9]*\b/;
+    const unread = ext("d2", [], { readable: false });
+    const passport = ext("d3", [{ field: "documentDate", value: "2026-11-01" }], { documentKind: "passport", evidenceItems: ["passport"] });
+    const sets: Array<[DocumentExtraction[], ObjectiveOptions | undefined]> = [
+      [[statement("d1", "2026-11-02")], undefined],
+      [[statement("d1", "2026-08-01")], undefined],
+      [[statement("d1", "2026-08-01"), unread], undefined],
+      [[statement("d1", null)], undefined],
+      [[statement("d1", "03/04/2026")], undefined],
+      [[passport], undefined],
+      [[passport, unread], undefined],
+      [[], undefined],
+      [[statement("d1", "2026-11-02")], {}],
+      [[], {}],
+    ];
+    for (const [docs, opts] of sets) {
+      const r = opts === undefined ? fin(docs) : fin(docs, opts);
+      assert.ok(!dotted.test(r.reason), r.reason);
+      assert.ok(!r.reason.includes(FIN_FIELD), r.reason);
+    }
   });
 });
 
