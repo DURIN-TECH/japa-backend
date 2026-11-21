@@ -717,16 +717,16 @@ export type SettleOutcome =
    * Recorded in consultationPaymentExceptions and refunded (issue #354); no
    * fee Transaction.
    */
-  | { kind: "refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice }
+  | { kind: "refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice; guestLinkEmailed?: boolean }
   /** The booking is no longer awaiting payment (cancelled...): recorded and refunded (#354); no fee Transaction. */
-  | { kind: "not_payable_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice }
+  | { kind: "not_payable_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice; guestLinkEmailed?: boolean }
   /**
    * Issue #354: paid on a checkout RETIRED when the booking was rescheduled
    * after its quote lock (`retiredBy: "reschedule"`). The booking is NOT
    * confirmed and stays `pending_payment`; the payment is recorded and
    * refunded in full. The client pays again for the new time.
    */
-  | { kind: "rescheduled_refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice }
+  | { kind: "rescheduled_refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice; guestLinkEmailed?: boolean }
   /** Paystack's amount or currency differs from what that checkout asked: nothing written. */
   | { kind: "mismatch" }
   /** Nothing chargeable stored for that checkout: nothing written. */
@@ -1057,20 +1057,27 @@ export async function settlePayment(
   if (fresh?.refund && outcome && "refund" in outcome) {
     if (options.deferRefundNotice) {
       const sent = await sendUnappliedRefund(fresh, { firstRecorded: wrote?.firstRecorded ?? false });
-      return { ...outcome, refund: sent.row, deferredNotice: { written: fresh, row: sent.row, linkEmailed: sent.linkEmailed } };
+      return {
+        ...outcome,
+        refund: sent.row,
+        guestLinkEmailed: sent.linkEmailed,
+        deferredNotice: { written: fresh, row: sent.row, linkEmailed: sent.linkEmailed },
+      };
     }
-    const sent = await startUnappliedRefund(fresh, { firstRecorded: wrote?.firstRecorded ?? false });
-    return { ...outcome, refund: sent };
+    const sent = await sendUnappliedRefund(fresh, { firstRecorded: wrote?.firstRecorded ?? false });
+    await notifyUnappliedRefundWrite(fresh, sent.row, { linkEmailed: sent.linkEmailed });
+    return { ...outcome, refund: sent.row, guestLinkEmailed: sent.linkEmailed };
   }
   // Issue #391 (decision 2026-11-17): a refund HELD for an admin (Paystack's
   // fee unknown) still gets the guest their pay-again link, as soon as the
   // late payment is recorded. Only on the call that first recorded it, so a
   // webhook retry of a held exception sends nothing again.
   if (wrote?.firstRecorded && !wrote.written.refund) {
-    await sendGuestPayAgainLink(wrote.written.exception, {
+    const linkEmailed = await sendGuestPayAgainLink(wrote.written.exception, {
       bookingAwaitingPayment: wrote.written.bookingAwaitingPayment,
       firstRecorded: true,
     });
+    if (outcome && "refund" in outcome) return { ...outcome, guestLinkEmailed: linkEmailed };
   }
   return outcome;
 }
@@ -1126,11 +1133,15 @@ async function notifyUnappliedRefundWrite(
   opts: { bookingCancelled?: boolean; linkEmailed?: boolean } = {}
 ): Promise<void> {
   const { consultationRefundService } = await import("./consultation-refund.service");
+  // Review round 1 of #391: the guest copy ("We've emailed you a link")
+  // only when the link email was really sent; a guest without one gets the
+  // refund sentence alone (a guest has no app to "pay again" in).
+  const guestWithoutLink = written.guestBooking && !opts.linkEmailed;
   await consultationRefundService.notifyUnappliedRefund(row, written.exception, {
-    bookingAwaitingPayment: opts.bookingCancelled ? false : written.bookingAwaitingPayment,
-    guestBooking: written.guestBooking,
+    bookingAwaitingPayment: opts.bookingCancelled || guestWithoutLink ? false : written.bookingAwaitingPayment,
+    guestBooking: written.guestBooking && !!opts.linkEmailed,
     ...(opts.bookingCancelled ? { bookingCancelled: true } : {}),
-    // Issue #391: no second email when the pay-link email went out.
+    // Issue #391: no second email only when the pay-link email was SENT.
     ...(opts.linkEmailed ? { skipEmail: true } : {}),
   });
   if (written.debit) await consultationRefundService.notifyFeeDebit(written.debit);

@@ -147,6 +147,19 @@ type PendingCheckoutShape = "checkout" | "create";
 /** The 400 message for a `scheduledTime` that is neither accepted form (same wording as the edit route, #316). */
 const BAD_SCHEDULED_TIME = "scheduledTime must be a 24-hour HH:mm or a 12-hour h:mm AM/PM time";
 
+/**
+ * Review round 1 of #391: the options of `rescheduledRefundMessage` for the
+ * verify 409 of a payment on a retired checkout. Pure.
+ */
+function guestRescheduledCopy(
+  booking: Pick<Consultation, "bookedVia" | "payLinkExpiresAt">,
+  emailedNow: boolean
+): { guestBooking?: boolean; bookingAwaitingPayment?: boolean } {
+  if (booking.bookedVia !== "public_page") return {};
+  const liveLink = !!booking.payLinkExpiresAt && booking.payLinkExpiresAt.toMillis() > chargeRuntime.now().getTime();
+  return emailedNow || liveLink ? { guestBooking: true } : { bookingAwaitingPayment: false };
+}
+
 export class ConsultationController {
   /**
    * GET /consultations?role=agent|owner|admin|client&status=...&type=...&startDate=...&endDate=...
@@ -2725,7 +2738,11 @@ export class ConsultationController {
         error: "CONSULTATION_RESCHEDULED",
         // Issue #413 (C): shared copy ("we're refunding ... on its way"),
         // with the guest variant for a public-page booking (emailed pay link).
-        message: rescheduledRefundMessage({ guestBooking: outcome.consultation.bookedVia === "public_page" }),
+        // Review round 1 of #391: the guest variant ("We've emailed you a
+        // link") only when a link really went out: in this call, or earlier
+        // (the booking still has a live one, `payLinkExpiresAt`). A guest
+        // with neither gets the refund sentence alone.
+        message: rescheduledRefundMessage(guestRescheduledCopy(outcome.consultation, outcome.guestLinkEmailed === true)),
         data: { refundPending: true, consultation: bookingSummary(outcome.consultation) },
       });
       return;

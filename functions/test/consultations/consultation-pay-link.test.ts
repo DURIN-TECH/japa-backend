@@ -62,6 +62,7 @@ import {
   payLinkExpiry,
   payLinkRuntime,
   PayLinkEmail,
+  slotStillAhead,
 } from "../../src/services/consultation-pay-link.service";
 import { createPublicRateLimit } from "../../src/middleware/public-rate-limit";
 import { EMAIL_BRANDING } from "../../src/services/email/branding";
@@ -98,6 +99,7 @@ beforeEach(async () => {
   logs.length = 0;
   payLinkRuntime.sendEmail = async (m) => {
     emails.push(m);
+    return "sent";
   };
   const capture = (...args: unknown[]) => {
     logs.push(args.map(String).join(" "));
@@ -177,8 +179,12 @@ async function lateGuestPayment(opts: { id?: string; fees?: number | undefined; 
   const out = await verify(reference);
   assert.equal(out.status, 409, JSON.stringify(out.body));
   assert.equal(out.body.error, "CONSULTATION_RESCHEDULED");
+  lastVerifyMessage = out.body.message;
   return reference;
 }
+
+/** The verify 409 message of the last `lateGuestPayment` (review round 1). */
+let lastVerifyMessage = "";
 
 /** The raw token of the last pay-again email (from its URL fragment `#t=`). */
 function lastToken(): string {
@@ -451,7 +457,7 @@ describe("expiry and replacement", () => {
 // GET: the booking summary
 // ============================================
 
-describe("GET /consultations/public/pay-links/:token", () => {
+describe("POST /consultations/public/pay-links/lookup", () => {
   test("answers that booking only, priced now in the charge currency, and writes nothing", async () => {
     await lateGuestPayment();
     setRate("NGN", 1600); // the rate moved since the first checkout
@@ -509,7 +515,7 @@ describe("GET /consultations/public/pay-links/:token", () => {
 // POST checkout
 // ============================================
 
-describe("POST /consultations/public/pay-links/:token/checkout", () => {
+describe("POST /consultations/public/pay-links/checkout", () => {
   test("opens a checkout on that booking at today's rate with a new lock, returning to the agency's confirm page", async () => {
     const oldRef = await lateGuestPayment();
     setRate("NGN", 1600);
@@ -851,5 +857,63 @@ describe("protections", () => {
     handler.handle(err, {}, res, () => undefined);
     assert.ok(logs.length > 0);
     assert.ok(!logs.join("\n").includes(token));
+  });
+});
+
+// ============================================
+// Review round 1 (#391): only a SENT email counts, a started slot kills the
+// link, the shared copy lives in its own module
+// ============================================
+
+describe("review round 1: email status, guest copy, slot start", () => {
+  for (const status of ["failed", "skipped"] as const) {
+    test(`a pay-again email that was ${status}: the refund notice keeps its email and never claims a link was emailed`, async () => {
+      payLinkRuntime.sendEmail = async (m) => {
+        emails.push(m);
+        return status;
+      };
+      await lateGuestPayment();
+      assert.equal(links().length, 1, "the link was minted");
+      const notice = notified.find((n) => n.userId === client.uid && n.type === "consultation_refunded")!;
+      assert.ok(notice, "the guest still hears about the refund");
+      assert.equal(notice.channels, undefined, "email included (the policy's channels)");
+      assert.equal(notice.body, rescheduledRefundMessage({ bookingAwaitingPayment: false }));
+      assert.ok(!/emailed you a link/.test(notice.body));
+      assert.ok(!/pay again/i.test(notice.body), "a guest has no app to pay again in");
+      assert.equal(lastVerifyMessage, notice.body, "the verify 409 says the same");
+    });
+  }
+
+  test("a SENT email: the guest copy, in-app and push only (as before)", async () => {
+    await lateGuestPayment();
+    const notice = notified.find((n) => n.userId === client.uid && n.type === "consultation_refunded")!;
+    assert.deepEqual(notice.channels, ["in_app", "push"]);
+    assert.equal(notice.body, rescheduledRefundMessage({ guestBooking: true }));
+    assert.equal(lastVerifyMessage, notice.body, "the verify 409 says the same");
+  });
+
+  test("the link answers 410 once the slot has started, also after the booking was moved EARLIER than the link's expiry", async () => {
+    await lateGuestPayment();
+    const token = lastToken();
+    assert.equal((await getLink(token)).status, 200);
+    // The agent side moves the booking to a slot that has started by now.
+    const booking = docsIn("consultations").find(([id]) => id === "c1")![1];
+    const now = harness.clock.now();
+    booking.scheduledDate = Timestamp.fromDate(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())));
+    booking.scheduledTime = "00:00";
+    assert.ok(links()[0][1].expiresAt.toMillis() > now.getTime(), "the link itself has not expired");
+    for (const call of [getLink, payLinkCheckout]) {
+      const before = writes.length;
+      const out = await call(token);
+      assert.equal(out.status, 410);
+      assert.equal(writes.length, before, "nothing written");
+    }
+  });
+
+  test("slotStillAhead: ahead, started, unreadable", () => {
+    const at = new Date("2026-11-20T10:00:00Z");
+    assert.equal(slotStillAhead({ scheduledDate: Timestamp.fromDate(new Date("2026-11-21")), scheduledTime: "10:00", timezone: "Africa/Lagos" } as any, at), true);
+    assert.equal(slotStillAhead({ scheduledDate: Timestamp.fromDate(new Date("2026-11-20")), scheduledTime: "08:00", timezone: "Africa/Lagos" } as any, at), false);
+    assert.equal(slotStillAhead({ scheduledDate: "nope", scheduledTime: "nope" } as any, at), false);
   });
 });

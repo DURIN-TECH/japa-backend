@@ -167,6 +167,8 @@ import { formatWithCode } from "../money/money";
 // Review round 1 of #413: what a closed refund reads as (shared with the client view).
 import { CLOSED_REFUND_DESCRIPTION } from "../transactions/client-transaction";
 import { slotStartsAt } from "../consultations/slot-time";
+// Review round 1 of #391: the shared "your consultation moved" copy (own module).
+import { rescheduledRefundMessage } from "../consultations/refund-copy";
 import { feeDebitDocId, mismatchAdjustmentDocId, mismatchTopUpDocId, refundDocId } from "../money/refund-id";
 
 // ============================================
@@ -730,43 +732,11 @@ function mirrorUpdate(
   return exceptionStatus ? { status: exceptionStatus, updatedAt: now } : null;
 }
 
-/**
- * The client's copy for a payment refunded because the booking moved (issue
- * #354 `paid_for_rescheduled_slot`; wording issue #413 C, decision
- * 2026-11-21, plus the guest variant from the coordinator the same day).
- * Shared by the verify 409 `CONSULTATION_RESCHEDULED` message and the
- * refund notification, so the two can never drift apart. Pure.
- *
- * "we're refunding ... on its way", never "we've refunded": the refund may
- * still be pending, or held for an admin (#392 design).
- *
- *  - app client: "... Please pay again for the new time.";
- *  - guest (`bookedVia: "public_page"`): "... We've emailed you a link to
- *    pay for the new time." (#391 sends that email);
- *  - when the booking no longer awaits payment (paid through a fresh
- *    checkout, or cancelled: #354 fix round) the last sentence is left out.
- *
- * @param opts.guestBooking the booking was made by a guest on a public page
- * @param opts.bookingAwaitingPayment the booking still awaits payment (default true)
- * @param opts.bookingCancelled (issue #411) the booking was cancelled right
- *   after this refund (the sweep's settle-then-cancel): "cancelled", no "pay again"
- */
-export function rescheduledRefundMessage(
-  opts: { guestBooking?: boolean; bookingAwaitingPayment?: boolean; bookingCancelled?: boolean } = {}
-): string {
-  // Issue #411 (orchestrator, review round 1): the abandoned-booking sweep
-  // refunded a late payment on a retired checkout and then CANCELLED the
-  // booking in the same run. "Pay again" would be wrong: there is nothing
-  // left to pay for.
-  if (opts.bookingCancelled) {
-    return "Your consultation was cancelled, so we're refunding your payment in full. Your refund is on its way.";
-  }
-  const base = "Your consultation moved, so we're refunding your payment in full. Your refund is on its way.";
-  if (opts.bookingAwaitingPayment === false) return base;
-  return opts.guestBooking
-    ? `${base} We've emailed you a link to pay for the new time.`
-    : `${base} Please pay again for the new time.`;
-}
+// Review round 1 of #391: the "your consultation moved" copy lives in its own
+// module (consultations/refund-copy.ts), so the pay-link service can use it
+// without importing this service (which imports the charge service, which
+// imports the pay-link service: a static cycle). Re-exported for its callers.
+export { rescheduledRefundMessage };
 
 /** A money amount for notification copy, with its ISO code ("NGN 15,000.00"). */
 function describe(amount: Money): string {

@@ -58,7 +58,7 @@ import { slotStartsAt, DEFAULT_BOOKING_TIMEZONE, isKnownTimeZone } from "../cons
 import { EMAIL_BRANDING } from "./email/branding";
 import { emailService } from "./email/email.service";
 // Issue #413 (C): the shared "your consultation moved" refund copy.
-import { rescheduledRefundMessage } from "./consultation-refund.service";
+import { rescheduledRefundMessage } from "../consultations/refund-copy";
 
 // ============================================
 // 1. Constants
@@ -100,8 +100,11 @@ export const PAY_LINK_INVALID_MESSAGE = "This payment link is no longer valid. P
 export const payLinkRuntime: {
   /** Random bytes for a new token (production: crypto.randomBytes). */
   randomBytes: (n: number) => Buffer;
-  /** Sends the pay-again email (production: the branded Resend template). */
-  sendEmail: (message: PayLinkEmail) => Promise<void>;
+  /**
+   * Sends the pay-again email (production: the branded Resend template).
+   * Review round 1: answers how the send went; only "sent" counts as emailed.
+   */
+  sendEmail: (message: PayLinkEmail) => Promise<PayLinkEmailStatus>;
 } = {
   randomBytes: (n) => randomBytes(n),
   sendEmail: (message) => sendPayLinkEmail(message),
@@ -158,6 +161,18 @@ export function payLinkExpiry(
   const ttl = now.getTime() + PAY_LINK_TTL_HOURS * HOUR_MS;
   const expires = Math.min(ttl, slot.getTime());
   return expires > now.getTime() ? new Date(expires) : null;
+}
+
+/** Review round 1: how the pay-again email went (`emailService.sendNotification`'s status). */
+export type PayLinkEmailStatus = "sent" | "failed" | "skipped";
+
+/** Review round 1: true when the booking's slot starts after `at` (false when it cannot be read). Pure. */
+export function slotStillAhead(booking: Pick<Consultation, "scheduledDate" | "scheduledTime" | "timezone">, at: Date): boolean {
+  try {
+    return slotStartsAt(booking).getTime() > at.getTime();
+  } catch {
+    return false;
+  }
 }
 
 /** True when a link is still unused, not superseded and not expired at `at`. Pure. */
@@ -343,7 +358,7 @@ export function payLinkEmailBody(expiresText: string): string {
  * the raw token must be in neither. The delivery is recorded WITHOUT the
  * link. Never throws.
  */
-async function sendPayLinkEmail(message: PayLinkEmail): Promise<void> {
+async function sendPayLinkEmail(message: PayLinkEmail): Promise<PayLinkEmailStatus> {
   const subject = "Pay for your new consultation time";
   const body = payLinkEmailBody(message.expiresText);
   let status: "sent" | "failed" | "skipped" = "failed";
@@ -380,6 +395,7 @@ async function sendPayLinkEmail(message: PayLinkEmail): Promise<void> {
   } catch (err) {
     console.error("[pay-link] email delivery record failed:", err);
   }
+  return status;
 }
 
 /**
@@ -396,7 +412,8 @@ async function sendPayLinkEmail(message: PayLinkEmail): Promise<void> {
  * @param opts.firstRecorded true when this call RECORDED the exception (the
  *   guest is always sent a link then); false when a refund starts later
  *   (a link only when the booking has no live one any more)
- * @returns true when the guest was sent the pay-again email (the caller then
+ * @returns true when the pay-again email was SENT (review round 1: a
+ *   failed or skipped send is false), and the caller then
  *   leaves the email channel out of its own refund notice, so the guest gets
  *   one email, the one with the link)
  */
@@ -410,12 +427,19 @@ export async function sendGuestPayAgainLink(
       onlyIfNoLiveLink: !opts.firstRecorded,
     });
     if (!minted) return false;
-    await payLinkRuntime.sendEmail({
+    const status = await payLinkRuntime.sendEmail({
       to: minted.booking.clientEmail,
       agencyId: minted.link.agencyId,
       url: payLinkUrl(minted.link.agencySlug, minted.token),
       expiresText: describeExpiry(minted.link.expiresAt.toDate(), minted.booking.timezone),
     });
+    // Review round 1: only a SENT email counts. A failed or skipped send
+    // leaves the refund notice with its own email (the guest still hears
+    // about the refund), and the notice does not claim a link was emailed.
+    if (status !== "sent") {
+      console.error(`[pay-link] ${exception.consultationId}: the pay-again email was not sent (${status})`);
+      return false;
+    }
     // The link's id is its hash: safe to log; the token never is.
     console.log(`[pay-link] ${exception.consultationId}: pay-again link ${minted.link.id.slice(0, 12)}… emailed`);
     return true;
@@ -454,6 +478,10 @@ export async function resolvePayLink(token: string): Promise<ResolvedPayLink | n
   const booking = bookingSnap.exists ? (bookingSnap.data() as Consultation) : null;
   // Single-booking scope: the booking named by the link, and still payable.
   if (!isPayableGuestBooking(booking) || booking.id !== link.consultationId) return null;
+  // Review round 1: never once the slot has started (the booking may have
+  // been moved EARLIER after the link was minted, so the link's own expiry,
+  // capped at the old slot, is not enough). Unreadable slot: dead too.
+  if (!slotStillAhead(booking, chargeRuntime.now())) return null;
   const agencySnap = await collections.agencies.doc(link.agencyId).get();
   if (!agencySnap.exists) return null;
   return { link, booking, agency: agencySnap.data() as Agency };

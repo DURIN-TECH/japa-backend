@@ -137,6 +137,7 @@ before(async () => {
   // ---- The pay-again email: recorded, never sent ----
   payLinkRuntime.sendEmail = async (m) => {
     emails.push({ url: m.url });
+    return "sent";
   };
   restore = () => {
     chargeRuntime.rates = saved.rates;

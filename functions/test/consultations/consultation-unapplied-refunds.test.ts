@@ -197,11 +197,13 @@ describe("late payment after a reschedule (paid_for_rescheduled_slot)", () => {
   // public-page guest is emailed a pay link (#391) instead of "pay again".
   const COPY_VARIANTS: Array<[string, Record<string, unknown>, string]> = [
     ["an app client", { bookedVia: "client" }, RESCHEDULED_COPY],
+    // Review round 1 of #391: this guest's agency has no public page (no
+    // slug), so no pay link can be emailed: neither the 409 nor the notice
+    // may claim one (the emailed-link variant is covered in consultation-pay-link.test.ts).
     [
-      "a guest (public page)",
+      "a guest (public page) whose link could not be emailed",
       { bookedVia: "public_page" },
-      "Your consultation moved, so we're refunding your payment in full. Your refund is on its way. " +
-        "We've emailed you a link to pay for the new time.",
+      "Your consultation moved, so we're refunding your payment in full. Your refund is on its way.",
     ],
   ];
   for (const [who, over, copy] of COPY_VARIANTS) {
