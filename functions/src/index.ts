@@ -520,8 +520,10 @@ export const sendUnreadMessageReminders = functions
  *    later run;
  *  - (#411) retired checkouts are looked up before the live one and the
  *    lookups stop at the first one in progress; a reference already final
- *    is never looked up again; a run makes at most SWEEP_MAX_LOOKUPS_PER_RUN
- *    Paystack calls and leaves the rest for the next run;
+ *    is skipped while the booking is left, but every reference is asked
+ *    about once more just before a cancel (an "abandoned" checkout can still
+ *    be paid); a run makes at most SWEEP_MAX_LOOKUPS_PER_RUN Paystack calls
+ *    and leaves the rest for the next run;
  *  - (#411) a booking left because a checkout is in progress still gets
  *    every PAID retired checkout settled (refunded) in that run; only the
  *    cancel waits;

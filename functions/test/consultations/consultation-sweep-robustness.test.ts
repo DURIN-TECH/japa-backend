@@ -535,12 +535,14 @@ describe("bounded Paystack lookups (criterion 2)", () => {
     assert.deepEqual(seen, ["live-1"], "only the one that is not final yet");
     assert.equal(second.lookups, 1);
 
-    // The live one fails for good: cancelled without asking about the others again.
+    // The live one fails for good. Before the cancel (decision 2026-11-21)
+    // the recorded ones are asked about once more, then it is cancelled.
     paystackAbandoned("live-1", "b1");
     harness.clock.advanceHours(1);
     seen.length = 0;
     const third = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(seen, ["live-1"]);
+    assert.deepEqual(seen, ["live-1", "old-1", "old-2", "old-3"]);
+    assert.equal(third.lookups, 4);
     assert.equal(third.cancelled, 1);
     assert.equal(booking("b1").status, "cancelled");
   });
@@ -586,21 +588,139 @@ describe("bounded Paystack lookups (criterion 2)", () => {
     assert.equal(booking("c").status, "cancelled");
   });
 
-  test("the cap in the middle of a booking: what it learned is kept; the next run asks only about the rest", async () => {
-    const refs = Array.from({ length: SWEEP_MAX_LOOKUPS_PER_RUN + 20 }, (_, i) => `old-${i}`);
+  test("the cap in the middle of a booking: what it learned is kept; the next run asks the rest, then the recorded ones again before the cancel", async () => {
+    // "first" uses 250 of the 300 lookups; "big" (100 checkouts) gets 50.
+    const firstRefs = Array.from({ length: 250 }, (_, i) => `f-${i}`);
+    await seedPending("first", 40, { supersededCheckouts: firstRefs.map((r) => entry(r)) });
+    for (const r of firstRefs) paystackAbandoned(r, "first");
+    const refs = Array.from({ length: 100 }, (_, i) => `old-${i}`);
     await seedPending("big", 30, { supersededCheckouts: refs.map((r) => entry(r)) });
     for (const r of refs) paystackAbandoned(r, "big");
     const seen = countLookups();
     const first = await consultationService.sweepAbandonedBookings();
     assert.equal(seen.length, SWEEP_MAX_LOOKUPS_PER_RUN);
+    assert.equal(first.cancelled, 1);
     assert.equal(first.leftForCap, 1);
     assert.equal(booking("big").sweepReview.unresolvedRuns, 0, "the cap is not counted toward set-aside");
-    assert.equal(booking("big").sweepReview.checkouts.length, SWEEP_MAX_LOOKUPS_PER_RUN);
+    assert.equal(booking("big").sweepReview.checkouts.length, 50);
     harness.clock.advanceHours(1);
     seen.length = 0;
     const second = await consultationService.sweepAbandonedBookings();
-    assert.equal(seen.length, 20);
+    // The 50 not asked yet, then the 50 recorded ones once more before the cancel.
+    assert.deepEqual(seen, [...refs.slice(50), ...refs.slice(0, 50)]);
     assert.equal(second.cancelled, 1);
+  });
+
+  test("more checkouts than a whole run may look up: never cancelled by the sweep; counted, so it reaches an admin", async () => {
+    const refs = Array.from({ length: SWEEP_MAX_LOOKUPS_PER_RUN + 1 }, (_, i) => `old-${i}`);
+    await seedPending("huge", 30, { supersededCheckouts: refs.map((r) => entry(r)) });
+    for (const r of refs) paystackAbandoned(r, "huge");
+    const first = await consultationService.sweepAbandonedBookings();
+    assert.equal(first.leftForCap, 1);
+    assert.equal(booking("huge").sweepReview.lastOutcome, "too_many_checkouts");
+    assert.equal(booking("huge").sweepReview.unresolvedRuns, 1);
+    // Every later run re-asks before a cancel and runs out again: set aside at N.
+    await runSweeps(SWEEP_SET_ASIDE_AFTER_RUNS);
+    assert.equal(booking("huge").status, "pending_payment");
+    assert.equal(booking("huge").sweepSetAside, true);
+    // The admin cancel has no run budget: it checks all 301 and cancels.
+    const out = await call("cancelSweepReview", ROLES.ADMIN, "huge");
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.equal(booking("huge").status, "cancelled");
+  });
+});
+
+// ============================================
+// 2b. Every reference is asked again before a cancel (decision 2026-11-21)
+// ============================================
+
+describe("before a cancel the sweep asks about the recorded references again (decision 2026-11-21)", () => {
+  /**
+   * Run 1 records `old-1` final unpaid (Paystack "abandoned") while the live
+   * checkout is in progress; then `old-1` is paid and the live one fails.
+   */
+  async function recordedThenPaid(retired: boolean): Promise<void> {
+    await seedPending("b1", 30, { transactionId: "live-1", supersededCheckouts: [entry("old-1", retired)] });
+    paystackAbandoned("old-1", "b1");
+    paystackStatus("live-1", "b1", "ongoing");
+    const first = await consultationService.sweepAbandonedBookings();
+    assert.equal(first.leftInProgress, 1);
+    const recorded = booking("b1").sweepReview.checkouts.find((r: any) => r.reference === "old-1");
+    assert.equal(recorded.state, "final_unpaid");
+    assert.equal(recorded.final, true);
+    // The "abandoned" checkout is completed after all; the live one fails.
+    paystackPaid("old-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" }, harness.clock.now(), { fees: 20_000 });
+    paystackAbandoned("live-1", "b1");
+    harness.clock.advanceHours(1);
+  }
+
+  test("a re-priced checkout marked final unpaid but paid since: settled (the booking confirmed), not cancelled", async () => {
+    await recordedThenPaid(false);
+    const seen = countLookups();
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.deepEqual(seen, ["live-1", "old-1"], "the recorded one is asked again before the cancel");
+    assert.equal(result.cancelled, 0);
+    assert.equal(result.settled, 1);
+    const b = booking("b1");
+    assert.equal(b.status, "scheduled");
+    assert.equal(b.paymentStatus, "paid");
+    assert.equal(b.transactionId, "old-1");
+    assert.equal(docsIn("consultationPaymentExceptions").length, 0, "no refund: the client's payment confirmed the booking");
+  });
+
+  test("a retired checkout marked final unpaid but paid since: settled through settlePayment as the agent-caused refund, never cancelled under it", async () => {
+    await recordedThenPaid(true);
+    const result = await consultationService.sweepAbandonedBookings();
+    // settlePayment records it (paid_for_rescheduled_slot, full refund, agent
+    // debit) BEFORE the cancel, never as a client-caused booking_not_payable.
+    const exceptions = docsIn("consultationPaymentExceptions");
+    assert.equal(exceptions.length, 1);
+    assert.equal(exceptions[0][1].reason, "paid_for_rescheduled_slot");
+    assert.equal(refundsOf("b1").length, 1);
+    assert.equal(refundsOf("b1")[0].amount, FEE_KOBO, "refunded in full");
+    assert.equal(docsIn("transactions").filter(([, t]) => t.type === "paystack_fee_debit").length, 1);
+    assert.equal(result.cancelled, 1, "then cancelled: nothing else can land");
+    assert.equal(booking("b1").status, "cancelled");
+  });
+
+  test("the re-check fails (Paystack down): not cancelled (fail closed), counted as a lookup failure", async () => {
+    await recordedThenPaid(false);
+    harness.onLookup = async (reference: string) => {
+      if (reference === "old-1") throw new Error("PAYSTACK_ERROR: 503");
+      return undefined;
+    };
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.cancelled, 0);
+    assert.equal(result.errors, 1);
+    assert.equal(booking("b1").status, "pending_payment");
+    assert.equal(booking("b1").sweepReview.lastOutcome, "lookup_failed");
+  });
+
+  test("the re-check finds a recorded checkout in progress again: left, not cancelled", async () => {
+    await recordedThenPaid(false);
+    paystackStatus("old-1", "b1", "ongoing");
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.cancelled, 0);
+    assert.equal(result.leftInProgress, 1);
+    assert.equal(booking("b1").status, "pending_payment");
+  });
+
+  test("the re-check counts toward the run cap: when it runs out, the booking is left for the next run, not cancelled", async () => {
+    // "first" uses 299 lookups, leaving one: enough for b1's live checkout, not for the re-check.
+    const firstRefs = Array.from({ length: SWEEP_MAX_LOOKUPS_PER_RUN - 1 }, (_, i) => `f-${i}`);
+    await recordedThenPaid(false);
+    paystackAbandoned("old-1", "b1"); // (not paid in this test)
+    await seedPending("first", 40, { supersededCheckouts: firstRefs.map((r) => entry(r)) });
+    for (const r of firstRefs) paystackStatus(r, "first", "failed");
+    const result = await consultationService.sweepAbandonedBookings();
+    assert.equal(result.lookups, SWEEP_MAX_LOOKUPS_PER_RUN);
+    assert.equal(result.leftForCap, 1);
+    assert.equal(booking("b1").status, "pending_payment", "not cancelled without re-asking about old-1");
+    // Next run (budget fresh): re-asked, then cancelled.
+    harness.clock.advanceHours(1);
+    const next = await consultationService.sweepAbandonedBookings();
+    assert.equal(next.cancelled, 1);
+    assert.equal(booking("b1").status, "cancelled");
   });
 });
 

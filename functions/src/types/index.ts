@@ -1540,9 +1540,20 @@ export interface NoShowReport {
  *  - `lookup_failed`: asking Paystack failed (network, 5xx, 401);
  *  - `not_found`:   Paystack answered "not found" for a reference it
  *    generated itself (fail closed: never cancelled on that answer);
- *  - `error`:       anything else failed while handling the booking.
+ *  - `error`:       anything else failed while handling the booking;
+ *  - `too_many_checkouts`: more references than one run may look up.
  */
-export type SweepUnresolvedOutcome = "in_progress" | "review" | "lookup_failed" | "not_found" | "error";
+export type SweepUnresolvedOutcome =
+  | "in_progress"
+  | "review"
+  | "lookup_failed"
+  | "not_found"
+  | "error"
+  // The booking carries more checkout references than one run may look up
+  // (SWEEP_MAX_LOOKUPS_PER_RUN), so the sweep can never check them all
+  // before a cancel: counted, so it is set aside for an admin (whose
+  // actions have no run budget).
+  | "too_many_checkouts";
 
 /**
  * The last known state of ONE checkout reference of a booking, as the sweep

@@ -1360,11 +1360,22 @@ interface SweepLookups {
  */
 async function lookUpSweepCheckouts(
   booking: Consultation,
-  options: { budget: { remaining: number } | null; fresh: boolean; at: Timestamp; logId: string }
+  options: {
+    budget: { remaining: number } | null;
+    fresh: boolean;
+    at: Timestamp;
+    logId: string;
+    /**
+     * Issue #411 (decision 2026-11-21): ask about exactly these references
+     * (in this order) instead of the booking's whole `sweepLookupOrder`.
+     * Used by the re-check before a cancel.
+     */
+    references?: readonly string[];
+  }
 ): Promise<SweepLookups> {
   const states = options.fresh ? new Map<string, SweepCheckoutState>() : recordedFinalStates(booking);
   const out: SweepLookups = { states, lookups: new Map(), records: [], stoppedBy: null, calls: 0 };
-  for (const reference of sweepLookupOrder(booking)) {
+  for (const reference of options.references ?? sweepLookupOrder(booking)) {
     // Final and recorded: costs nothing (criterion 2).
     if (states.has(reference)) continue;
     // The run's Paystack budget is spent: the rest waits for the next run.
@@ -1839,7 +1850,12 @@ class ConsultationService {
    *    `settlePayment` (recorded as an exception and refunded under #354's
    *    rules; issue #411). Same on a failed lookup;
    *  - the budget ran out: left for the next run (`leftForCap`, not counted
-   *    toward set-aside);
+   *    toward set-aside, unless the booking has more references than a whole
+   *    run may ask about: `too_many_checkouts`, counted);
+   *  - BEFORE A CANCEL (decision 2026-11-21) every reference not asked about
+   *    in this run (the recorded finals) is asked about once more, inside the
+   *    same budget, and the decision is taken again: an "abandoned" checkout
+   *    paid since is settled, never cancelled under;
    *  - PAID ones (nothing in flight): each settled through `settlePayment`
    *    (the ONLY writer of money rows here). Confirmed: settled, never
    *    cancelled. Recorded and refunded (#354): it no longer blocks the
@@ -1954,7 +1970,40 @@ class ConsultationService {
     const look = await lookUpSweepCheckouts(booking, { budget, fresh: false, at: stamp, logId: id });
 
     // ---- 3. Decide on all the answers at once (pure) ----
-    const decision = decideAbandonedCheckouts(booking, look.states, chargeRuntime.now());
+    let decision = decideAbandonedCheckouts(booking, look.states, chargeRuntime.now());
+
+    // ---- 3'. Before a cancel, ask about the recorded ones again (#411) ----
+    // Decision 2026-11-21: a reference recorded as final (Paystack
+    // "abandoned" above all) can still be paid later. Cancelling under that
+    // late payment would turn it into a refund charged to the client as if
+    // the client had caused it. So when this run's answers would lead to a
+    // cancel (directly, or after settling paid references), every reference
+    // NOT asked about in this run is asked about once more first, inside the
+    // same run budget, and the decision is taken again on all the answers.
+    // Fail closed as everywhere: a failure, a checkout now in progress, or the
+    // cap running out means no cancel this run; a reference paid since goes
+    // through settlePayment (step 4 / 3a) like any other paid one.
+    if (decision.kind === "cancel" || decision.kind === "settle") {
+      const unasked = sweepLookupOrder(booking).filter((reference) => !look.lookups.has(reference));
+      if (unasked.length > 0) {
+        const again = await lookUpSweepCheckouts(booking, {
+          budget, fresh: true, at: stamp, logId: `${id} (before cancel)`, references: unasked,
+        });
+        for (const [reference, state] of again.states) look.states.set(reference, state);
+        for (const [reference, lookup] of again.lookups) look.lookups.set(reference, lookup);
+        look.records.push(...again.records);
+        look.calls += again.calls;
+        // A recorded final that was NOT re-asked (the lookups stopped first)
+        // must not count as answered: drop it, so the decision sees it as
+        // "not looked up" and leaves the booking.
+        for (const reference of unasked) {
+          if (!again.states.has(reference)) look.states.delete(reference);
+        }
+        look.stoppedBy = again.stoppedBy;
+        decision = decideAbandonedCheckouts(booking, look.states, chargeRuntime.now());
+      }
+    }
+
     if (decision.kind === "skip") {
       result.skipped++;
       return;
@@ -1976,7 +2025,16 @@ class ConsultationService {
       if (look.stoppedBy === "cap") {
         // The run's Paystack budget ran out: not an error, not counted.
         result.leftForCap++;
-        if (records.length > 0) await this.recordSweepRun(id, observedFingerprint, records, null);
+        // Except for a booking with more references than a whole run may
+        // ask about: no run can ever check them all before a cancel, so it
+        // is counted and reaches an admin (set aside) instead of waiting forever.
+        const tooMany = sweepLookupOrder(booking).length > SWEEP_MAX_LOOKUPS_PER_RUN;
+        if (tooMany) {
+          const counted = await this.recordSweepRun(id, observedFingerprint, records, "too_many_checkouts");
+          if (counted.setAside) result.setAside++;
+        } else if (records.length > 0) {
+          await this.recordSweepRun(id, observedFingerprint, records, null);
+        }
         return;
       }
       let unresolved: SweepUnresolvedOutcome;
