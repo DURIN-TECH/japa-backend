@@ -122,6 +122,10 @@ export interface RubricCheckInput {
   rubric: VisaRubric;
   // Rules the code gates already leave out; the check need not look at them.
   codeLeftOutIds: readonly string[];
+  // (#440) Reuse the check's answers from this earlier version (stored as it is, UNFILTERED) for rules that did
+  // not change. Set only when the run was started with `reuseCheckFromVersion` (the script's flag); the checker
+  // accepts it for one rulebook and one pair of versions only and holds anything else before any spend.
+  reuseFrom?: { version: number; rubric: VisaRubric };
 }
 
 /**
@@ -253,6 +257,11 @@ export interface RunOptions {
   // Report the code gates only and state the check has not run. Never publishes
   // (publishing without the check would defeat it), so it implies `dryRun`.
   skipChecker?: boolean;
+  // (#440) The check reuses its answers from this earlier version of the same rulebook for unchanged rules
+  // (see `RubricCheckInput.reuseFrom`). Named on the call by `publish:rubric --reuse-check-from <n>` only:
+  // never a setting, never set by the trigger, the sweep or the admin endpoint. It skips nothing: every
+  // gate, the check of the changed rules, the question plan and the approval run as always.
+  reuseCheckFromVersion?: number;
 }
 
 /** (#223) What the independent check reports beyond keep / leave out / hold, carried to the record and the alert. */
@@ -512,10 +521,11 @@ export class RubricAutoPublishService {
    * @throws RubricReviewError 404 (no such version), 409 ALREADY_DECIDED (not
    *   pending), 409 NOT_LATEST_VERSION.
    */
-  async runOnDraft(id: string, opts: { dryRun?: boolean; skipChecker?: boolean; trigger?: "admin_endpoint" | "script" } = {}): Promise<RubricPublishReport> {
+  async runOnDraft(id: string, opts: { dryRun?: boolean; skipChecker?: boolean; trigger?: "admin_endpoint" | "script"; reuseCheckFromVersion?: number } = {}): Promise<RubricPublishReport> {
     const parsed = parseRubricVersionId(id);
     if (!parsed) throw new RubricReviewError("NOT_FOUND", "Rubric version not found", 404);
-    return this.run(parsed.routeKey, parsed.version, { trigger: opts.trigger ?? "admin_endpoint", dryRun: opts.dryRun, skipChecker: opts.skipChecker });
+    // (#440) `reuseCheckFromVersion` is passed through only when given (the script); the endpoint never sets it.
+    return this.run(parsed.routeKey, parsed.version, { trigger: opts.trigger ?? "admin_endpoint", dryRun: opts.dryRun, skipChecker: opts.skipChecker, ...(opts.reuseCheckFromVersion !== undefined ? { reuseCheckFromVersion: opts.reuseCheckFromVersion } : {}) });
   }
 
   /**
@@ -696,7 +706,11 @@ export class RubricAutoPublishService {
         }
         if (this.deps.checker !== null && this.deps.planner !== null) {
           // Both exist: spend on the check only now that every code gate passed.
-          const outcome = await this.callChecker(this.deps.checker, { routeKey, version, runId, rubric, codeLeftOutIds: report.excludedCriterionIds });
+          // (#440) With `reuseCheckFromVersion`, the earlier version is handed to the check as stored; the check
+          // decides whether that pair may reuse anything (and holds before any spend when it may not). A base
+          // version that cannot be read is passed as missing, so the check holds rather than asking everything.
+          const reuseFrom = opts.reuseCheckFromVersion !== undefined ? { version: opts.reuseCheckFromVersion, rubric: (await rubricStore.getVersionForReview(routeKey, opts.reuseCheckFromVersion)) as VisaRubric } : undefined;
+          const outcome = await this.callChecker(this.deps.checker, { routeKey, version, runId, rubric, codeLeftOutIds: report.excludedCriterionIds, ...(reuseFrom ? { reuseFrom } : {}) });
           extras.checkerRequests = outcome.requests;
           if (!outcome.ok) {
             checker = "failed";
