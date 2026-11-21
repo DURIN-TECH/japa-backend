@@ -480,6 +480,10 @@ class TransactionService {
    *    Paystack fee is unknown (or not less than A) counts in NEITHER
    *    balance, nor in revenue, and releasing the meeting hold does not make
    *    it withdrawable. A legacy fee (no fee status) counts A, as before.
+   *  - (issue #393) a paid payment request (`escrow_release`) counts the
+   *    same way, A - F, in `availableBalance` straight away (no meeting
+   *    hold); unknown or not-less-than-A: in neither balance nor revenue
+   *    (so never withdrawable); a legacy row (no fee status) counts A.
    *    With `opts.feeBreakdown` (admin stats) each row also carries
    *    `paystackFees` and `grossRevenue` (gross, fee and net side by side);
    *  - a currency appears in `byCurrency` as soon as any transaction in it
@@ -613,6 +617,18 @@ class TransactionService {
         if (hold === "held") held.add(currency, credit);
         else if (hold === "released") available.add(currency, credit);
         // "refunded": given back out of the hold, counted nowhere.
+        continue;
+      }
+      if (txn.type === "escrow_release") {
+        // Issue #393: a paid payment request credits the agent A - Paystack's
+        // fee, available at once (it has no meeting hold, as before #393).
+        // A row whose fee is unknown (or not less than A) credits NOTHING, so
+        // it can never be withdrawn; a legacy row (no fee status) counts A.
+        const credit = consultationFeeCredit(txn);
+        if (credit === null) continue;
+        // The fee Paystack kept, for the admin breakdown (0 on a legacy row).
+        paystackFees.add(currency, txn.amount - credit);
+        available.add(currency, credit);
         continue;
       }
       // Any other settled incoming payment is available straight away.
@@ -838,6 +854,21 @@ class TransactionService {
    *  - `paymentProvider` is "paystack" with the Paystack reference, and
    *    `agentId` is the agent's USER uid (what GET /transactions filters
    *    on), not the agent profile id the old record carried.
+   *
+   * Issue #393 (decision 2026-11-17: the agent pays Paystack's fee on a
+   * payment request, as on a consultation): the row also records Paystack's
+   * fee for the reference with #395's fields (`paystackFeeMinor`,
+   * `paystackFeeStatus`, `agentCreditMinor` = A - F). `amount` stays A, what
+   * the client paid. While the fee is unknown the status says so, no fee is
+   * stored and the row credits nothing until the job or an admin refresh
+   * stores it (services/paystack-fee.service.ts).
+   *
+   * The fee is taken ONLY by netting this credit: no `paystack_fee_debit` is
+   * written for a payment-request reference. When payment-request refunds
+   * are automated later they MUST start from the stored `paystackFeeMinor`
+   * and write any fee debit at `feeDebitDocId(reference)` with `tx.create`
+   * (money/refund-id.ts, #354), so the agent is never charged the fee twice
+   * for one reference.
    */
   buildPaymentRequestPayment(
     id: string,
@@ -854,6 +885,14 @@ class TransactionService {
       reference: string;
       /** The request's charge snapshot (empty for a legacy naira request). */
       snapshot?: Partial<ChargeSnapshot>;
+      /**
+       * Issue #393: Paystack's fee for this reference, classified from
+       * Paystack's own report (`classifyPaystackFee`): known, unknown, or not
+       * less than the amount. Required: a payment-request row is never
+       * written without saying where Paystack's fee stands (no silent full
+       * credit).
+       */
+      paystackFee: PaystackFeeClassification;
     }
   ): Transaction {
     const pr = input.paymentRequest;
@@ -866,8 +905,17 @@ class TransactionService {
       applicationId: pr.applicationId,
       paymentRequestId: pr.id,
       type: "escrow_release",
+      // A: what the client was charged. Never the net (the client's history
+      // and any later refund start from this figure).
       amount: input.amount,
       currency: input.currency,
+      // Issue #393: Paystack's fee and the agent's credit (A - F), or the
+      // "unknown" / "fee_not_less_than_amount" status, stored with the row.
+      ...paystackFeeFields(input.amount, input.paystackFee),
+      // When and by what the fee was stored (absent while it is unknown).
+      ...(input.paystackFee.status !== "unknown"
+        ? { paystackFeeResolvedAt: now, paystackFeeResolvedBy: "settle" as const }
+        : {}),
       status: "released",
       isEscrow: false,
       paymentProvider: "paystack",

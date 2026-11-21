@@ -32,6 +32,35 @@
  * The shared decision step (which checkout was paid, does the amount match)
  * is `matchPaidCheckout` in charge-checkout.service.ts, the same one
  * consultation bookings use.
+ *
+ * ISSUE #393 (decision 2026-11-17: on payment requests the AGENT pays
+ * Paystack's fee, the same as consultations, #395). Per Paystack reference,
+ * A = what the client was charged and F = Paystack's own `fees`:
+ *  - step 5 stores F on the `escrow_release` Transaction, in the SAME commit
+ *    that flips the request to paid, writes the Transaction and moves the
+ *    case's `amountPaid`. F comes ONLY from `reported.fees` (kept by
+ *    `toTransactionLookup` only when `isWellFormedFee`) and only when
+ *    `reported.currency` is the charge currency (`classifyPaystackFee`):
+ *    never estimated, never a rate, never a default;
+ *  - the Transaction's `amount` stays A, and the case's `amountPaid` moves
+ *    by the full price (the client paid it all). The agent is credited
+ *    A - F (computeStats, `revenueEffect`);
+ *  - F unknown, or F >= A: the request is still paid and `amountPaid` still
+ *    moves, but the row credits NOTHING (no balance, no revenue, never
+ *    withdrawable) until the scheduled job or an admin refresh stores F
+ *    (services/paystack-fee.service.ts, which re-checks inside a transaction
+ *    that the row is still unknown, so F is stored once);
+ *  - F is written once per reference: a second settlement of the same
+ *    reference (verify again, the webhook, or both at once) ends at step 3
+ *    `already_paid` and writes nothing, so a stored fee never changes;
+ *  - the fee is taken ONLY by netting the credit. No `paystack_fee_debit` is
+ *    written for a payment-request reference. Future automated refunds of
+ *    payment requests MUST use the stored `paystackFeeMinor` and #354's
+ *    `feeDebitDocId(reference)` with `tx.create`, so the agent is never
+ *    charged the fee twice for one reference;
+ *  - a payment that cannot be applied (`paymentRequestExceptions`) records F
+ *    too, for the human who refunds it (decision 2026-11-19: client-caused,
+ *    refunded A - F, the agent not charged). It still writes no Transaction.
  */
 
 import { Timestamp } from "firebase-admin/firestore";
@@ -43,6 +72,7 @@ import { notificationService } from "./notification.service";
 import { PaystackTransactionLookup } from "./billing/paystack.provider";
 import { chargeRuntime, hasChargeSnapshot, matchPaidCheckout, snapshotOf, supersededSwap } from "./charge-checkout.service";
 import { describeRequestAmount, expectedRequestCharge, isUsdPaymentRequest } from "./payment-request-charge.service";
+import { classifyPaystackFee, isWellFormedFee } from "../money/paystack-fee";
 
 // ============================================
 // Outcomes
@@ -199,11 +229,22 @@ export async function settlePaymentRequest(
     const { isCurrent, entry, check } = match;
     if (!check.ok) return { kind: check.reason, request: current };
 
-    /** Record money we hold but cannot apply (idempotent: doc id = reference). */
+    /**
+     * Record money we hold but cannot apply (idempotent: doc id = reference).
+     * An existing record is returned unchanged, so its fee (#393) is never
+     * overwritten by a later report of the same reference.
+     */
     const recordException = (
       reason: PaymentRequestPaymentException["reason"]
     ): PaymentRequestPaymentException => {
       if (exceptionSnap.exists) return exceptionSnap.data() as PaymentRequestPaymentException;
+      // Issue #393: Paystack's fee for the human who refunds it, only when
+      // it is well-formed AND in the charge currency (else left out =
+      // unknown). Kept even when it is not less than the amount: it is the
+      // figure Paystack reported, and the refund rule decides what to do.
+      const reportedFee = reported.currency === check.charged.currency && isWellFormedFee(reported.fees)
+        ? reported.fees
+        : null;
       const exception: PaymentRequestPaymentException = {
         id: reference,
         paymentRequestId,
@@ -212,6 +253,7 @@ export async function settlePaymentRequest(
         currency: check.charged.currency,
         paystackPaidAt: check.providerPaidAt ? Timestamp.fromDate(check.providerPaidAt) : null,
         reason,
+        ...(reportedFee !== null ? { paystackFeeMinor: reportedFee } : {}),
         status: "open",
         createdAt: Timestamp.fromDate(at),
       };
@@ -258,6 +300,17 @@ export async function settlePaymentRequest(
     };
     const settled = { ...current, ...updates } as PaymentRequest;
 
+    // Issue #393: Paystack's fee on this reference, from Paystack's report
+    // only (well-formed, same currency as the charge). Unknown, or not less
+    // than A: the row is written but credits nothing until it is resolved.
+    const paystackFee = classifyPaystackFee(check.charged.amountMinor, check.charged.currency, reported);
+    if (paystackFee.status !== "known") {
+      console.warn(
+        `[payment-request] ${paymentRequestId}: Paystack's fee on ${reference} is ${paystackFee.status}; ` +
+          "the payment is recorded but credited to the agent nowhere until the fee is resolved"
+      );
+    }
+
     // The agent's USER uid (GET /transactions filters on it).
     const agentUserId = (agentSnap?.exists ? (agentSnap.data() as { userId?: string }).userId : undefined) ?? current.agentId;
     const transaction: Transaction = {
@@ -268,12 +321,14 @@ export async function settlePaymentRequest(
         currency: check.charged.currency,
         reference,
         snapshot: hasChargeSnapshot(settled) ? snapshotOf(settled) : undefined,
+        paystackFee,
       }),
       ...review,
     };
 
     // What the payment counts as on the case: the dollar price for a #181
-    // request, the legacy request's own kobo for a legacy one.
+    // request, the legacy request's own kobo for a legacy one. Issue #393:
+    // the FULL price, never net of Paystack's fee (the client paid it all).
     const countsAs: Money = usdRequest && hasChargeSnapshot(settled)
       ? { amountMinor: settled.priceUsdCents!, currency: "USD" }
       : check.charged;

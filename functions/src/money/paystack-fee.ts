@@ -99,7 +99,9 @@ export function paystackFeeFields(
 
 /**
  * What a consultation fee Transaction credits the agent, in minor units of
- * its currency, or null when it credits NOTHING (issue #395). Pure. The ONE
+ * its currency, or null when it credits NOTHING (issue #395). Since #393 the
+ * same rule is used for a payment-request `escrow_release` row (it reads only
+ * the amount and the fee fields, never the type). Pure. The ONE
  * rule the held / available balances (computeStats), revenue
  * (`revenueEffect`, so analytics too) and the refund engine use:
  *  - legacy row (no `paystackFeeStatus`, written before #395): A;
@@ -133,12 +135,31 @@ export function isUnresolvedFeeStatus(status: PaystackFeeStatus | undefined): bo
 }
 
 /**
- * Whether a consultation fee Transaction is waiting for Paystack's fee, so a
+ * Issue #393: the Transaction types whose Paystack fee is tracked (the agent
+ * pays it, credited A - F under the rules above):
+ *  - "consultation_fee": a paid consultation (#395);
+ *  - "escrow_release": a paid payment request (#393, decision 2026-11-17:
+ *    "on payment requests the agent pays Paystack's fee, the same as
+ *    consultations").
+ * The fee fields, the statuses, `consultationFeeCredit` (status-based, so it
+ * applies to both types unchanged), the scheduled lookup and the admin
+ * refresh are shared by both. Any other type never carries a fee.
+ */
+export const PAYSTACK_FEE_TRACKED_TYPES: readonly Transaction["type"][] = ["consultation_fee", "escrow_release"];
+
+/** Issue #393: whether rows of `type` track Paystack's fee (see PAYSTACK_FEE_TRACKED_TYPES). Pure. */
+export function isPaystackFeeTracked(type: Transaction["type"]): boolean {
+  return PAYSTACK_FEE_TRACKED_TYPES.includes(type);
+}
+
+/**
+ * Whether a fee-tracked Transaction (a consultation fee, or since #393 a
+ * payment-request `escrow_release`) is waiting for Paystack's fee, so a
  * lookup (the scheduled job, an admin refresh, a refund) may store it
  * (issue #395). Only "unknown" rows (and, issue #413 D, "set_aside" ones,
  * which the admin refresh and a refund still resolve): a known fee is never
  * overwritten, and a legacy row keeps counting as A. Pure.
  */
 export function awaitsPaystackFee(txn: Pick<Transaction, "type"> & Partial<Pick<Transaction, "paystackFeeStatus">>): boolean {
-  return txn.type === "consultation_fee" && isUnresolvedFeeStatus(txn.paystackFeeStatus);
+  return isPaystackFeeTracked(txn.type) && isUnresolvedFeeStatus(txn.paystackFeeStatus);
 }

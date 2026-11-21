@@ -134,6 +134,9 @@ export function unionCurrencies(...sets: CurrencyBuckets[]): CurrencyCode[] {
 //    unknown (or not less than A) adds 0 until the fee is known. A legacy
 //    row (no fee status, written before #395) adds A as before. So the
 //    agent's `totalRevenue` and the analytics revenue are NET of the fee.
+//  - (issue #393) a settled payment-request "escrow_release" follows the
+//    SAME rule as a consultation fee: A - F, 0 while the fee is unknown or
+//    not less than A, A on a legacy row (written before #393).
 //  - (issue #390) a settled consultation "refund" subtracts what it takes
 //    off the AGENT (`agentReversalMinor`): the fee's whole credit when paid
 //    out of the hold, at least the refund when paid from available. With
@@ -200,7 +203,9 @@ export function revenueEffect(
   if (isAgentDebit(txn)) return -txn.amount;
   // Issue #395: a consultation fee counts what it credits the agent
   // (A - Paystack's fee), or nothing while that cannot be worked out.
-  if (txn.type === "consultation_fee") return consultationFeeCredit(txn) ?? 0;
+  // Issue #393: a paid payment request (`escrow_release`) follows the same
+  // rule: A - F, nothing while unknown, A on a legacy row (no fee status).
+  if (txn.type === "consultation_fee" || txn.type === "escrow_release") return consultationFeeCredit(txn) ?? 0;
   // Issue #390: a refund takes off revenue what it takes off the AGENT
   // (`agentReversalMinor`), which may differ from what the client got back
   // (Paystack keeps its fee). Older rows have none: `amount`, as before.

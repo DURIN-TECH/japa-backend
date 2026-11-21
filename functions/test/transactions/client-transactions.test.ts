@@ -108,6 +108,8 @@ async function seedTransactions(): Promise<void> {
       amount: 22_500_000,
       currency: "NGN",
       reference: "ref-ng-request",
+      // Issue #393: Paystack's fee as settle classifies it (hidden from clients).
+      paystackFee: { status: "known", feeMinor: 337_500 },
     }),
     // Nigerian client again, but paid to agent B in ANOTHER agency, in USD.
     transactionService.buildPaymentRequestPayment(TX.ngRequestAgentB, at(3), {
@@ -116,6 +118,8 @@ async function seedTransactions(): Promise<void> {
       amount: 15_000,
       currency: "USD",
       reference: "ref-ng-request-b",
+      // Issue #393: Paystack's fee as settle classifies it (hidden from clients).
+      paystackFee: { status: "unknown" },
     }),
     // Ghanaian client: a consultation with the SAME agent A (GHS pesewas).
     transactionService.buildConsultationFee(TX.ghConsultation, at(4), {
@@ -135,6 +139,8 @@ async function seedTransactions(): Promise<void> {
       amount: 225_000,
       currency: "GHS",
       reference: "ref-gh-request",
+      // Issue #393: Paystack's fee as settle classifies it (hidden from clients).
+      paystackFee: { status: "fee_not_less_than_amount", feeMinor: 225_000 },
     }),
   ];
   for (const row of rows) await seed("transactions", row.id, row as unknown as Record<string, unknown>);

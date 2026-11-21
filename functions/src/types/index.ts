@@ -1656,6 +1656,21 @@ export interface PaymentRequestPaymentException {
   /** Paystack's own payment time (`paid_at`), when it reported one. */
   paystackPaidAt: Timestamp | null;
   reason: "paid_on_superseded_reference_after_request_paid" | "request_not_payable";
+  /**
+   * Issue #393: Paystack's processing fee on this reference, in minor units
+   * of `currency`, exactly as Paystack reported it at settlement. Stored only
+   * when it was a well-formed fee (`isWellFormedFee`) reported in the charge
+   * currency; absent otherwise (unknown: never estimated, never 0 by
+   * default). Written once with the record and never changed.
+   *
+   * For the human who refunds it. Decision (user, 2026-11-19): paying a
+   * request that is no longer payable is CLIENT-caused (the #354 rule), so
+   * the client is refunded `amountMinor - paystackFeeMinor` and the agent is
+   * not charged. When these refunds are automated, they must use this stored
+   * fee and #354's `feeDebitDocId(reference)` with `tx.create` for any fee
+   * row, so the fee is never taken twice for one reference.
+   */
+  paystackFeeMinor?: number;
   /** Open until a human refunds it (no automated refund yet). */
   status: "open";
   createdAt: Timestamp;
@@ -1982,6 +1997,8 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   feeHoldFrozenByReportAt?: Timestamp;
 
   // ---- Issue #395: Paystack's fee on a consultation fee (type "consultation_fee") ----
+  // Issue #393: the same fields, statuses and rules apply to a paid payment
+  // request (type "escrow_release"): the agent pays Paystack's fee there too.
   // Decision (user, 2026-11-17): on a paid consultation the AGENT pays
   // Paystack's fee. `amount` stays what the client was charged (A); the agent
   // is credited A - F, where F is Paystack's own `fees` for this reference in
