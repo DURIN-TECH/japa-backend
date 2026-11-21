@@ -106,5 +106,34 @@ export function findBannedWording(text: string): boolean {
 /**
  * Version of the prompts in this module and the engine. Recorded on every assessment.
  * (#384) Bumped for the new narrative prompt (buildNarrativeRequest).
+ * (#418) Bumped for the caseworker read (general fields and the document kind
+ * in the extraction call), the document list in the judgement and narrative
+ * prompts, and their new rules. The per-upload document check (#115) sends
+ * an unchanged request, so it records its own DOCUMENT_CHECK_PROMPT_VERSION
+ * below (fix round 1), not this one.
  */
-export const ASSESSMENT_PROMPT_VERSION = "assessment-2026-11-16.1";
+export const ASSESSMENT_PROMPT_VERSION = "assessment-2026-11-21.1";
+
+/**
+ * (#418 fix round 1) Version of the prompt the per-upload document check
+ * (#115, `document-check.service.ts`) sends. Stored on every check record and
+ * part of its reuse key: an earlier check of an identical file is reused only
+ * when the versions match. Kept at the value the check stored before #418
+ * (the assessment version of #384), because #418 does not change the request
+ * the check sends (it does not opt in to the caseworker read). Had it
+ * followed ASSESSMENT_PROMPT_VERSION, every stored check would be re-paid
+ * once for identical files. Bump THIS only when the check's own request
+ * (EXTRACTION_SYSTEM, CHECK_FIELDS, its schema) changes.
+ */
+export const DOCUMENT_CHECK_PROMPT_VERSION = "assessment-2026-11-16.1";
+
+/**
+ * (#418 fix round 3) Version of the extraction request the bulk reassessment
+ * (`ai-bulk-reassessment.service.ts`) sends. Part of its `documentExtractions`
+ * cache key (`extractionKeyFor`). Kept at the pre-#418 value for the same
+ * reason as DOCUMENT_CHECK_PROMPT_VERSION: #418 does not change the bulk
+ * request (it does not opt in to the caseworker read), so following
+ * ASSESSMENT_PROMPT_VERSION would re-pay every stored bulk extraction once.
+ * Bump THIS only when the bulk extraction request itself changes.
+ */
+export const BULK_EXTRACTION_PROMPT_VERSION = "assessment-2026-11-16.1";

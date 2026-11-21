@@ -5,6 +5,9 @@ import type {
   AssessmentNarrative,
   BlockingRule,
   CredibilityFlag,
+  DocumentKind,
+  DocumentReadRecord,
+  DocumentUnreadReason,
   InsufficientItem,
   ReadinessBand,
   RefusalGround,
@@ -12,6 +15,8 @@ import type {
   StatementFinding,
   StatementRef,
 } from "../../types/assessment";
+// (#418) Values (not types): the fixed document kinds and unread reasons.
+import { DOCUMENT_KINDS, DOCUMENT_UNREAD_REASONS } from "../../types/assessment";
 import type { LlmRequest } from "./llm-provider";
 import { AI_MODELS } from "./ai-models";
 // (#234) Group matching from what the applicant holds (pure).
@@ -75,6 +80,11 @@ export interface DocumentExtraction {
   failure: string | null;
   // The document addressed the model. Its values cannot satisfy any criterion.
   suspicious: boolean;
+  // (#418) The kind of document the model read from the content, on the
+  // caseworker read only (`caseworkerRead`). Null when it was not given (or
+  // the document was not read); ABSENT on every other path (the per-upload
+  // document check, the bulk path), so their results are unchanged.
+  documentKind?: DocumentKind | null;
 }
 
 /** Facts the objective checks may read, keyed by a dotted name. */
@@ -321,32 +331,181 @@ export function documentFieldsFor(rubric: Pick<VisaRubric, "criteria">): string[
   return [...fields].sort();
 }
 
+// ----- (#418) The caseworker read: what an officer reads in ANY document -----
+
+/**
+ * (#418) One general field a caseworker reads in a document, whatever the
+ * rulebook's objective checks ask for. A row of `CASEWORKER_FIELDS`.
+ *  - `field`:   the name the model reports it under (the schema `enum` value);
+ *  - `meaning`: what the model is told the field is (sent in the extraction
+ *               prompt, so it must stay generic: no route, country or
+ *               nationality wording);
+ *  - `money`:   true when the value is an amount of money. A money value with
+ *               no unit is read in the application's declared currency by
+ *               the narrative's figure check (`labelExtractedValues`);
+ *  - `perItem`: true when the document can hold the field many times (one
+ *               value per item, e.g. each recurring payment). For these the
+ *               model's quote is the item's description as printed, and the
+ *               extraction summary shows it next to the amount.
+ */
+export interface CaseworkerField {
+  field: string;
+  meaning: string;
+  money: boolean;
+  perItem: boolean;
+}
+
+/**
+ * (#418) THE fixed list of general caseworker fields. Asked for, on top of the
+ * rulebook's own fields (`documentFieldsFor`), in the ONE extraction call the
+ * review already makes per document (no extra call). Why: a rulebook's
+ * objective fields can be abstract (a field no document literally prints), so
+ * before #418 a readable bank statement could give no values at all, and the
+ * judgement and narrative calls then told applicants their uploads were missing.
+ *
+ * A single data table on purpose: a later issue extends it (the evidence items
+ * a document shows) by adding rows, not code. Date fields are named for what
+ * they are (`documentDate`, `statementPeriodStart`, `statementPeriodEnd`, ...)
+ * and are reported as YYYY-MM-DD when the date is clear, else as printed.
+ */
+export const CASEWORKER_FIELDS: readonly CaseworkerField[] = [
+  // ---- the document's own dates ----
+  { field: "documentDate", meaning: "the date the document was issued, printed or signed", money: false, perItem: false },
+  { field: "statementPeriodStart", meaning: "the first day a statement covers", money: false, perItem: false },
+  { field: "statementPeriodEnd", meaning: "the last day a statement covers", money: false, perItem: false },
+  // ---- who holds it and who issued it ----
+  // `accountHolder` is ALSO an objective-check field (`funds.holderIsApplicant`
+  // is derived from it, see `deriveHolderFact`), so its meaning stays the
+  // pre-#418 one: the ACCOUNT holder only. A passport or payslip must never
+  // report the applicant's name here (fix round 1: that let a passport
+  // satisfy the holder check). "Who the document is about" is its own field.
+  { field: "accountHolder", meaning: "the name of the holder of the account the document is a statement of (a bank or savings account); leave it out for any other document", money: false, perItem: false },
+  { field: "documentSubjectName", meaning: "the name of the person the document is about or issued to (for example the passport holder, the employee or the person a letter names)", money: false, perItem: false },
+  { field: "issuer", meaning: "who issued the document: the bank, employer, authority, landlord or institution", money: false, perItem: false },
+  // ---- balances and totals ----
+  { field: "openingBalance", meaning: "the balance at the start of the period", money: true, perItem: false },
+  { field: "closingBalance", meaning: "the balance at the end of the period", money: true, perItem: false },
+  { field: "totalCredits", meaning: "the total paid in over the period, as stated on the document", money: true, perItem: false },
+  { field: "totalDebits", meaning: "the total paid out over the period, as stated on the document", money: true, perItem: false },
+  // ---- money in and out, one value per item ----
+  { field: "recurringCredit", meaning: "a payment in that repeats (salary, allowance, rent received): one value per repeating payment, the amount as the value and its description as the quote", money: true, perItem: true },
+  { field: "recurringDebit", meaning: "a payment out that repeats (rent, school fees, loan, transfers): one value per repeating payment, the amount as the value and its description as the quote", money: true, perItem: true },
+  { field: "largeDeposit", meaning: "a single payment in that is large next to the usual ones: one value per payment, the amount as the value and its description and date as the quote", money: true, perItem: true },
+  { field: "cashDeposit", meaning: "a cash deposit: one value per deposit, the amount as the value and its description and date as the quote", money: true, perItem: true },
+  // ---- work and pay ----
+  { field: "employer", meaning: "the employer's name", money: false, perItem: false },
+  { field: "jobTitle", meaning: "the job title or role", money: false, perItem: false },
+  { field: "employmentStartDate", meaning: "the date the employment started", money: false, perItem: false },
+  { field: "salary", meaning: "the salary or pay amount", money: true, perItem: false },
+  { field: "payPeriod", meaning: "how often the salary is paid or what period it covers (for example monthly, or a year)", money: false, perItem: false },
+  // ---- home ----
+  { field: "tenancyStart", meaning: "the date a tenancy or lease starts", money: false, perItem: false },
+  { field: "tenancyEnd", meaning: "the date a tenancy or lease ends", money: false, perItem: false },
+  { field: "rentAmount", meaning: "the rent amount", money: true, perItem: false },
+  // ---- hosts, sponsors, courses ----
+  { field: "hostOrSponsorName", meaning: "the name of a host, sponsor or person inviting or supporting the applicant", money: false, perItem: false },
+  { field: "courseTitle", meaning: "the title of a course or programme", money: false, perItem: false },
+  { field: "referenceNumber", meaning: "a confirmation, acceptance, certificate or reference number printed on the document", money: false, perItem: false },
+  { field: "awardOrResult", meaning: "an award, qualification, grade or result", money: false, perItem: false },
+  // ---- validity ----
+  { field: "expiryDate", meaning: "the date the document expires or stops being valid", money: false, perItem: false },
+];
+
+/** (#418) The caseworker field names, in table order. */
+export const CASEWORKER_FIELD_NAMES: readonly string[] = CASEWORKER_FIELDS.map((f) => f.field);
+
+/** (#418) The caseworker fields that hold money (the `money` column). */
+export const CASEWORKER_MONEY_FIELDS: readonly string[] = CASEWORKER_FIELDS.filter((f) => f.money).map((f) => f.field);
+
+/** (#418) The caseworker fields the model reports once per item (the `perItem` column). */
+const CASEWORKER_PER_ITEM_FIELDS = new Set(CASEWORKER_FIELDS.filter((f) => f.perItem).map((f) => f.field));
+
+/**
+ * (#418) Most read values KEPT per document on the caseworker read. Past it,
+ * whole values are dropped in code (`capReadValues`), never cut mid-value, and
+ * the document is still listed. Bounds what one long statement can add to
+ * every judgement call (the extraction call's output is already bounded by its
+ * `maxOutputTokens`).
+ */
+export const MAX_READ_VALUES_PER_DOCUMENT = 40;
+
+/**
+ * (#418) The fields the caseworker read asks for: the rulebook's own fields
+ * (`documentFieldsFor`, which the objective checks need) first, then the
+ * caseworker fields that are not already among them. A name in both is asked
+ * for once.
+ */
+export function caseworkerReadFields(objectiveFields: readonly string[]): string[] {
+  const out = [...objectiveFields];
+  for (const f of CASEWORKER_FIELD_NAMES) if (!out.includes(f)) out.push(f);
+  return out;
+}
+
+/**
+ * (#418) Keep at most `MAX_READ_VALUES_PER_DOCUMENT` values of one document.
+ * Values of an objective-check field come first (they decide rules), then the
+ * rest in the order the model gave them. A value is kept whole or dropped
+ * whole. Pure.
+ */
+export function capReadValues(values: readonly ExtractedValue[], objectiveFields: readonly string[]): ExtractedValue[] {
+  const objective = new Set(objectiveFields);
+  const first = values.filter((v) => objective.has(v.field));
+  const rest = values.filter((v) => !objective.has(v.field));
+  return [...first, ...rest].slice(0, MAX_READ_VALUES_PER_DOCUMENT);
+}
+
+/** (#418) Options of the stage 2 builders. Both default to today's request (no caseworker read). */
+export interface ExtractionOptions {
+  // Also read the caseworker fields and the document's kind. The interactive
+  // review opts in; the per-upload document check (#115) and the bulk path do
+  // NOT, so the request they send is exactly the one they sent before #418.
+  caseworkerRead?: boolean;
+}
+
 /**
  * The output schema for stage 2. VALUES ONLY: there is no pass, fail, verdict or
  * meets property anywhere in it. A test asserts that.
+ *
+ * (#418) With `documentKind: true` (the caseworker read) it also asks for the
+ * document's kind, a fixed `enum` (DOCUMENT_KINDS): a description of the
+ * document, never a judgement of it.
  */
-export function extractionSchema(fields: readonly string[]): Record<string, unknown> {
+export function extractionSchema(fields: readonly string[], opts: { documentKind?: boolean } = {}): Record<string, unknown> {
+  const valuesSchema = {
+    type: "array",
+    items: {
+      type: "object",
+      additionalProperties: false,
+      required: ["field", "value", "unit", "page", "quote"],
+      properties: {
+        field: { type: "string", enum: [...fields] },
+        value: { type: ["string", "number", "boolean", "null"] },
+        unit: { type: ["string", "null"] },
+        page: { type: ["integer", "null"] },
+        quote: { type: ["string", "null"] },
+      },
+    },
+  };
+  if (opts.documentKind) {
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["readable", "documentKind", "values"],
+      properties: {
+        readable: { type: "boolean" },
+        documentKind: { type: "string", enum: [...DOCUMENT_KINDS] },
+        values: valuesSchema,
+      },
+    };
+  }
+  // Unchanged since before #418 (the per-upload check and the bulk path send this).
   return {
     type: "object",
     additionalProperties: false,
     required: ["readable", "values"],
     properties: {
       readable: { type: "boolean" },
-      values: {
-        type: "array",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["field", "value", "unit", "page", "quote"],
-          properties: {
-            field: { type: "string", enum: [...fields] },
-            value: { type: ["string", "number", "boolean", "null"] },
-            unit: { type: ["string", "null"] },
-            page: { type: ["integer", "null"] },
-            quote: { type: ["string", "null"] },
-          },
-        },
-      },
+      values: valuesSchema,
     },
   };
 }
@@ -359,18 +518,43 @@ const EXTRACTION_SYSTEM =
   "only report what the document says.\n" +
   DATA_ONLY_RULE;
 
-/** The request for stage 2, one document. The label is code-written; the document is attached. */
+/**
+ * (#418) The extra rules of the caseworker read: what each general field
+ * means, and how to report the document's kind. Static text (no per-request
+ * data), so the system prompt stays cacheable. Built from CASEWORKER_FIELDS.
+ */
+const CASEWORKER_READ_RULES =
+  "Also report, wherever the document holds them, these general fields (they are in the field list):\n" +
+  CASEWORKER_FIELDS.map((f) => `- ${f.field}: ${f.meaning}${f.money ? " (an amount: the number as the value, the currency as the unit when the document shows one)" : ""}`).join("\n") +
+  "\nWrite a date as YYYY-MM-DD when it is clear, otherwise as printed. A field that can occur many times " +
+  "may be reported more than once, one value per item.\n" +
+  `Set documentKind to what the document is, read from its content (not from its label): one of ${DOCUMENT_KINDS.join(", ")}. ` +
+  "Use other when none fits. This describes the document; it is not a judgement of it.";
+
+/** (#418) The system prompt of the caseworker read: the stage 2 prompt plus its rules. */
+const EXTRACTION_SYSTEM_CASEWORKER = `${EXTRACTION_SYSTEM}\n${CASEWORKER_READ_RULES}`;
+
+/**
+ * The request for stage 2, one document. The label is code-written; the document is attached.
+ *
+ * (#418) `opts.caseworkerRead` asks the SAME call for the caseworker fields and
+ * the document's kind as well (no extra request; only output tokens are
+ * added, bounded by `maxOutputTokens`). Without it the request is exactly the
+ * one sent before #418.
+ */
 export function buildExtractionRequest(
   doc: { label: string; mediaType: "application/pdf" | "image/jpeg" | "image/png"; data: string },
-  fields: readonly string[]
+  fields: readonly string[],
+  opts: ExtractionOptions = {}
 ): LlmRequest {
+  const asked = opts.caseworkerRead ? caseworkerReadFields(fields) : [...fields];
   return {
     role: "extraction",
-    system: EXTRACTION_SYSTEM,
+    system: opts.caseworkerRead ? EXTRACTION_SYSTEM_CASEWORKER : EXTRACTION_SYSTEM,
     user:
-      `Fields to report: ${fields.join(", ")}.\n` +
+      `Fields to report: ${asked.join(", ")}.\n` +
       wrapUntrusted(doc.label, "document_label"),
-    schema: extractionSchema(fields),
+    schema: extractionSchema(asked, { documentKind: opts.caseworkerRead === true }),
     documents: [{ mediaType: doc.mediaType, data: doc.data }],
     maxOutputTokens: 4_000,
     timeoutMs: 120_000,
@@ -379,18 +563,29 @@ export function buildExtractionRequest(
 
 /** Result of checking one stage 2 answer against the contract. */
 export type ExtractionParse =
-  | { ok: true; readable: boolean; values: ExtractedValue[] }
+  // (#418) `documentKind` only on the caseworker read (null when the answer gave none).
+  | { ok: true; readable: boolean; values: ExtractedValue[]; documentKind?: DocumentKind | null }
   | { ok: false; reason: string };
 
 const EXTRACTION_KEYS = new Set(["readable", "values"]);
+/** (#418) The top-level keys of a caseworker-read answer. */
+const EXTRACTION_KEYS_WITH_KIND = new Set(["readable", "documentKind", "values"]);
 const VALUE_KEYS = new Set(["field", "value", "unit", "page", "quote"]);
 
 /**
  * Check a stage 2 answer in code. Any shape mismatch (missing key, extra key,
  * wrong type, unknown field) is a FAILED extraction, never a pass. Unknown
  * fields inside an otherwise valid answer are dropped, not trusted.
+ *
+ * (#418) With `opts.documentKind` (the caseworker read) the answer may carry
+ * `documentKind`. A value outside DOCUMENT_KINDS (or not a string) is a
+ * contract break: the extraction fails, like any other. A MISSING kind reads
+ * as null ("not known"): the kind only describes the document and never
+ * decides a rule, so an answer that is otherwise valid keeps its values (the
+ * schema still marks it required, so a structured-output model always sends
+ * it). Without the option, `documentKind` is an unexpected key, as before.
  */
-export function parseExtraction(text: string, fields: readonly string[]): ExtractionParse {
+export function parseExtraction(text: string, fields: readonly string[], opts: { documentKind?: boolean } = {}): ExtractionParse {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -398,9 +593,18 @@ export function parseExtraction(text: string, fields: readonly string[]): Extrac
     return { ok: false, reason: "answer is not JSON" };
   }
   if (!isRecord(parsed)) return { ok: false, reason: "answer is not an object" };
-  for (const key of Object.keys(parsed)) if (!EXTRACTION_KEYS.has(key)) return { ok: false, reason: `unexpected key ${key}` };
+  const allowedKeys = opts.documentKind ? EXTRACTION_KEYS_WITH_KIND : EXTRACTION_KEYS;
+  for (const key of Object.keys(parsed)) if (!allowedKeys.has(key)) return { ok: false, reason: `unexpected key ${key}` };
   if (typeof parsed.readable !== "boolean") return { ok: false, reason: "readable is not a boolean" };
   if (!Array.isArray(parsed.values)) return { ok: false, reason: "values is not an array" };
+  // (#418) The kind: absent is "not known"; present must be one of the fixed kinds.
+  let documentKind: DocumentKind | null = null;
+  if (opts.documentKind && parsed.documentKind !== undefined) {
+    if (typeof parsed.documentKind !== "string" || !(DOCUMENT_KINDS as readonly string[]).includes(parsed.documentKind)) {
+      return { ok: false, reason: "documentKind is not a known kind" };
+    }
+    documentKind = parsed.documentKind as DocumentKind;
+  }
 
   const values: ExtractedValue[] = [];
   const allowed = new Set(fields);
@@ -421,7 +625,8 @@ export function parseExtraction(text: string, fields: readonly string[]): Extrac
       quote: v.quote as string | null,
     });
   }
-  return { ok: true, readable: parsed.readable, values };
+  // The kind key is only on the result of a caseworker read, so the other paths' results are unchanged.
+  return opts.documentKind ? { ok: true, readable: parsed.readable, values, documentKind } : { ok: true, readable: parsed.readable, values };
 }
 
 /** True when the extracted text or quotes address the model. Sets the suspicious flag. */
@@ -611,15 +816,56 @@ function normaliseName(name: string): string {
     .join(" ");
 }
 
+/** (#418 fix round 1) Options of `deriveHolderFact`. */
+export interface HolderFactOptions {
+  // True when `accountHolder` was in the objective fields the extraction asked
+  // for (`documentFieldsFor(rubric)` holds it, i.e. the rulebook checks
+  // `funds.holderIsApplicant`). Decides whether a document of unknown kind
+  // may give the holder fact. Defaults to true (the pre-#418 behaviour).
+  holderAskedAsObjective?: boolean;
+}
+
 /**
  * Derive the holder fact from extracted `accountHolder` values: true when the
  * holder's name matches the applicant's, false when it does not. Absent when no
  * holder was read. The check reads `funds.holderIsApplicant`.
+ * (#418 fix round 1) Read only from bank statements (or, with no known kind,
+ * when the field was an objective field); the first such holder wins.
+ * (#418 fix round 3) When the field was an objective field, a document read
+ * as `other` counts too (e.g. a fixed-deposit certificate).
  */
-export function deriveHolderFact(applicantName: string | null, docs: readonly DocumentExtraction[]): Facts {
+export function deriveHolderFact(
+  applicantName: string | null,
+  docs: readonly DocumentExtraction[],
+  opts: HolderFactOptions = {}
+): Facts {
   if (!applicantName) return {};
+  // (#418 fix round 1) Was `accountHolder` asked as an objective-check field?
+  // Defaults to true, so a caller that does not say (the bulk path, older
+  // tests) keeps the pre-#418 behaviour exactly.
+  const askedAsObjective = opts.holderAskedAsObjective ?? true;
   for (const d of docs) {
     if (!d.readable || d.failed || d.suspicious) continue;
+    // (#418 fix round 1) Only a document that IS a bank statement gives the
+    // holder fact. A document of any other known kind (a passport, a payslip,
+    // a CAS) is skipped, even if the model reported an `accountHolder` on it:
+    // otherwise a passport in the applicant's name, uploaded first, would make
+    // the check pass while the statement is in someone else's name. A document
+    // whose kind is NOT known (`documentKind` undefined: no caseworker read,
+    // e.g. the bulk path; or null: the model gave none) counts only when the
+    // field was asked as an objective field, which is the pre-#418 behaviour.
+    //
+    // (#418 fix round 3) A document read as `other` (a fixed-deposit
+    // certificate, an investment statement: a holding the rulebook may accept
+    // as funds) also counts when the field was asked as an objective field,
+    // as it did before #418. An identity or other known kind (passport,
+    // payslip, CAS...) never does.
+    if (d.documentKind != null) {
+      const holderKind = d.documentKind === "bank_statement" || (askedAsObjective && d.documentKind === "other");
+      if (!holderKind) continue;
+    } else if (!askedAsObjective) {
+      continue;
+    }
     for (const v of d.values) {
       if (v.field === "accountHolder" && typeof v.value === "string" && v.value.trim()) {
         return { "funds.holderIsApplicant": normaliseName(v.value) === normaliseName(applicantName) };
@@ -627,6 +873,598 @@ export function deriveHolderFact(applicantName: string | null, docs: readonly Do
     }
   }
   return {};
+}
+
+// ============================================
+// (#418) The document list: what was uploaded, and what was read
+// ============================================
+//
+// Before #418 the judgement and narrative calls were never told WHICH
+// documents were uploaded, only the values read from them. When no value was
+// read (an abstract rulebook field, nothing to compare), they were given
+// "(no values read from documents)" and wrote, to applicants, that readable
+// uploads were missing. Now every judgement call and the narrative call carry
+// one line per upload: a short code id (D1, D2...), the applicant-facing name,
+// the kind as read, whether it was read and, when not, a FIXED reason.
+
+/** (#418) The `failure` text document-extraction.ts gives an encrypted PDF (never sent to a model). */
+export const PASSWORD_PROTECTED_FAILURE = "the file is password protected";
+
+/** (#418) The `failure` text document-extraction.ts gives a file that is not a PDF, JPEG or PNG. */
+export const UNSUPPORTED_TYPE_FAILURE = "file type is not supported";
+
+/** (#418) One upload as the judgement and narrative calls are told about it. */
+export interface DocumentListEntry {
+  // The short code id the prompts use (D1, D2... in upload order).
+  code: string;
+  documentId: string;
+  // The applicant-facing name (`documentNamesFor`), else the code label.
+  // Applicant-derived: only ever sent inside the wrapped list.
+  name: string;
+  // The kind the model read from the content; null when unread or not given.
+  kind: DocumentKind | null;
+  // Read cleanly: readable, not failed, not suspicious.
+  read: boolean;
+  // The fixed reason when not read; null when read.
+  reason: DocumentUnreadReason | null;
+  // Read values kept for this upload (0 when not read).
+  valueCount: number;
+}
+
+/** (#418) A document whose values may be used: read, not failed, not suspicious. */
+function isCleanlyRead(d: DocumentExtraction): boolean {
+  return d.readable && !d.failed && !d.suspicious;
+}
+
+/**
+ * (#418) The fixed reason an upload was not read, from what stage 2 recorded.
+ * Never model text: a suspicious upload is "could not be used", the size,
+ * password and file-type guards keep their own words, and everything else
+ * (download failed, the model said unreadable, the call failed, the answer
+ * broke the contract) is "could not be opened or read".
+ */
+export function unreadReasonOf(d: DocumentExtraction): DocumentUnreadReason | null {
+  if (isCleanlyRead(d)) return null;
+  if (d.suspicious) return DOCUMENT_UNREAD_REASONS.unusable;
+  if (d.failure === FILE_TOO_LARGE) return DOCUMENT_UNREAD_REASONS.tooLarge;
+  if (d.failure === PASSWORD_PROTECTED_FAILURE) return DOCUMENT_UNREAD_REASONS.passwordProtected;
+  if (d.failure === UNSUPPORTED_TYPE_FAILURE) return DOCUMENT_UNREAD_REASONS.unsupportedType;
+  return DOCUMENT_UNREAD_REASONS.unreadable;
+}
+
+/**
+ * (#418 fix round 1) Make an applicant-supplied name safe as ONE field of ONE
+ * list line. The name can be the applicant's typed file name, and the
+ * sanitiser keeps newlines and `|`, so a name like "x\nD9 | read: yes" could
+ * otherwise add a fake "read" line to the list the prompts tell the model to
+ * trust. So, BEFORE the 80-character cut:
+ *  - every run of whitespace (newlines, tabs, line and paragraph separators)
+ *    becomes one space;
+ *  - the list's field delimiter `|` (and the summary's `[`/`]` code brackets)
+ *    become `/`, `(` and `)`.
+ */
+function flattenListName(name: string): string {
+  return name
+    .replace(/[\s\u2028\u2029]+/g, " ")
+    .replace(/[|¦｜]/g, "/")
+    .replace(/\[/g, "(")
+    .replace(/\]/g, ")")
+    .trim();
+}
+
+/**
+ * (#418) The document list, one entry per upload, in the order of
+ * `documents` (the job passes its extractions, one per loaded upload, so the
+ * list holds EVERY upload, read or not).
+ *
+ * @param names applicant-facing name per document id (`documentNamesFor`).
+ */
+export function documentListOf(documents: readonly DocumentExtraction[], names: Readonly<Record<string, string>> = {}): DocumentListEntry[] {
+  return documents.map((d, i) => {
+    const read = isCleanlyRead(d);
+    return {
+      code: `D${i + 1}`,
+      documentId: d.documentId,
+      name: flattenListName((names[d.documentId] ?? "").trim() || d.label || "document").slice(0, MAX_DOCUMENT_LABEL),
+      kind: read ? (d.documentKind ?? null) : null,
+      read,
+      reason: unreadReasonOf(d),
+      valueCount: read ? d.values.length : 0,
+    };
+  });
+}
+
+/** (#418) The text of the document list as sent (wrapped by the caller). */
+export function documentListText(entries: readonly DocumentListEntry[]): string {
+  if (entries.length === 0) return "(no documents uploaded)";
+  return entries
+    .map(
+      (e) =>
+        `${e.code} | name: ${e.name} | kind: ${e.kind ? e.kind.replace(/_/g, " ") : "not known"} | read: ${e.read ? "yes" : "no"}` +
+        (e.read ? "" : ` | why not: ${e.reason ?? DOCUMENT_UNREAD_REASONS.unreadable}`)
+    )
+    .join("\n");
+}
+
+/** (#418) The stored staff-only record of the list: no read values, only counts and reasons. */
+export function documentsReadOf(entries: readonly DocumentListEntry[]): DocumentReadRecord[] {
+  return entries.map((e) => ({ documentId: e.documentId, documentKind: e.kind, readable: e.read, reason: e.reason, valueCount: e.valueCount }));
+}
+
+/**
+ * (#418, fix round 1) Longest item description (a per-item field's quote)
+ * shown in the summary. Was 120 and a longer one was left out: one statement
+ * at the value cap could then take 6-7k of the 20k block. Now a longer
+ * description is cut at a word boundary to this length and marked with "…"
+ * (the value itself is never cut).
+ */
+const MAX_ITEM_DESCRIPTION_CHARS = 60;
+
+/** (#418) Characters kept free under MAX_UNTRUSTED_CHARS for the "values left out" note. */
+const SUMMARY_NOTE_RESERVE = 400;
+
+/** (#418) The extraction summary, and exactly which values it carries. */
+export interface ExtractionSummary {
+  // The text sent in the wrapped `extraction` block ("" when nothing was read).
+  text: string;
+  // The values in `text`, in order: the narrative's figure facts.
+  values: ExtractedValue[];
+  // Code ids of read documents some (or all) of whose values were left out for length.
+  leftOut: string[];
+}
+
+/** (#418 fix round 1) Options of `buildExtractionSummary`. */
+export interface ExtractionSummaryOptions {
+  // The objective-check fields (`documentFieldsFor`): their values are the
+  // LAST a document gives up when it has to shrink to its share.
+  objectiveFields?: readonly string[];
+}
+
+/** (#418 fix round 1) An item description cut to MAX_ITEM_DESCRIPTION_CHARS, at a word boundary when there is one. */
+function shortDescription(description: string): string {
+  const flat = description.replace(/\s+/g, " ").trim();
+  if (flat.length <= MAX_ITEM_DESCRIPTION_CHARS) return flat;
+  const cut = flat.slice(0, MAX_ITEM_DESCRIPTION_CHARS - 1);
+  const space = cut.lastIndexOf(" ");
+  // Cut at the last space if it keeps at least half the text, else mid-word.
+  return `${(space >= MAX_ITEM_DESCRIPTION_CHARS / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
+/** (#418) One value as a summary line: `field: value unit (page n)`, plus an item's description. */
+function summaryLine(v: ExtractedValue): string {
+  const base = `${v.field}: ${String(v.value)}${v.unit ? ` ${v.unit}` : ""}${v.page ? ` (page ${v.page})` : ""}`;
+  // A per-item field (a recurring payment, a deposit) is meaningless without
+  // what it is: its description, as printed (shortened), follows the amount.
+  const description = v.quote?.trim();
+  return CASEWORKER_PER_ITEM_FIELDS.has(v.field) && description ? `${base} | described as: ${shortDescription(description)}` : base;
+}
+
+/**
+ * (#418 fix round 1) How much a value matters when a document must shrink to
+ * its share of the block. Lower is kept first:
+ *  0 - an objective-check field (it decides a rule);
+ *  1 - any other single-value field (dates, holder, balances, totals, employer...);
+ *  2 - a per-item field (each recurring payment or deposit).
+ */
+function valuePriority(v: ExtractedValue, objective: ReadonlySet<string>): number {
+  if (objective.has(v.field)) return 0;
+  return CASEWORKER_PER_ITEM_FIELDS.has(v.field) ? 2 : 1;
+}
+
+/** (#418 fix round 1) One read document's candidate lines for the summary. */
+interface SummaryDoc {
+  code: string;
+  // The `[D1]` header and the values with their lines and sanitised sizes (+1 newline each).
+  header: string;
+  headerSize: number;
+  items: Array<{ value: ExtractedValue; line: string; size: number; priority: number; index: number }>;
+  // The whole block's size, header included.
+  fullSize: number;
+}
+
+/**
+ * (#418) The extraction summary: the read values in the existing line shape
+ * (`field: value unit (page n)`), grouped under their document's code id
+ * ("[D1]"), so the model can tie each value to an upload in the list.
+ * Only cleanly read documents add values (an unread or suspicious one adds
+ * none, as before).
+ *
+ * LENGTH (fix round 1: a FAIR SHARE per document): the summary goes into one
+ * wrapped block, which is cut at MAX_UNTRUSTED_CHARS. Before, documents were
+ * added first come first served and later ones lost ALL their values, so on a
+ * statement-heavy case the newest statements could be the ones left out. Now:
+ *  - the budget is shared out between the read documents ("water filling"):
+ *    a document smaller than an equal share keeps all its values and leaves
+ *    the rest of its share to the others; a larger one gets the share;
+ *  - a document over its share drops its lowest-priority values WHOLE
+ *    (per-item lines first, then other caseworker values; objective-check
+ *    values last, see `valuePriority`), never cutting a value, and keeps its
+ *    kept values in their original order;
+ *  - every read document with values keeps its header and as many values as
+ *    its share holds, so none loses all its values to earlier long ones;
+ *  - a closing note names the documents that gave up values. They stay in
+ *    the document list, marked read.
+ * Sizes are measured on the sanitised text (what is actually sent).
+ *
+ * @param entries the document list (for the code ids), in the same order as `documents`
+ */
+export function buildExtractionSummary(
+  entries: readonly DocumentListEntry[],
+  documents: readonly DocumentExtraction[],
+  opts: ExtractionSummaryOptions = {}
+): ExtractionSummary {
+  const budget = MAX_UNTRUSTED_CHARS - SUMMARY_NOTE_RESERVE;
+  const objective = new Set(opts.objectiveFields ?? []);
+
+  // ---- the candidate lines of each read document ----
+  const docs: SummaryDoc[] = [];
+  documents.forEach((d, i) => {
+    if (!isCleanlyRead(d) || d.values.length === 0) return;
+    const code = entries[i]?.code ?? `D${i + 1}`;
+    const header = `[${code}]`;
+    // +1 for the newline that joins lines (and blocks).
+    const headerSize = sanitizeUntrusted(header).length + 1;
+    const items = d.values.map((value, index) => {
+      const line = summaryLine(value);
+      return { value, line, size: sanitizeUntrusted(line).length + 1, priority: valuePriority(value, objective), index };
+    });
+    docs.push({ code, header, headerSize, items, fullSize: headerSize + items.reduce((n, it) => n + it.size, 0) });
+  });
+
+  // ---- each document's share of the budget (water filling) ----
+  // Smallest documents first: each takes min(its size, an equal share of what
+  // is left), so what a small document does not use goes to the larger ones.
+  const share = new Map<string, number>();
+  let left = budget;
+  const bySize = [...docs].sort((a, b) => a.fullSize - b.fullSize);
+  bySize.forEach((doc, k) => {
+    const fair = Math.floor(left / (bySize.length - k));
+    const given = Math.min(doc.fullSize, fair);
+    share.set(doc.code, given);
+    left -= given;
+  });
+
+  // ---- fit each document into its share ----
+  const blocks: string[] = [];
+  const values: ExtractedValue[] = [];
+  const leftOut: string[] = [];
+  for (const doc of docs) {
+    const allowed = share.get(doc.code) ?? 0;
+    let kept = doc.items;
+    if (doc.fullSize > allowed) {
+      // Keep values by priority (then original order) while they fit; a
+      // value that does not fit is dropped whole, a smaller later one may
+      // still fit. Then restore the original order.
+      let used = doc.headerSize;
+      const chosen: typeof doc.items = [];
+      for (const it of [...doc.items].sort((a, b) => a.priority - b.priority || a.index - b.index)) {
+        if (used + it.size > allowed) continue;
+        used += it.size;
+        chosen.push(it);
+      }
+      kept = chosen.sort((a, b) => a.index - b.index);
+      leftOut.push(doc.code);
+    }
+    if (kept.length === 0) continue;
+    blocks.push([doc.header, ...kept.map((it) => it.line)].join("\n"));
+    values.push(...kept.map((it) => it.value));
+  }
+  const note = leftOut.length > 0 ? `\n(some values of ${leftOut.join(", ")} are not shown here: too many values to send; these documents were read)` : "";
+  return { text: blocks.join("\n") + note, values, leftOut };
+}
+
+/**
+ * (#418) What the judgement and narrative prompts say about the document
+ * list. One text, so both calls are told exactly the same.
+ */
+const DOCUMENT_LIST_RULES =
+  "The document list (source documents) is what the applicant uploaded, one line per upload. " +
+  "A document marked read: yes was read, and its values are in the extraction summary under its code (D1, D2...). " +
+  "Never say that a listed document marked read is missing, was not sent or was not uploaded. " +
+  "When a document is marked read: no, say plainly that it could not be read, naming it and giving the reason shown. " +
+  "Set the values read against what the applicant says: for example, spending the applicant states against the debits on " +
+  "their statements, or a tenancy they describe against rent payments on the statements.";
+
+// ============================================
+// (#418) The narrative never says a read document is missing
+// ============================================
+
+/** (#418) One phrase that names a kind of document in narrative text. */
+interface KindPhrase {
+  // A regex source for the phrase, written with plain words and `\s+`; a
+  // trailing plural "s" is allowed by the check.
+  source: string;
+  // An acronym is matched in its own capitals only ("CAS", never "cas").
+  caseSensitive?: boolean;
+}
+
+/**
+ * (#418) THE fixed phrase list per document kind: the words a narrative uses
+ * to say that kind of document is missing ("no bank statements", "the CAS is
+ * not included", "there is no passport"). Used ONLY to drop a narrative
+ * string that says a document kind is missing when a document of that kind
+ * was read. Generic document words: none names a country or a route (an
+ * acronym listed here is a document name, kept to the words seen in real
+ * reviews). `other` has none: nothing can be said to be missing about it.
+ */
+const DOCUMENT_KIND_PHRASES: Readonly<Record<DocumentKind, readonly KindPhrase[]>> = {
+  // NOTE: "identity document" is listed under BOTH `passport` and
+  // `identity_card` on purpose: a narrative uses it for either, so a read
+  // passport OR a read identity card makes "there is no identity document" a
+  // false claim. Listing it twice only means either kind can trigger it.
+  passport: [{ source: "passport(?![-\\s]*photo)" }, { source: "travel\\s+document" }, { source: "identity\\s+document" }],
+  identity_card: [{ source: "identity\\s+card" }, { source: "ID\\s+card", caseSensitive: true }, { source: "identity\\s+document" }],
+  bank_statement: [
+    { source: "bank\\s+statement" },
+    { source: "statement\\s+of\\s+account" },
+    { source: "account\\s+statement" },
+    // (fix round 1) "statements" on its own, PLURAL only ("there are no
+    // statements to show your funds"): a narrative means bank statements by
+    // it. The singular "statement" is the applicant's own written statement
+    // in this product, so it is never a bank-statement phrase. The plural
+    // suffix the check allows adds nothing here.
+    { source: "statements" },
+  ],
+  payslip: [{ source: "pay\\s*slip" }, { source: "salary\\s+slip" }, { source: "pay\\s+stub" }],
+  employment_letter: [
+    { source: "employer(?:'s|’s)?\\s+letter" },
+    { source: "employment\\s+letter" },
+    { source: "letter\\s+from\\s+(?:your|the|an|his|her)\\s+employer" },
+    { source: "letter\\s+of\\s+employment" },
+    { source: "employment\\s+contract" },
+  ],
+  tenancy_agreement: [{ source: "tenancy\\s+agreement" }, { source: "lease(?:\\s+agreement)?" }, { source: "rental\\s+agreement" }, { source: "tenancy\\s+contract" }],
+  property_document: [{ source: "title\\s+deed" }, { source: "property\\s+document" }, { source: "deed\\s+of\\s+ownership" }],
+  sponsor_letter: [
+    { source: "sponsor(?:'s|’s)?\\s+letter" },
+    { source: "sponsorship\\s+letter" },
+    { source: "letter\\s+from\\s+(?:your|the)\\s+sponsor" },
+    { source: "sponsor\\s+(?:papers|documents)" },
+  ],
+  invitation_letter: [{ source: "invitation\\s+letter" }, { source: "letter\\s+of\\s+invitation" }],
+  study_acceptance: [
+    { source: "CAS", caseSensitive: true },
+    { source: "confirmation\\s+of\\s+acceptance" },
+    { source: "offer\\s+letter" },
+    { source: "acceptance\\s+letter" },
+    { source: "admission\\s+letter" },
+    { source: "letter\\s+of\\s+(?:admission|acceptance)" },
+  ],
+  academic_record: [{ source: "transcript" }, { source: "degree\\s+certificate" }, { source: "academic\\s+certificate" }, { source: "award\\s+letter" }, { source: "certificate\\s+of\\s+award" }],
+  tax_document: [{ source: "tax\\s+return" }, { source: "tax\\s+certificate" }, { source: "tax\\s+clearance" }],
+  business_document: [{ source: "business\\s+registration" }, { source: "certificate\\s+of\\s+incorporation" }, { source: "company\\s+registration" }],
+  relationship_document: [{ source: "birth\\s+certificate" }, { source: "marriage\\s+certificate" }],
+  travel_booking: [{ source: "flight\\s+booking" }, { source: "hotel\\s+booking" }, { source: "travel\\s+itinerary" }, { source: "booking\\s+confirmation" }],
+  insurance: [{ source: "insurance\\s+(?:policy|certificate)" }, { source: "travel\\s+insurance" }],
+  utility_bill: [{ source: "utility\\s+bill" }],
+  photo: [{ source: "photograph" }, { source: "passport\\s+photo" }],
+  other: [],
+};
+
+// ----- (#418 fix round 1) The grammar of a "this document is missing" claim -----
+//
+// Round 0 used wide character windows ("<phrase> ... up to 60 characters ...
+// not provided") and a loose "no <up to 2 words> <phrase>", and so dropped
+// ordinary caseworker reasoning: "the bank statements do not appear to show a
+// regular salary", "there are no passport stamps", "the source of the deposit
+// has not been provided", "your bank statement is missing the last two
+// months". A dropped conclusion nulls the whole narrative, so PRECISION
+// matters more than recall here: the prompt rule (DOCUMENT_LIST_RULES) is the
+// first line of defence, this check only catches the plain claims.
+//
+// So each pattern below is grammar-shaped: the kind phrase is the SUBJECT or
+// OBJECT, DIRECTLY next to the absence words (at most a determiner before it,
+// "itself"/"also"/"still" after it), and the claim must END there (end of
+// sentence or clause, or "in/among/from your uploads"). A content noun after
+// the phrase ("passport STAMPS", "bank statement ENTRIES", "CAS NUMBER"), an
+// adjective before it ("a more RECENT bank statement", "a bank statement
+// DATED within 31 days"), an object after "is missing" ("is missing THE LAST
+// TWO MONTHS") or a coverage tail ("not included FOR MARCH") all break the
+// match, so those sentences are kept. A qualified recency/coverage ask is
+// real advice while the 31-day check (#444) is open.
+
+/**
+ * A negation added AFTER a verb: " not", "n't" (isn't, wasn't, hasn't,
+ * haven't, didn't, couldn't...) or " never". It cannot spell "can't" (that
+ * would be "can" + "n't" = "cann't"), so every place that takes "can" also
+ * takes CANT below (#418 fix round 3).
+ */
+const NEG = "(?:\\s+not|n['’]t|\\s+never)";
+
+/** (#418 fix round 3) "can't", with a straight or a curly apostrophe: the one contraction NEG cannot make. */
+const CANT = "can['’]t";
+
+/** A determiner allowed directly before the kind phrase ("your", "a", "any"...). */
+const DET = "(?:(?:a|an|any|your|the|their|his|her|its|this|these|those)\\s+)";
+
+/**
+ * Where a SUBJECT may start: the start of the text or of a clause (after
+ * . ! ? ; : , ( or a newline), or after a conjunction. Lookbehinds, so the
+ * phrase stays group 1. Requiring this (instead of "anywhere") is what keeps
+ * "a more recent bank statement is missing" and "the source of the deposit
+ * has not been provided" from matching.
+ */
+const SUBJECT_START =
+  "(?:^|(?<=[.!?;:,(\\n]\\s*)|(?<=\\b(?:and|but|or|so|because|while|although|since|that|if|when|whereas|also|however)\\s+))";
+
+/** Words allowed between the subject phrase and its verb ("the CAS itself is not included"). */
+const SUBJECT_TAIL = "(?:\\s+(?:itself|themselves|also|still))?";
+
+/** The participles of "sending" a document ("not included", "not provided"...). */
+const SENT_VERB = "(?:included|provided|sent|uploaded|attached|supplied|submitted|given|received|enclosed)";
+
+/**
+ * The absence predicates after a subject phrase:
+ *  - "is/are/was/were/has/have/had not (been) <sent verb>" and contractions
+ *    ("isn't included", "hasn't been uploaded", "has never been sent");
+ *  - "is/are/was/were missing/absent" (only with nothing after it but the
+ *    end, see CLAIM_END: "is missing the last two months" is a gap, kept);
+ *  - "could not / cannot / can't be found";
+ *  - "does/do/did not appear" (only when it ends the claim: "does not appear
+ *    among your uploads"; "does not appear to show" is kept).
+ */
+const ABSENT_PREDICATE =
+  `(?:(?:is|are|was|were|has|have|had)${NEG}(?:\\s+been)?(?:\\s+yet)?\\s+${SENT_VERB}` +
+  "|(?:is|are|was|were)\\s+(?:missing|absent)" +
+  `|(?:(?:could|can)${NEG}|\\s*cannot|${CANT})\\s+be\\s+(?:found|located)` +
+  `|(?:does|do|did)${NEG}\\s+appear)`;
+
+/**
+ * The end of a missing claim: optional "yet / either / at all", then the end
+ * of the text, a clause mark, a conjunction, or a "where" tail naming the
+ * uploads ("in your upload", "among what you sent", "from the file", "with
+ * your application"). Anything else after it (an object, "for March", "to
+ * show ...") means the sentence is about content or coverage, and is kept.
+ */
+const CLAIM_END =
+  "(?:\\s+(?:yet|either|at\\s+all))?" +
+  "(?=\\s*(?:$|[.,;:!?)\\n—–-]|\\b(?:so|and|but|or|which|because)\\b" +
+  "|\\b(?:in|with|among|from|to|for)\\s+(?:your|the|this|what|any)\\s+(?:uploads?|application|documents?|files?|submission|pack|bundle|evidence|you)\\b))";
+
+/** A looser end after "there is no <phrase>": also a purpose tail ("there are no statements to show your funds"). */
+const THERE_IS_NO_END = `(?:${CLAIM_END}|(?=\\s+to\\s+(?:show|prove|support|confirm|back|evidence|check)\\b))`;
+
+/** The end after "without your <phrase>": a clause mark or a new subject ("without your bank statements we cannot..."). */
+const WITHOUT_END = "(?=\\s*(?:$|[.,;:!?)\\n]|\\b(?:we|you|it|they|there|this|i|nothing|no\\s+one|the\\s+officer|an?\\s+officer)\\b))";
+
+/** Active verbs of sending or finding a document ("you did not include", "we could not find"). */
+const ACTIVE_VERB =
+  "(?:include|included|send|sent|provide|provided|upload|uploaded|attach|attached|submit|submitted|supply|supplied|receive|received|see|seen|saw|find|found|locate|located)";
+
+/**
+ * (#418) A compiled "this kind is missing" pattern for one phrase. The
+ * regex is case-insensitive (sentence case, capitals) and captures the
+ * phrase as written in group 1; an acronym phrase is then also checked in
+ * its own capitals (`exact`), so "CAS" counts and "cas" does not.
+ */
+interface KindMissingPattern {
+  re: RegExp;
+  exact: RegExp | null;
+}
+
+/**
+ * (#418, rewritten in fix round 1) The grammar-shaped patterns for one
+ * phrase (K), each a whole-document absence claim:
+ *  1. subject:  "<det> K (itself) <absent predicate> <end>"
+ *               ("the CAS itself is not included", "your bank statement isn't
+ *               included", "a bank statement does not appear among your uploads");
+ *  2. there:    "there is/are/was/were (been) no K <end>" and "there isn't a /
+ *               aren't any K <end>" ("there is no passport or other identity
+ *               document", "there are no bank statements, payslips, ...");
+ *  3. no+verb:  "no K (was/were/has been/have been) <sent verb|found|seen> <end>"
+ *               ("no bank statement was uploaded", "no letter from your
+ *               employer was provided");
+ *  4. no+appear: "no K ... appear(s) among/in what you sent / your uploads"
+ *               (the "where" tail is strong enough to allow a short gap:
+ *               "no bank statements from Crestway Bank Plc appear among what you sent");
+ *  5. bare no:  "no K" ending the sentence ("we found no bank statement.");
+ *  6. active:   "you/we (still) did not / have not / could not / can't (CANT) / never
+ *               <active verb> <det> K <end>" ("you did not include a payslip",
+ *               "we have not received your bank statements", "we could not
+ *               find a bank statement", "we did not see any bank statements in your upload");
+ *  7. without:  "without your/any/a/the K" + a clause mark or a new subject
+ *               ("without your bank statements we cannot check the funds";
+ *               "without a doubt your bank statement ..." does not match);
+ *  8. listing:  "K: none / missing / not provided".
+ */
+function kindMissingPatterns(p: KindPhrase): KindMissingPattern[] {
+  // A trailing plural is allowed ("bank statements", "payslips"). Group 1 is the phrase as written.
+  const K = `((?:${p.source})(?:e?s)?)\\b`;
+  const exact = p.caseSensitive ? new RegExp(`^(?:${p.source})(?:e?s)?$`) : null;
+  const sources = [
+    // 1. subject + absence predicate
+    `${SUBJECT_START}${DET}?${K}${SUBJECT_TAIL}\\s+${ABSENT_PREDICATE}${CLAIM_END}`,
+    // 2. there is no K / there isn't a K
+    `\\bthere\\s+(?:is|are|was|were|has\\s+been|have\\s+been)\\s+no\\s+${K}${THERE_IS_NO_END}`,
+    `\\bthere\\s+(?:is|are|was|were)${NEG}\\s+(?:a|an|any)\\s+${K}${THERE_IS_NO_END}`,
+    // 3. no K was/were <sent verb>
+    `\\bno\\s+${K}${SUBJECT_TAIL}\\s+(?:was|were|is|are|has\\s+been|have\\s+been|had\\s+been)\\s+(?:yet\\s+)?(?:${SENT_VERB}|found|seen)${CLAIM_END}`,
+    // 4. no K ... appear(s) among what you sent
+    `\\bno\\s+${K}[^.!?;\\n]{0,60}?\\s+appear(?:s|ed)?\\s+(?:among|in)\\s+(?:what\\s+you\\s+(?:sent|uploaded|provided)|your\\s+(?:uploads|documents|files|application))\\b`,
+    // 5. bare "no K" at the end of a sentence
+    `\\bno\\s+${K}(?=\\s*(?:$|[.;!?]))`,
+    // 6. active forms
+    `\\b(?:you|we|i)\\s+(?:still\\s+)?(?:(?:did|do|does|have|has|had|could|can|were|was)${NEG}|cannot|${CANT}|never)\\s+(?:yet\\s+)?${ACTIVE_VERB}\\s+${DET}?${K}${CLAIM_END}`,
+    // 7. without your K, ...
+    `\\bwithout\\s+(?:your|any|a|an|the)\\s+${K}${WITHOUT_END}`,
+    // 8. K: none
+    `${K}\\s*:\\s*(?:none|missing|absent|not\\s+(?:provided|sent|uploaded|included))\\b`,
+  ];
+  return sources.map((src) => ({ re: new RegExp(src, "gi"), exact }));
+}
+
+/** (#418) True when one pattern finds a match (in the phrase's own capitals, for an acronym). */
+function matchesKindMissing(text: string, p: KindMissingPattern): boolean {
+  for (const m of text.matchAll(p.re)) {
+    if (!p.exact || p.exact.test(m[1])) return true;
+  }
+  return false;
+}
+
+/** (#418) The patterns per kind, built once from DOCUMENT_KIND_PHRASES. */
+const KIND_MISSING_PATTERNS: ReadonlyMap<DocumentKind, KindMissingPattern[]> = new Map(
+  DOCUMENT_KINDS.map((k) => [k, DOCUMENT_KIND_PHRASES[k].flatMap(kindMissingPatterns)])
+);
+
+/** The documents as a whole: "documents", "uploads", "files" (never "evidence", see NOTHING_READ_RES). */
+const ALL_DOCS = "(?:documents?|uploads?|files?)";
+
+/**
+ * (#418, tightened in fix round 1) Sentences that say NO document at all was
+ * read, sent or uploaded. Only a false claim when at least one document WAS
+ * read. A sentence about ONE upload that could not be read ("your second
+ * upload could not be read because it is password protected") matches none.
+ *
+ * Fix round 1: the subject must be the documents / uploads / files AS A
+ * WHOLE: never "evidence" ("no evidence has been provided to explain the cash
+ * deposits" is a point about the deposits), never with a word in between
+ * ("no OTHER documents were provided to support the sponsor's income", "no
+ * SUPPORTING documents"), and the claim must end there (CLAIM_END: "no
+ * documents were provided TO SUPPORT ..." is about one point, and is kept).
+ */
+const NOTHING_READ_RES: readonly RegExp[] = [
+  // "no documents could be read", "no documents were sent", "no files have been uploaded"
+  new RegExp(`\\bno\\s+${ALL_DOCS}\\s+(?:could|can|were|was|have|has|had)(?:\\s+not|n['’]t)?\\s+(?:be\\s+|been\\s+)?(?:read|opened|found|seen|sent|uploaded|provided|submitted|received)${CLAIM_END}`, "i"),
+  // "none of your documents could be read / were sent"
+  new RegExp(`\\bnone\\s+of\\s+(?:your|the)\\s+(?:documents|uploads|files)\\s+(?:could|can|were|was|have|has)(?:\\s+not|n['’]t)?\\s+(?:be\\s+|been\\s+)?(?:read|opened|used|sent|uploaded|provided|received)${CLAIM_END}`, "i"),
+  // "we could not read any of your documents", "cannot open your files",
+  // "we can't read any of your documents" (CANT: fix round 3)
+  new RegExp(`\\b(?:(?:could|can)(?:\\s*not|n['’]t)|${CANT})\\s+(?:read|open)\\s+(?:any\\s+(?:of\\s+)?)?(?:your|the)\\s+(?:documents|uploads|files)${CLAIM_END}`, "i"),
+  // "you have not sent any documents", "you did not upload any files"
+  new RegExp(`\\b(?:have|has|did|do)(?:\\s+not|n['’]t)\\s+(?:sent|send|uploaded|upload|provided|provide|included|include|submitted|submit)\\s+any\\s+(?:documents|files|uploads)${CLAIM_END}`, "i"),
+  // "you have sent no documents"
+  new RegExp(`\\b(?:sent|uploaded|provided|submitted|included)\\s+no\\s+(?:documents|files|uploads)${CLAIM_END}`, "i"),
+  // "nothing could be read", "nothing was read from"
+  /\bnothing\s+(?:could\s+be|was|has\s+been|can\s+be)\s+read\b/i,
+];
+
+/** (#418) What the narrative check needs about the documents: was any read, and of which kinds. */
+export interface DocumentsReadFacts {
+  anyRead: boolean;
+  kinds: readonly DocumentKind[];
+}
+
+/** (#418) The facts the narrative check needs, from the document list. */
+export function documentsReadFactsOf(entries: readonly DocumentListEntry[]): DocumentsReadFacts {
+  const read = entries.filter((e) => e.read);
+  return { anyRead: read.length > 0, kinds: [...new Set(read.map((e) => e.kind).filter((k): k is DocumentKind => k !== null))] };
+}
+
+/** (#418) The name of the narrative check below, for the count-only log. */
+export const READ_DOCUMENT_SAID_MISSING_CHECK = "read_document_said_missing";
+
+/**
+ * (#418) True when a narrative string says a document that WAS read is
+ * missing: either that no document could be read / was sent / was uploaded
+ * (when at least one was read), or that a kind of document is missing or not
+ * included ("no bank statements", "the CAS is not included", "there is no
+ * passport") when a document of that kind was read.
+ * Without `facts` (a caller with no document list) it never fires.
+ */
+export function saysReadDocumentMissing(text: string, facts: DocumentsReadFacts | undefined): boolean {
+  if (!facts || !facts.anyRead) return false;
+  if (NOTHING_READ_RES.some((re) => re.test(text))) return true;
+  return facts.kinds.some((k) => (KIND_MISSING_PATTERNS.get(k) ?? []).some((p) => matchesKindMissing(text, p)));
 }
 
 // ============================================
@@ -837,7 +1675,11 @@ export function judgementSchema(criterionIds: readonly string[]): Record<string,
   };
 }
 
-const JUDGEMENT_SYSTEM =
+/**
+ * The stage 3 system prompt, without the document list rules: the text sent
+ * before #418. Ends with a newline, so a rule block can follow it.
+ */
+const JUDGEMENT_SYSTEM_CORE =
   "You weigh an application against the rubric criteria listed below, using the " +
   "factors listed under each criterion. You report concerns and strengths with " +
   "reasons. You do not decide the outcome, do not predict a decision, and do not " +
@@ -846,8 +1688,23 @@ const JUDGEMENT_SYSTEM =
   "The statement is shown as numbered blocks, each line starting [n]. For every " +
   "statement note, set blockIndex to the number n of the one block the note is about. " +
   "Use -1 when the note concerns the statement as a whole or text that is not numbered. " +
-  "Never write a path or copy text spans.\n" +
-  DATA_ONLY_RULE;
+  "Never write a path or copy text spans.\n";
+
+/**
+ * (#418) The stage 3 system prompt of the interactive review: the core prompt
+ * plus the document list rules (what was uploaded, what was read, never say a
+ * read document is missing, name an unread one with its reason, set the read
+ * values against what the applicant says).
+ */
+export const JUDGEMENT_SYSTEM = JUDGEMENT_SYSTEM_CORE + DOCUMENT_LIST_RULES + "\n" + DATA_ONLY_RULE;
+
+/**
+ * (#418) The prompt for a request built WITHOUT a document list: exactly the
+ * text sent before #418. Only the bulk re-assessment path builds such a
+ * request (it does not pass the list yet; bringing it up to date is #445), so
+ * its requests stay byte-for-byte what they were.
+ */
+const JUDGEMENT_SYSTEM_WITHOUT_DOCUMENT_LIST = JUDGEMENT_SYSTEM_CORE + DATA_ONLY_RULE;
 
 /** Inputs for the stage 3 request. Everything applicant-derived is wrapped. */
 export interface JudgementRequestInput {
@@ -860,6 +1717,11 @@ export interface JudgementRequestInput {
   intakeSummary: string;
   extractionSummary: string;
   objectiveSummary: string;
+  // (#418) The document list (`documentListOf`), sent wrapped as `documents`
+  // with the document list rules in the system prompt. An empty list is sent
+  // as "(no documents uploaded)". Absent (the bulk path, until #445): no list
+  // and the pre-#418 prompt, so that request is unchanged.
+  documents?: readonly DocumentListEntry[];
 }
 
 /** The statement as sent to the model: numbered text and how many blocks it holds. */
@@ -916,13 +1778,17 @@ export function buildJudgementRequest(input: JudgementRequestInput): LlmRequest 
     "\n" +
     wrapUntrusted(input.intakeSummary, "intake") +
     "\n" +
+    // (#418) The uploads, read or not, right before the values read from them.
+    // Names are applicant-derived, so the whole list is wrapped.
+    (input.documents ? wrapUntrusted(documentListText(input.documents), "documents") + "\n" : "") +
     wrapUntrusted(input.extractionSummary, "extraction") +
     "\n" +
     wrapUntrusted(input.statementText ?? "(no statement)", "statement") +
     (input.otherStatementsText ? "\n" + wrapUntrusted(input.otherStatementsText, "other_statement") : "");
   return {
     role: "judgement",
-    system: JUDGEMENT_SYSTEM,
+    // (#418) The document list rules go with the list; without it, the pre-#418 prompt.
+    system: input.documents ? JUDGEMENT_SYSTEM : JUDGEMENT_SYSTEM_WITHOUT_DOCUMENT_LIST,
     user,
     schema: judgementSchema(criteria.map((c) => c.criterionId)),
     maxOutputTokens: 12_000,
@@ -1024,8 +1890,10 @@ export function parseJudgement(
  * The `failure` text the job gives a document it did NOT send to a model
  * because the rulebook has no document field to read at all. Such an upload is
  * not "unreadable" (nobody tried to read it), so it is never reported to the
- * applicant as one. The job uses this constant; the bulk path writes the same
- * text (services/ai-bulk-reassessment.service.ts), so keep the two equal.
+ * applicant as one. The bulk path writes the same text
+ * (services/ai-bulk-reassessment.service.ts), so keep the two equal.
+ * (#418) The interactive job no longer writes it: every upload is read there
+ * (the caseworker fields), even when the rulebook has no document field.
  */
 export const NO_FIELD_TO_READ = "no field to read";
 
@@ -1580,6 +2448,8 @@ export const NARRATIVE_SYSTEM =
   "- Reason about the applicant's own facts and documents. Name or briefly quote a rule only where it " +
   "matters to the point you are making, at most once. Never list the rules or go through them one by " +
   "one: the reading is about the applicant, not the rulebook.\n" +
+  // (#418) What the document list means, the same rules the judgement call is given.
+  `- ${DOCUMENT_LIST_RULES}\n` +
   "- Use only the facts given below. Copy every figure, date and amount exactly as given, in the " +
   "currency it was given in. Never convert a currency, estimate, round, add up or work out an amount " +
   "that is not written in the data.\n" +
@@ -1616,6 +2486,12 @@ export interface NarrativeRequestInput {
   extractionSummary: string;
   // Every statement's plain text (null when none).
   statementText: string | null;
+  // (#418) The document list (`documentListOf`), sent wrapped as `documents`.
+  // An empty list is sent as "(no documents uploaded)". Also read by the
+  // grounding: which kinds were read, for the "a read document is never said
+  // to be missing" check. The list is NOT a quote source. Optional so a
+  // caller without one builds the request as before (no list, no check).
+  documents?: readonly DocumentListEntry[];
   // (#408) Extra facts for the FIGURE check only. `buildNarrativeRequest`
   // never reads this field, so the text sent to the model (and its recorded
   // request hash) is the same with or without it. Optional: without it the
@@ -1697,6 +2573,8 @@ export function buildNarrativeRequest(input: NarrativeRequestInput): LlmRequest 
     "\n" +
     wrapUntrusted(input.intakeSummary, "intake") +
     "\n" +
+    // (#418) The uploads, read or not, right before the values read from them.
+    (input.documents ? wrapUntrusted(documentListText(input.documents), "documents") + "\n" : "") +
     wrapUntrusted(input.extractionSummary || "(no values read from documents)", "extraction") +
     "\n" +
     wrapUntrusted(input.statementText ?? "(no statement)", "statement");
@@ -1734,6 +2612,10 @@ export interface NarrativeGrounding {
   // checks figures and quotes can leave it out (no rule is then recognised by
   // ref or wording; generic "rule 4.2" patterns are still counted).
   rules?: NarrativeRuleRef[];
+  // (#418) Which documents were read, and of which kinds, for the check that
+  // drops a string saying a read document is missing. Optional: without it
+  // that check never fires (a caller with no document list).
+  documentsRead?: DocumentsReadFacts;
 }
 
 /** (#384) One rubric rule a narrative might cite: its ref and its published wording (either may be absent). */
@@ -1770,7 +2652,16 @@ export function narrativeGroundingOf(input: NarrativeRequestInput): NarrativeGro
     : input.extractionSummary;
   const figureApplicant = [input.profileSummary, labelIntakeAmounts(input.intakeSummary), figureExtraction, input.statementText ?? ""];
   const rules: NarrativeRuleRef[] = ruled.map((r) => ({ ref: r.ruleRef ?? null, quote: r.sourceQuote || null }));
-  return { figureSources: [...figureApplicant, ...rubricText], quoteSources: [...quotes, ...applicant], rules };
+  // (#418) The document list is deliberately in NEITHER source list: a name or
+  // file name the applicant typed is no proof of a figure, and quoting it is
+  // not quoting a document (the read values stay a source, through the
+  // extraction summary, exactly as before).
+  return {
+    figureSources: [...figureApplicant, ...rubricText],
+    quoteSources: [...quotes, ...applicant],
+    rules,
+    ...(input.documents ? { documentsRead: documentsReadFactsOf(input.documents) } : {}),
+  };
 }
 
 /**
@@ -2242,6 +3133,9 @@ export interface NarrativeParse {
   dropped: number;
   // Strings dropped because they addressed a model (stored as suspicious content).
   suspicious: number;
+  // (#418) Of `dropped`: strings dropped by the READ_DOCUMENT_SAID_MISSING_CHECK
+  // (they said a document that was read is missing). A count, for the log.
+  readDocumentSaidMissing: number;
   // Why the whole narrative is null (for the count-only log). Null when kept.
   reason: string | null;
 }
@@ -2262,7 +3156,9 @@ function stringsWithin(list: unknown, max: number): list is string[] {
  * @param grounding what figures and quotations may come from
  */
 export function parseNarrative(text: string, band: ReadinessBand, grounding: NarrativeGrounding): NarrativeParse {
-  const fail = (reason: string, dropped = 0, suspicious = 0): NarrativeParse => ({ narrative: null, dropped, suspicious, reason });
+  // (#418) `missing` counts the strings the read-document check dropped (also in `dropped`).
+  let missing = 0;
+  const fail = (reason: string, dropped = 0, suspicious = 0): NarrativeParse => ({ narrative: null, dropped, suspicious, reason, readDocumentSaidMissing: missing });
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -2281,7 +3177,7 @@ export function parseNarrative(text: string, band: ReadinessBand, grounding: Nar
 
   let dropped = 0;
   let suspicious = 0;
-  /** The four string checks, in order. Injection is counted apart (it is stored as suspicious content). */
+  /** The string checks, in order (#418 added the fifth: a read document said missing). Injection is counted apart (it is stored as suspicious content). */
   const keep = (s: string): boolean => {
     if (findInjectionSignals(s)) {
       suspicious++;
@@ -2289,6 +3185,15 @@ export function parseNarrative(text: string, band: ReadinessBand, grounding: Nar
     }
     if (findBannedWording(s) || !figuresAreGrounded(s, grounding.figureSources) || !quotationsAreGrounded(s, grounding.quoteSources)) {
       dropped++;
+      return false;
+    }
+    // (#418) READ_DOCUMENT_SAID_MISSING_CHECK: a string that says a document
+    // that WAS read is missing (or that nothing could be read) is false, and
+    // is dropped like any other failed string. A conclusion dropped here makes
+    // the narrative null, the same rule as every other check.
+    if (saysReadDocumentMissing(s, grounding.documentsRead)) {
+      dropped++;
+      missing++;
       return false;
     }
     return true;
@@ -2324,7 +3229,7 @@ export function parseNarrative(text: string, band: ReadinessBand, grounding: Nar
   const keptSteps = nextSteps.map((s) => s.trim()).filter((st) => keep(st) && withinCitationCaps(st));
   if (keptConclusion === null) return fail("the conclusion was dropped", dropped, suspicious);
   if (keptParagraphs.length === 0) return fail("every paragraph was dropped", dropped, suspicious);
-  return { narrative: { paragraphs: keptParagraphs, conclusion: keptConclusion, nextSteps: keptSteps }, dropped, suspicious, reason: null };
+  return { narrative: { paragraphs: keptParagraphs, conclusion: keptConclusion, nextSteps: keptSteps }, dropped, suspicious, reason: null, readDocumentSaidMissing: missing };
 }
 
 // ============================================

@@ -1,5 +1,13 @@
 import type { DocumentExtraction } from "./assessment-engine";
-import { buildExtractionRequest, extractionIsSuspicious, parseExtraction } from "./assessment-engine";
+import {
+  buildExtractionRequest,
+  capReadValues,
+  caseworkerReadFields,
+  extractionIsSuspicious,
+  parseExtraction,
+  PASSWORD_PROTECTED_FAILURE,
+  UNSUPPORTED_TYPE_FAILURE,
+} from "./assessment-engine";
 import type { LlmProvider, LlmRequest, LlmUsage } from "./llm-provider";
 
 // ============================================
@@ -61,6 +69,14 @@ export interface ExtractOneInput {
   bytes: Buffer;
   /** The fields to read (the extraction schema's `field` enum). */
   fields: readonly string[];
+  /**
+   * (#418) Also read the general caseworker fields (CASEWORKER_FIELDS) and the
+   * document's kind, in the SAME call (no extra request). OPT-IN: only the
+   * interactive review sets it. The per-upload document check (#115) leaves it
+   * out, so the request it sends, and the result it gets, are exactly as
+   * before #418.
+   */
+  caseworkerRead?: boolean;
   /** Page cap for a PDF. Absent means no cap (the assessment's behaviour). */
   maxPages?: number;
   /** Per-request wall-clock budget. Absent keeps the request builder's default. */
@@ -113,19 +129,23 @@ export async function extractOneDocument(input: ExtractOneInput): Promise<Extrac
 
   // ---- 1. media type from the bytes ----
   const mediaType = sniffMediaType(input.bytes);
-  if (!mediaType) return done(unreadable(base, "file type is not supported"), "unsupported_type", null, false);
+  // (#418) The failure texts are shared constants: the review maps them to its fixed "why not read" words.
+  if (!mediaType) return done(unreadable(base, UNSUPPORTED_TYPE_FAILURE), "unsupported_type", null, false);
 
   // ---- 2. cheap PDF guards, before any bytes leave the backend ----
   if (mediaType === "application/pdf") {
     const pdf = inspectPdf(input.bytes);
-    if (pdf.encrypted) return done(unreadable(base, "the file is password protected", mediaType), "password_protected", null, false);
+    if (pdf.encrypted) return done(unreadable(base, PASSWORD_PROTECTED_FAILURE, mediaType), "password_protected", null, false);
     if (input.maxPages !== undefined && pdf.pages > input.maxPages) {
       return done(unreadable(base, `the file has more than ${input.maxPages} pages`, mediaType), "too_many_pages", null, false);
     }
   }
 
   // ---- 3. the request: the SAME builder the assessment uses ----
-  const request = buildExtractionRequest({ label: input.label, mediaType, data: input.bytes.toString("base64") }, input.fields);
+  const caseworker = input.caseworkerRead === true;
+  const request = buildExtractionRequest({ label: input.label, mediaType, data: input.bytes.toString("base64") }, input.fields, { caseworkerRead: caseworker });
+  // (#418) The fields the answer may carry: the requested ones, plus the caseworker fields on that read.
+  const answerFields = caseworker ? caseworkerReadFields(input.fields) : input.fields;
   if (input.timeoutMs !== undefined) request.timeoutMs = input.timeoutMs;
   // May throw (assessment cost caps). Deliberately outside the try below.
   input.beforeCall?.(request);
@@ -136,14 +156,19 @@ export async function extractOneDocument(input: ExtractOneInput): Promise<Extrac
     if (res.stopReason === "refusal") {
       return done(failedExtraction(base, "the model declined to read the file", mediaType), "model_refused", res.usage, true, res.model);
     }
-    const parsed = parseExtraction(res.text, input.fields);
+    const parsed = parseExtraction(res.text, answerFields, { documentKind: caseworker });
     if (!parsed.ok) {
       return done(failedExtraction(base, `the answer broke the contract: ${parsed.reason}`, mediaType), "bad_answer", res.usage, true, res.model);
     }
     // A document that addresses the model is flagged; its values are then never used.
+    // Checked over EVERY value the model gave, before the cap below drops any.
     const suspicious = extractionIsSuspicious(parsed.values);
+    // (#418) The caseworker read keeps at most MAX_READ_VALUES_PER_DOCUMENT
+    // whole values (the rulebook's own fields first); the kind is recorded.
+    // The other paths keep every value and get no `documentKind` key.
+    const values = caseworker ? capReadValues(parsed.values, input.fields) : parsed.values;
     return done(
-      { ...base, mediaType, readable: parsed.readable, values: parsed.values, failed: false, failure: null, suspicious },
+      { ...base, mediaType, readable: parsed.readable, values, failed: false, failure: null, suspicious, ...(caseworker ? { documentKind: parsed.documentKind ?? null } : {}) },
       null,
       res.usage,
       true,

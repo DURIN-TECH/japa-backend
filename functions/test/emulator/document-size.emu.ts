@@ -456,6 +456,20 @@ describe("readiness review on the emulators", () => {
     // written after the findings are assembled.
     assert.equal(provider.callsFor("narrative"), 1);
     assert.equal(provider.requests.length, 16, "inside the default cap of 30");
+    // (#418) The caseworker read rides on the SAME extraction calls (still 10,
+    // no new call): each one asks for the general caseworker fields and the
+    // document's kind, and each judgement call carries the document list.
+    const { CASEWORKER_FIELD_NAMES } = await import("../../src/services/ai/assessment-engine");
+    for (const r of provider.requests.filter((x) => x.role === "extraction")) {
+      const listed = /Fields to report: ([^\n]*)\./.exec(r.user)?.[1].split(", ") ?? [];
+      for (const f of CASEWORKER_FIELD_NAMES) assert.ok(listed.includes(f), `the extraction request asks for ${f}`);
+      assert.ok((r.schema as any).properties.documentKind, "the extraction schema asks for the document kind");
+    }
+    for (const r of provider.requests.filter((x) => x.role === "judgement")) {
+      const list = /<user_uploaded_document source="documents">\n([\s\S]*?)\n<\/user_uploaded_document>/.exec(r.user)?.[1] ?? "";
+      assert.equal(list.split("\n").length, uploads.length, "the judgement request lists every upload");
+      assert.ok(list.split("\n").every((l) => / \| read: yes$/.test(l)), "every upload is listed as read");
+    }
     // The 4 MB photos went out whole, and under what the provider accepts for one image.
     const largestImage = Math.max(...provider.requests.filter((r) => r.documents?.[0]?.mediaType === "image/jpeg").map((r) => r.documents![0].data.length));
     assert.ok(largestImage > 5_000_000 && largestImage < 10_000_000);

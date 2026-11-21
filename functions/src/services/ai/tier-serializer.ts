@@ -222,6 +222,11 @@ export function serializeFull(assessment: ApplicationAssessment, role: string | 
   visible.narrative = narrativeOf(assessment);
   visible.blockingRule = blockingRuleFor(assessment);
   if (role && REQUESTER_VISIBLE_ROLES.includes(role) && requestedByName) visible.requestedByName = requestedByName;
+  // (#418) What the review read in each upload (`documentsRead`) is for staff
+  // only. Removed for every other caller, a client or a missing role alike
+  // (fail closed). The free and reading bodies are whitelists, so it never
+  // reaches them in the first place.
+  if (!role || !STAFF_ROLES.includes(role)) delete visible.documentsRead;
   // A client-role caller never sees the verdict call, nor (issue #37) what the
   // rule change was or that an agent was asked to review: the applicant sees
   // the update only as the normal stale / updated state.

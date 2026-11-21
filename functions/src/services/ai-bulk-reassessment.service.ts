@@ -58,7 +58,7 @@ import { BATCH_PRICE_MULTIPLIER, costOfUsage, rolesArePriced } from "./ai/ai-pri
 import { readAiSettings, type AiSettings } from "./ai/ai-settings";
 import { AnthropicBatchProvider, type BatchItemOutcome, type BatchRequestItem, type LlmBatchProvider } from "./ai/batch-provider";
 import type { LlmRequest, LlmUsage } from "./ai/llm-provider";
-import { ASSESSMENT_PROMPT_VERSION, findInjectionSignals } from "./ai/prompt-safety";
+import { BULK_EXTRACTION_PROMPT_VERSION, findInjectionSignals } from "./ai/prompt-safety";
 import {
   aiCaseOfficerService,
   barDateOf,
@@ -388,7 +388,9 @@ function sha256Json(value: unknown): string {
  * so a stale extraction is never read.
  */
 export function extractionKeyFor(documentId: string, updatedAtMs: number, fields: readonly string[]): string {
-  return sha256Json([documentId, updatedAtMs, [...fields].sort(), ASSESSMENT_PROMPT_VERSION, AI_MODELS.extraction]);
+  // (#418 fix round 3) The bulk path's own version, not ASSESSMENT_PROMPT_VERSION:
+  // its request did not change in #418, so stored extractions stay reusable.
+  return sha256Json([documentId, updatedAtMs, [...fields].sort(), BULK_EXTRACTION_PROMPT_VERSION, AI_MODELS.extraction]);
 }
 
 /** Position of a band in the ordered list (higher is better), or -1. */

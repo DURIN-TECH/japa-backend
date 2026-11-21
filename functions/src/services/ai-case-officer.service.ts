@@ -33,8 +33,6 @@ import {
   isJudgedBar,
   judgementCriteriaOf,
   mergeJudgementOutputs,
-  // (#308) The one "unread" reason that is not reported to the applicant.
-  NO_FIELD_TO_READ,
   // (#308) The "unread" reason that gets its own wording (a smaller file helps).
   FILE_TOO_LARGE,
   numberStatementBlocks,
@@ -47,6 +45,12 @@ import {
   narrativeGroundingOf,
   parseNarrative,
   NARRATIVE_TIMEOUT_MS,
+  // (#418) The document list, the grouped extraction summary, the stored record.
+  buildExtractionSummary,
+  CASEWORKER_MONEY_FIELDS,
+  documentListOf,
+  documentsReadOf,
+  READ_DOCUMENT_SAID_MISSING_CHECK,
   type NarrativeRequestInput,
   type AssessmentContent,
   type AssessmentInputs,
@@ -975,8 +979,13 @@ export class AiCaseOfficerService {
     // tomorrow. The count is an upper bound (a file that turns out to be
     // unreadable makes no call), which keeps the answer the same every time for
     // the same application.
+    // (#418) EVERY upload now gets its one extraction call, also on a rulebook
+    // with no objective document field (before #418 such uploads were not read
+    // at all and marked NO_FIELD_TO_READ): the call reads the general
+    // caseworker fields. So every upload is counted here, and the caps refuse
+    // an application with too many of them before any call, as before.
     const plannedJudgementCalls = planJudgementBatches(judgementCriteriaOf(rubric)).length;
-    const plannedExtractionCalls = documentFieldsFor(rubric).length > 0 ? loaded.documents.length : 0;
+    const plannedExtractionCalls = loaded.documents.length;
     if (plannedExtractionCalls > 0) {
       const roomForDocuments = settings.maxRequestsPerAssessment - plannedJudgementCalls;
       if (roomForDocuments < 1) throw new JobStop("review_too_large", REVIEW_TOO_LARGE_MESSAGE);
@@ -1040,10 +1049,8 @@ export class AiCaseOfficerService {
 
     for (const d of loaded.documents) {
       const base = { documentId: d.id, label: d.label };
-      if (fields.length === 0) {
-        extractions.push(unreadable(base, NO_FIELD_TO_READ));
-        continue;
-      }
+      // (#418) No "no field to read" skip any more: even with no objective
+      // field (`fields` empty) the call reads the caseworker fields.
       if (this.deps.now().getTime() - started > JOB_BUDGET_MS) throw new JobStop("timed_out", "the assessment ran out of time");
 
       let bytes: Buffer;
@@ -1083,6 +1090,9 @@ export class AiCaseOfficerService {
         label: d.label,
         bytes,
         fields,
+        // (#418) Opt in to the caseworker read (general fields + document kind)
+        // in the SAME call. The per-upload check (#115) does not opt in.
+        caseworkerRead: true,
         beforeCall: (request) => {
           requests++;
           // (#310) TEXT only. The attached file's base64 data is not counted
@@ -1105,7 +1115,10 @@ export class AiCaseOfficerService {
     // ---- facts the checks may read ----
     const facts: Facts = {
       ...Object.fromEntries(Object.entries(loaded.intake).map(([k, v]) => [`intake.${k}`, v as Facts[string]])),
-      ...deriveHolderFact(loaded.applicantName, extractions),
+      // (#418 fix round 1) Only a bank statement gives the holder fact; a
+      // document of unknown kind only when `accountHolder` was asked as an
+      // objective field (the pre-#418 behaviour). See deriveHolderFact.
+      ...deriveHolderFact(loaded.applicantName, extractions, { holderAskedAsObjective: fields.includes("accountHolder") }),
     };
 
     // ---- stage 2 evaluation: code decides ----
@@ -1148,13 +1161,21 @@ export class AiCaseOfficerService {
     // (#234) Only the facts the rules need reach the model (see factsSummaryForModel).
     const profileSummary = `Applicant name: ${loaded.applicantName ?? "not given"}. ${factsSummaryForModel(loaded.facts, rubric.criteria, barDate, rubric.criteria.some(isJudgedBar))}`;
     const intakeSummary = JSON.stringify(loaded.intake);
-    // (#408) The values the extraction summary is built from, kept as values
-    // (field, unit) so the narrative's FIGURE check can read a money value in
-    // its currency. The summary text itself is built exactly as before.
-    const summarisedValues = extractions.filter((e) => e.readable && !e.failed && !e.suspicious).flatMap((e) => e.values);
-    const extractionSummary = summarisedValues
-      .map((v) => `${v.field}: ${String(v.value)}${v.unit ? ` ${v.unit}` : ""}${v.page ? ` (page ${v.page})` : ""}`)
-      .join("\n");
+    // (#418) The document list: one entry per upload (read or not, with a
+    // fixed reason when not), named as the applicant knows it. Every judgement
+    // call and the narrative call get it, wrapped.
+    const documentNames = documentNamesFor(loaded.documents, fullRubric);
+    const documentList = documentListOf(extractions, documentNames);
+    // (#418) The extraction summary, grouped under each document's code id
+    // (D1...), whole documents left out when it would pass the block cap.
+    // (#408) Its values are kept as values (field, unit) so the narrative's
+    // FIGURE check can read a money value in its currency; they are exactly
+    // the values in the text, in order.
+    // (#418 fix round 1) `fields` (the objective-check fields) are kept
+    // first when a document has to give up values for its share of the block.
+    const summary = buildExtractionSummary(documentList, extractions, { objectiveFields: fields });
+    const summarisedValues = summary.values;
+    const extractionSummary = summary.text;
     if (batches.length > 0 && (extractions.length > 0 || statementText.trim().length > 0)) {
       const outputs: JudgementOutput[] = [];
       for (const batch of batches) {
@@ -1169,6 +1190,8 @@ export class AiCaseOfficerService {
           intakeSummary,
           extractionSummary,
           objectiveSummary: objective.map((r) => `${r.criterionId}: ${r.outcome}`).join("\n"),
+          // (#418) The uploads, read or not.
+          documents: documentList,
         });
         // The characters of every call count toward the same cap.
         chars += request.user.length;
@@ -1209,7 +1232,7 @@ export class AiCaseOfficerService {
       judgementFailed,
       unjudgedCriterionIds: judgement ? unjudgedCriterionIds : [],
       notAssessed,
-      documentNames: documentNamesFor(loaded.documents, fullRubric),
+      documentNames,
     });
 
     // ---- (#384) the narrative: ONE more call, after assembly ----
@@ -1228,10 +1251,14 @@ export class AiCaseOfficerService {
         intakeSummary,
         extractionSummary,
         statementText: statementText.trim() ? statementText : null,
+        // (#418) The same document list the judgement calls were given.
+        documents: documentList,
         // (#408) Grounding only: `buildNarrativeRequest` never reads it, so
         // the narrative request (and its recorded hash) is unchanged. The
-        // money fields come from the rubric the documents were read for.
-        figureFacts: { values: summarisedValues, moneyFields: moneyFieldsFor(rubric) },
+        // money fields come from the rubric the documents were read for,
+        // (#418) plus the caseworker money fields (a unitless closing balance
+        // on a naira application then reads as NGN).
+        figureFacts: { values: summarisedValues, moneyFields: [...new Set([...moneyFieldsFor(rubric), ...CASEWORKER_MONEY_FIELDS])] },
       },
     });
     // A narrative string that addressed a model is stored as suspicious content (never shown).
@@ -1248,7 +1275,8 @@ export class AiCaseOfficerService {
         ...(narrativeRun.called ? { narrative: this.deps.provider.modelFor("narrative") } : {}),
       },
       suspiciousContent,
-      { narrative: narrativeRun.narrative }
+      // (#418) `documentsRead`: the staff-only record of the list (no read values).
+      { narrative: narrativeRun.narrative, documentsRead: documentsReadOf(documentList) }
     );
   }
 
@@ -1328,7 +1356,8 @@ export class AiCaseOfficerService {
       const parsed = parseNarrative(res.text, args.input.readiness, narrativeGroundingOf(args.input));
       // Counts only, never the text: it may carry an applicant's words.
       if (parsed.dropped > 0 || parsed.suspicious > 0) {
-        console.warn(`[ai-case-officer] narrative: ${parsed.dropped} string(s) dropped by code checks, ${parsed.suspicious} suspicious`);
+        // (#418) The read-document check has its own count (part of `dropped`).
+        console.warn(`[ai-case-officer] narrative: ${parsed.dropped} string(s) dropped by code checks (${parsed.readDocumentSaidMissing} by ${READ_DOCUMENT_SAID_MISSING_CHECK}), ${parsed.suspicious} suspicious`);
       }
       return { narrative: parsed.narrative, called: true, usage, suspicious: parsed.suspicious };
     } catch (err) {
