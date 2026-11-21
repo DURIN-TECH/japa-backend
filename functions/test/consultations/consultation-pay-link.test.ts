@@ -48,6 +48,8 @@ import {
   adminRefund, admin, agent, bookingOf, client, edit, FEE_NGN, refOf, refundRows, setStatus, SLOT_DAY, SLOT_TIME, SLOT_ZONE,
 } from "./refund-fixtures";
 import { notificationService } from "../../src/services/notification.service";
+// Issue #413 (C): the shared "your consultation moved" refund copy.
+import { rescheduledRefundMessage } from "../../src/services/consultation-refund.service";
 import { consultationController } from "../../src/controllers/consultation.controller";
 import { consultationPayLinkController } from "../../src/controllers/consultation-pay-link.controller";
 import { settlePayment } from "../../src/services/consultation-charge.service";
@@ -229,6 +231,14 @@ describe("minting the link when a guest's late payment is recorded", () => {
     const notice = notified.find((n) => n.userId === client.uid && n.type === "consultation_refunded")!;
     assert.ok(notice, "the refund notice still goes in-app");
     assert.deepEqual(notice.channels, ["in_app", "push"]);
+    // Issue #413 (C) integration: the guest variant of the shared copy (it
+    // names the emailed link), word for word what the 409 message says.
+    assert.equal(notice.body, rescheduledRefundMessage({ guestBooking: true }));
+    assert.equal(
+      notice.body,
+      "Your consultation moved, so we're refunding your payment in full. Your refund is on its way. " +
+        "We've emailed you a link to pay for the new time."
+    );
   });
 
   test("the email copy says the refund is on its way and names the expiry with its timezone", async () => {
@@ -236,6 +246,8 @@ describe("minting the link when a guest's late payment is recorded", () => {
     const { payLinkEmailBody } = await import("../../src/services/consultation-pay-link.service");
     const body = payLinkEmailBody(emails[0].expiresText);
     assert.match(body, /^Your consultation moved, so we're refunding your payment in full\. Your refund is on its way\./);
+    // Issue #413 (C) integration: that first sentence IS the shared copy (no "pay again" tail).
+    assert.ok(body.startsWith(`${rescheduledRefundMessage({ bookingAwaitingPayment: false })}\n`));
     assert.match(body, /The link works for this booking only and expires on .+ \(Africa\/Lagos\)\.$/);
     // 72 h after the payment was recorded (now = 2026-11-13T10:00Z -> 16 Nov 10:00Z = 11:00 Lagos).
     assert.match(emails[0].expiresText, /^Monday,? 16 November 2026 at 11:00 \(Africa\/Lagos\)$/);
@@ -250,7 +262,12 @@ describe("minting the link when a guest's late payment is recorded", () => {
     assert.equal(links().length, 0);
     assert.equal(emails.length, 0);
     const notice = notified.find((n) => n.userId === client.uid && n.type === "consultation_refunded")!;
-    assert.equal(notice.body, "Your consultation moved, so we've refunded your payment in full. Please pay again for the new time.");
+    // Issue #413 (C): the app-client variant of the shared copy.
+    assert.equal(notice.body, rescheduledRefundMessage({ guestBooking: false }));
+    assert.equal(
+      notice.body,
+      "Your consultation moved, so we're refunding your payment in full. Your refund is on its way. Please pay again for the new time."
+    );
     assert.equal(notice.channels, undefined, "the policy's channels (email included), as before");
   });
 

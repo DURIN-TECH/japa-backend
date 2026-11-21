@@ -57,6 +57,8 @@ import { chargeRuntime, hasChargeSnapshot } from "./charge-checkout.service";
 import { slotStartsAt, DEFAULT_BOOKING_TIMEZONE, isKnownTimeZone } from "../consultations/slot-time";
 import { EMAIL_BRANDING } from "./email/branding";
 import { emailService } from "./email/email.service";
+// Issue #413 (C): the shared "your consultation moved" refund copy.
+import { rescheduledRefundMessage } from "./consultation-refund.service";
 
 // ============================================
 // 1. Constants
@@ -320,8 +322,14 @@ export function describeExpiry(expiresAt: Date, timezone: string | undefined): s
  * (`renderNotificationText` prints `<label>: <url>`). Pure.
  */
 export function payLinkEmailBody(expiresText: string): string {
+  // Issue #413 (C) integration: the "your consultation moved" sentence comes
+  // from the ONE shared copy function, so the email, the in-app notice and
+  // the verify 409 message can never drift apart. Asked WITHOUT its last
+  // "pay again" sentence (`bookingAwaitingPayment: false` returns the bare
+  // refund sentence): this email says how to pay in its own words, with the
+  // link, below.
   return (
-    "Your consultation moved, so we're refunding your payment in full. Your refund is on its way.\n" +
+    `${rescheduledRefundMessage({ bookingAwaitingPayment: false })}\n` +
     "Pay for the new time with the link below. " +
     `The link works for this booking only and expires on ${expiresText}.`
   );
