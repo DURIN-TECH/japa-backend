@@ -618,9 +618,15 @@ describe("PUT /consultations/:id — input", () => {
     assert.equal(after.supersededCheckouts.at(-1).retiredBy, "reschedule");
     // Issue #405: the move also restarts the 24-hour payment grace, from now.
     assert.equal(after.paymentGraceStartsAt.toMillis(), harness.clock.now().getTime());
+    // Issue #411: the move is counted and takes the booking out of the sweep's set-aside.
+    assert.equal(after.graceRestartCount, 1);
+    assert.equal(after.sweepSetAside, false);
     assert.deepEqual(
       Object.keys(writes[0].data).sort(),
-      [...ALL_FIELDS, "updatedAt", "supersededCheckouts", "transactionId", "checkoutUrl", "paymentGraceStartsAt"].sort()
+      [
+        ...ALL_FIELDS, "updatedAt", "supersededCheckouts", "transactionId", "checkoutUrl", "paymentGraceStartsAt",
+        "graceRestartCount", "sweepSetAside",
+      ].sort()
     );
   });
 });

@@ -2292,11 +2292,17 @@ class ConsultationService {
         const fresh = await tx.get(ref);
         if (!fresh.exists) return;
         const current = fresh.data() as Consultation;
-        if (current.sweepSetAside !== true) return;
+        // Paid or cancelled meanwhile (a verify racing this check): leave it.
+        if (current.sweepSetAside !== true || current.status !== "pending_payment" || current.paymentStatus === "paid") {
+          return;
+        }
         const merged = releasedSweepFields(current, check.records, sweepFingerprint(current));
         tx.update(ref, merged);
       });
-      return { kind: "released", consultation: await this.getConsultationById(id) };
+      const after = await this.getConsultationById(id);
+      // A verify that confirmed the booking during the check: say so.
+      if (after?.paymentStatus === "paid") return { kind: "settled", consultation: after };
+      return { kind: "released", consultation: after };
     }
     await this.recordSweepRun(id, observedFingerprint, check.records, null);
     const fresh = await this.getConsultationById(id);

@@ -737,14 +737,14 @@ export class ConsultationController {
         // Paid: the locked snapshot; free: priceUsdCents 0 and no Paystack.
         ...(charge
           ? {
-              ...charge,
-              status: "pending_payment" as const,
-              paymentStatus: "pending" as const,
-              // Issue #411: the abandoned-booking sweep selects on
-              // `sweepSetAside == false`, and Firestore never matches a
-              // missing field, so every unpaid booking starts with it.
-              sweepSetAside: false,
-            }
+            ...charge,
+            status: "pending_payment" as const,
+            paymentStatus: "pending" as const,
+            // Issue #411: the abandoned-booking sweep selects on
+            // `sweepSetAside == false`, and Firestore never matches a
+            // missing field, so every unpaid booking starts with it.
+            sweepSetAside: false,
+          }
           : { priceUsdCents: 0, status: "scheduled" as const, paymentStatus: "paid" as const }),
       };
 
@@ -1322,21 +1322,21 @@ export class ConsultationController {
       }
       const outcome = await consultationService.adminRecheckSweepReview(req.params.id);
       switch (outcome.kind) {
-        case "not_found":
-          sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
-          return;
-        case "not_set_aside":
-          sendError(res, "NOT_SET_ASIDE", "This booking is not set aside by the payment sweep.", 409);
-          return;
-        case "settled":
-          sendSuccess(res, { result: "settled", consultation: outcome.consultation });
-          return;
-        case "released":
-          sendSuccess(res, { result: "released", consultation: outcome.consultation });
-          return;
-        case "still_unresolved":
-          sendSuccess(res, { result: "still_unresolved", reason: outcome.reason, item: outcome.item });
-          return;
+      case "not_found":
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      case "not_set_aside":
+        sendError(res, "NOT_SET_ASIDE", "This booking is not set aside by the payment sweep.", 409);
+        return;
+      case "settled":
+        sendSuccess(res, { result: "settled", consultation: outcome.consultation });
+        return;
+      case "released":
+        sendSuccess(res, { result: "released", consultation: outcome.consultation });
+        return;
+      case "still_unresolved":
+        sendSuccess(res, { result: "still_unresolved", reason: outcome.reason, item: outcome.item });
+        return;
       }
     } catch (error) {
       console.error("Error re-checking a set-aside consultation:", error);
@@ -1368,38 +1368,38 @@ export class ConsultationController {
       }
       const outcome = await consultationService.adminCancelSweepBooking(req.params.id, req.userId!);
       switch (outcome.kind) {
-        case "not_found":
-          sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
-          return;
-        case "not_pending":
-          sendError(res, "NOT_PENDING", "Only an unpaid booking that is waiting for payment can be cancelled here.", 409);
-          return;
-        case "grace_running":
-          sendError(res, "GRACE_RUNNING", "This booking's payment time has not run out yet.", 409);
-          return;
-        case "paid":
-          sendError(res, "BOOKING_PAID", "A payment on this booking was just confirmed, so it was not cancelled.", 409);
-          return;
-        case "blocked":
-          if (outcome.reason === "in_progress") {
-            sendError(res, "PAYMENT_IN_PROGRESS", "A payment on this booking is still in progress at Paystack.", 409);
-          } else if (outcome.reason === "review") {
-            sendError(
-              res,
-              "PAYMENT_NEEDS_REVIEW",
-              "A payment on this booking could not be applied (for example a wrong amount) and needs review first.",
-              409
-            );
-          } else {
-            sendError(res, "PAYSTACK_ERROR", "Paystack could not be asked about this booking's payments. Try again.", 502);
-          }
-          return;
-        case "changed":
-          sendError(res, "BOOKING_CHANGED", "This booking changed while it was being checked. Try again.", 409);
-          return;
-        case "cancelled":
-          sendSuccess(res, { cancelled: true, consultation: outcome.consultation });
-          return;
+      case "not_found":
+        sendError(res, "NOT_FOUND", ErrorMessages.NOT_FOUND, 404);
+        return;
+      case "not_pending":
+        sendError(res, "NOT_PENDING", "Only an unpaid booking that is waiting for payment can be cancelled here.", 409);
+        return;
+      case "grace_running":
+        sendError(res, "GRACE_RUNNING", "This booking's payment time has not run out yet.", 409);
+        return;
+      case "paid":
+        sendError(res, "BOOKING_PAID", "A payment on this booking was just confirmed, so it was not cancelled.", 409);
+        return;
+      case "blocked":
+        if (outcome.reason === "in_progress") {
+          sendError(res, "PAYMENT_IN_PROGRESS", "A payment on this booking is still in progress at Paystack.", 409);
+        } else if (outcome.reason === "review") {
+          sendError(
+            res,
+            "PAYMENT_NEEDS_REVIEW",
+            "A payment on this booking could not be applied (for example a wrong amount) and needs review first.",
+            409
+          );
+        } else {
+          sendError(res, "PAYSTACK_ERROR", "Paystack could not be asked about this booking's payments. Try again.", 502);
+        }
+        return;
+      case "changed":
+        sendError(res, "BOOKING_CHANGED", "This booking changed while it was being checked. Try again.", 409);
+        return;
+      case "cancelled":
+        sendSuccess(res, { cancelled: true, consultation: outcome.consultation });
+        return;
       }
     } catch (error) {
       console.error("Error cancelling a set-aside consultation:", error);
@@ -2235,14 +2235,14 @@ export class ConsultationController {
         // Paid: the locked snapshot; free: priceUsdCents 0 and no Paystack.
         ...(charge
           ? {
-              ...charge,
-              status: "pending_payment" as const,
-              paymentStatus: "pending" as const,
-              // Issue #411: the abandoned-booking sweep selects on
-              // `sweepSetAside == false`, and Firestore never matches a
-              // missing field, so every unpaid booking starts with it.
-              sweepSetAside: false,
-            }
+            ...charge,
+            status: "pending_payment" as const,
+            paymentStatus: "pending" as const,
+            // Issue #411: the abandoned-booking sweep selects on
+            // `sweepSetAside == false`, and Firestore never matches a
+            // missing field, so every unpaid booking starts with it.
+            sweepSetAside: false,
+          }
           : { priceUsdCents: 0, status: "scheduled" as const, paymentStatus: "paid" as const }),
       });
 
