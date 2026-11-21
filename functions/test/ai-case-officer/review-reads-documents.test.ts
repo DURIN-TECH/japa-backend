@@ -54,8 +54,12 @@ import {
 } from "../../src/services/ai/assessment-engine";
 import { extractOneDocument } from "../../src/services/ai/document-extraction";
 import { CHECK_FIELDS } from "../../src/services/ai/document-check-engine";
-import { ASSESSMENT_PROMPT_VERSION, DATA_ONLY_RULE, DOCUMENT_CHECK_PROMPT_VERSION, MAX_UNTRUSTED_CHARS, wrapUntrusted } from "../../src/services/ai/prompt-safety";
+import { ASSESSMENT_PROMPT_VERSION, BULK_EXTRACTION_PROMPT_VERSION, DATA_ONLY_RULE, DOCUMENT_CHECK_PROMPT_VERSION, MAX_UNTRUSTED_CHARS, wrapUntrusted } from "../../src/services/ai/prompt-safety";
 import { DocumentCheckService } from "../../src/services/ai/document-check.service";
+// (fix round 3) The bulk path's extraction cache key and its version.
+import { createHash } from "crypto";
+import { extractionKeyFor } from "../../src/services/ai-bulk-reassessment.service";
+import { AI_MODELS } from "../../src/services/ai/ai-models";
 import { fakeCollection, fakeRunTransaction } from "../helpers/fake-firestore";
 import { DEFAULT_AI_SETTINGS } from "../../src/services/ai/ai-settings";
 import { envelope } from "../../src/services/ai/tier-serializer";
@@ -234,6 +238,28 @@ describe("#418 the caseworker read (extraction request and parse)", () => {
     assert.deepEqual(deriveHolderFact("Ada Lovelace", [passport, own], { holderAskedAsObjective: true }), { "funds.holderIsApplicant": true });
   });
 
+  // ----- (fix round 3) a document read as `other` counts when accountHolder is objective -----
+
+  test("a document read as `other` (a fixed-deposit certificate) gives the holder fact only when accountHolder was asked as an objective field", () => {
+    const deposit = ext("d-fd", [{ field: "accountHolder", value: "Ada Lovelace" }], { documentKind: "other" });
+    assert.deepEqual(deriveHolderFact("Ada Lovelace", [deposit], { holderAskedAsObjective: true }), { "funds.holderIsApplicant": true });
+    assert.deepEqual(deriveHolderFact("Ada Lovelace", [deposit], { holderAskedAsObjective: false }), {});
+    // Someone else's certificate is a holder mismatch, as for a statement.
+    const theirs = ext("d-fd2", [{ field: "accountHolder", value: "Charles Babbage" }], { documentKind: "other" });
+    assert.deepEqual(deriveHolderFact("Ada Lovelace", [theirs], { holderAskedAsObjective: true }), { "funds.holderIsApplicant": false });
+  });
+
+  test("identity and other known kinds never give the holder fact, even when accountHolder is objective", () => {
+    for (const kind of ["passport", "payslip", "study_acceptance", "employment_letter"] as const) {
+      const d = ext(`d-${kind}`, [{ field: "accountHolder", value: "Ada Lovelace" }], { documentKind: kind });
+      assert.deepEqual(deriveHolderFact("Ada Lovelace", [d], { holderAskedAsObjective: true }), {}, kind);
+    }
+    // A passport in the applicant's name first, someone else's `other` holding second: the holding decides.
+    const passport = ext("d-pass", [{ field: "accountHolder", value: "Ada Lovelace" }], { documentKind: "passport" });
+    const theirs = ext("d-fd", [{ field: "accountHolder", value: "Charles Babbage" }], { documentKind: "other" });
+    assert.deepEqual(deriveHolderFact("Ada Lovelace", [passport, theirs], { holderAskedAsObjective: true }), { "funds.holderIsApplicant": false });
+  });
+
   test("a document of unknown kind gives the holder fact only when accountHolder was asked as an objective field (the pre-#418 behaviour)", () => {
     const unknownNull = ext("d1", [{ field: "accountHolder", value: "Ada Lovelace" }], { documentKind: null });
     const unknownUndefined = ext("d2", [{ field: "accountHolder", value: "Ada Lovelace" }], { documentKind: undefined });
@@ -285,6 +311,17 @@ describe("#418 the other paths do not opt in", () => {
     } finally {
       firebase.collections.documentChecks = saved;
     }
+  });
+
+  test("(fix round 3) the bulk extraction cache key keeps the pre-#418 version, so stored bulk extractions are reused", () => {
+    assert.equal(BULK_EXTRACTION_PROMPT_VERSION, "assessment-2026-11-16.1");
+    assert.notEqual(BULK_EXTRACTION_PROMPT_VERSION, ASSESSMENT_PROMPT_VERSION, "not the bumped assessment version");
+    const keyWith = (version: string) =>
+      createHash("sha256").update(JSON.stringify(["doc-1", 1700000000000, ["accountHolder", "closingBalance"], version, AI_MODELS.extraction])).digest("hex");
+    // Field order does not matter; the key is the one a pre-#418 run stored.
+    const key = extractionKeyFor("doc-1", 1700000000000, ["closingBalance", "accountHolder"]);
+    assert.equal(key, keyWith("assessment-2026-11-16.1"));
+    assert.notEqual(key, keyWith(ASSESSMENT_PROMPT_VERSION));
   });
 
   test("a judgement request built without a document list (the bulk path) is the pre-#418 request", () => {
@@ -512,6 +549,15 @@ describe("#418 the narrative never says a read document is missing", () => {
     { text: "We could not find a bank statement.", kind: "bank_statement", drop: true },
     { text: "Your passport was not sent.", kind: "passport", drop: true },
     { text: "the passport is not provided", kind: "passport", drop: true },
+    // (fix round 3) "can't", straight and curly apostrophe (NEG cannot spell it)
+    { text: "We can't see a payslip.", kind: "payslip", drop: true },
+    { text: "We can’t find your bank statement.", kind: "bank_statement", drop: true },
+    { text: "Your passport can't be found.", kind: "passport", drop: true },
+    { text: "We can't read any of your documents.", kind: "*", drop: true },
+    { text: "We can’t open your files.", kind: "*", drop: true },
+    // ...and the content forms with "can't" are still kept
+    { text: "We can't see a salary on your bank statement.", kind: "bank_statement", drop: false },
+    { text: "We can't find any large deposits on your bank statement.", kind: "bank_statement", drop: false },
     // ---- KEEP: content or coverage of a read document ----
     { text: "The bank statements do not appear to show a regular salary.", kind: "bank_statement", drop: false },
     { text: "Your passport does not appear to have enough blank pages.", kind: "passport", drop: false },
