@@ -626,6 +626,12 @@ export const pollProcessingConsultationRefunds = functions
  * Secrets: PAYSTACK_SECRET_KEY (transaction verify). Query: equality on
  * `paystackFeeStatus` ordered by `createdAt` asc (composite index in
  * firestore.indexes.json).
+ *
+ * Issue #393: despite its name, this job also resolves the Paystack fee of
+ * paid PAYMENT REQUESTS (`escrow_release` rows): it picks every fee-tracked
+ * type (`PAYSTACK_FEE_TRACKED_TYPES`), not only consultations. The deployed
+ * function name is kept as it is (renaming a scheduled function deletes and
+ * recreates it).
  */
 export const resolveConsultationPaystackFees = functions
   .runWith({ timeoutSeconds: 300, memory: "256MB", secrets: ["PAYSTACK_SECRET_KEY"] })

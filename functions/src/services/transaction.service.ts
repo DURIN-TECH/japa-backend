@@ -33,7 +33,7 @@ import {
 // Issue #317: a consultation fee is HELD until the meeting has happened.
 import { feeHoldStatusAt } from "../money/fee-hold";
 // Issue #395: the agent is credited A - Paystack's fee (one shared rule).
-import { consultationFeeCredit, PaystackFeeClassification, paystackFeeFields } from "../money/paystack-fee";
+import { isPaystackFeeTracked, PaystackFeeClassification, paystackFeeCredit, paystackFeeFields } from "../money/paystack-fee";
 
 export interface TransactionFilters {
   status?: TransactionStatus;
@@ -475,7 +475,7 @@ class TransactionService {
    *    `revenueEffect`) and `availableBalance` of its own currency from the
    *    moment it is written, never `heldBalance`, never pending payments;
    *  - (issue #395) a settled `consultation_fee` counts what it CREDITS the
-   *    agent: A - Paystack's fee F (`consultationFeeCredit`), in `heldBalance`
+   *    agent: A - Paystack's fee F (`paystackFeeCredit`), in `heldBalance`
    *    while held and in `availableBalance` once released. A fee whose
    *    Paystack fee is unknown (or not less than A) counts in NEITHER
    *    balance, nor in revenue, and releasing the meeting hold does not make
@@ -596,14 +596,17 @@ class TransactionService {
         continue;
       }
       if (!isSettled(txn)) continue;
-      if (txn.type === "consultation_fee") {
-        // Issue #395: the agent's credit is A - Paystack's fee. A fee that
-        // cannot be worked out yet credits nothing, held or released.
-        const credit = consultationFeeCredit(txn);
+      if (isPaystackFeeTracked(txn.type)) {
+        // Issue #395 / #393 (review round 1: ONE branch for every
+        // fee-tracked type, `PAYSTACK_FEE_TRACKED_TYPES`): the agent's credit
+        // is A - Paystack's fee. A fee that cannot be worked out yet credits
+        // nothing, held, released or (a payment request) available.
+        const credit = paystackFeeCredit(txn);
         if (credit === null) {
           // Issue #413 (I): credited nobody, but the client paid A. A fee
           // Paystack reported as the whole charge or more is Paystack's (it
-          // kept all of A); any other row's fee is still unknown.
+          // kept all of A); any other row's fee is still unknown (`unknown`
+          // or `set_aside`). The same for a consultation and a payment request.
           if (txn.paystackFeeStatus === "fee_not_less_than_amount" && typeof txn.paystackFeeMinor === "number") {
             paystackFees.add(currency, txn.amount);
           } else {
@@ -613,22 +616,17 @@ class TransactionService {
         }
         // The fee Paystack kept, for the admin breakdown (0 on a legacy row).
         paystackFees.add(currency, txn.amount - credit);
-        const hold = feeHoldStatusAt(txn, at);
-        if (hold === "held") held.add(currency, credit);
-        else if (hold === "released") available.add(currency, credit);
-        // "refunded": given back out of the hold, counted nowhere.
-        continue;
-      }
-      if (txn.type === "escrow_release") {
-        // Issue #393: a paid payment request credits the agent A - Paystack's
-        // fee, available at once (it has no meeting hold, as before #393).
-        // A row whose fee is unknown (or not less than A) credits NOTHING, so
-        // it can never be withdrawn; a legacy row (no fee status) counts A.
-        const credit = consultationFeeCredit(txn);
-        if (credit === null) continue;
-        // The fee Paystack kept, for the admin breakdown (0 on a legacy row).
-        paystackFees.add(currency, txn.amount - credit);
-        available.add(currency, credit);
+        if (txn.type === "consultation_fee") {
+          // A consultation fee is held until its meeting (#317).
+          const hold = feeHoldStatusAt(txn, at);
+          if (hold === "held") held.add(currency, credit);
+          else if (hold === "released") available.add(currency, credit);
+          // "refunded": given back out of the hold, counted nowhere.
+        } else {
+          // Issue #393: a paid payment request (`escrow_release`) has no
+          // meeting hold: A - F is available at once, as before #393.
+          available.add(currency, credit);
+        }
         continue;
       }
       // Any other settled incoming payment is available straight away.

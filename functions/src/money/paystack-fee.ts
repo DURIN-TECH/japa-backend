@@ -125,6 +125,15 @@ export function consultationFeeCredit(
 }
 
 /**
+ * Review round 1 of #393: the same rule under a name that says what it
+ * covers: the agent's credit (A - F, null while it cannot be worked out, A
+ * on a legacy row) for ANY fee-tracked Transaction (a consultation fee, and
+ * since #393 a payment request's `escrow_release`), not only consultations.
+ * `consultationFeeCredit` stays for the consultation code that already uses it.
+ */
+export const paystackFeeCredit = consultationFeeCredit;
+
+/**
  * Issue #413 (D): whether a fee status means "Paystack's fee is not known
  * yet": "unknown", or "set_aside" (an unknown row the scheduled job stopped
  * picking). Both count EXACTLY alike everywhere (credited nowhere, nothing

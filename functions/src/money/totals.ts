@@ -2,7 +2,7 @@ import type { CurrencyCode } from "../types/money";
 import type { Transaction, TransactionStatus } from "../types";
 import { normalizeCurrencyCode } from "./currencies";
 // Issue #395: what a consultation fee credits the agent (A - Paystack's fee).
-import { consultationFeeCredit } from "./paystack-fee";
+import { isPaystackFeeTracked, paystackFeeCredit } from "./paystack-fee";
 
 // ============================================
 // PER-CURRENCY TOTALS (issue #282)
@@ -205,7 +205,9 @@ export function revenueEffect(
   // (A - Paystack's fee), or nothing while that cannot be worked out.
   // Issue #393: a paid payment request (`escrow_release`) follows the same
   // rule: A - F, nothing while unknown, A on a legacy row (no fee status).
-  if (txn.type === "consultation_fee" || txn.type === "escrow_release") return consultationFeeCredit(txn) ?? 0;
+  // Review round 1: every fee-tracked type (`PAYSTACK_FEE_TRACKED_TYPES`),
+  // so the one list decides the job, the balance and revenue alike.
+  if (isPaystackFeeTracked(txn.type)) return paystackFeeCredit(txn) ?? 0;
   // Issue #390: a refund takes off revenue what it takes off the AGENT
   // (`agentReversalMinor`), which may differ from what the client got back
   // (Paystack keeps its fee). Older rows have none: `amount`, as before.

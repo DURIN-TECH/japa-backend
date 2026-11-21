@@ -338,6 +338,34 @@ describe("settle with a known fee", () => {
     assert.equal(ngn.grossRevenue, A);
   });
 
+  test("review round 1: admin gross counts an unresolved payment request too (unknown, set aside, F >= A), as a consultation", async () => {
+    // Unknown at settle.
+    await paidNgn(undefined);
+    let ngn = await balanceOf(admin, "NGN", { role: "admin" });
+    assert.deepEqual(
+      [ngn.totalRevenue, ngn.paystackFees, ngn.unknownFeeAmount, ngn.grossRevenue],
+      [0, 0, A, A],
+      "credited nobody, but the client paid A: counted as unknown"
+    );
+    // Set aside by the job: still unknown in the admin figures.
+    paystackFeeJobConfig.maxJobLookups = 1;
+    try {
+      await paystackFeeService.resolveUnknownFees();
+    } finally {
+      paystackFeeJobConfig.maxJobLookups = PAYSTACK_FEE_MAX_JOB_LOOKUPS;
+    }
+    assert.equal(paymentTxns()[0].paystackFeeStatus, "set_aside");
+    ngn = await balanceOf(admin, "NGN", { role: "admin" });
+    assert.deepEqual([ngn.totalRevenue, ngn.paystackFees, ngn.unknownFeeAmount, ngn.grossRevenue], [0, 0, A, A]);
+
+    // F >= A: Paystack kept all of A (its fee), nothing unknown.
+    await resetPaymentRequests();
+    await paidNgn(A);
+    ngn = await balanceOf(admin, "NGN", { role: "admin" });
+    assert.deepEqual([ngn.totalRevenue, ngn.paystackFees, ngn.unknownFeeAmount, ngn.grossRevenue], [0, A, 0, A]);
+    assert.equal(ngn.availableBalance, 0, "never withdrawable");
+  });
+
   test("stats and analytics revenue agree (shared revenueEffect)", async () => {
     await paidNgn(F);
     await paidNgn(undefined);
