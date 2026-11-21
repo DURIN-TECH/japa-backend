@@ -458,7 +458,7 @@ export class RubricStore {
    * the version already exists. Running the tool twice never creates n + 2.
    *
    * @returns `{ written: true, version }`, or `{ written: false, version, reason }`
-   *   with `reason` a code word: `already_exists` (n + 1 is already the latest),
+   *   with `reason` a code word: `already_exists` (a version n + 1 is already the latest; its content is not compared with this draft),
    *   `no_head`, `head_moved` (the head no longer points at the base for both
    *   approved and latest), `base_missing`, `base_not_approved`,
    *   `base_changed` (the stored base's content is not the one the caller built
@@ -522,7 +522,11 @@ export class RubricStore {
       const baseData = await this.readVersionDataInTx(tx, routeKey, base, baseSnap.data());
       if (derivedBaseFingerprint(baseData) !== opts.baseFingerprint) return { written: false as const, version: head.latestVersion, reason: "base_changed" as const };
       // Only a version over the SAME snapshots may take this path (the hash gate stays the rule for new sources).
-      if (head.latestSourceSetHash !== draft.sourceSetHash) return { written: false as const, version: head.latestVersion, reason: "source_set_differs" as const };
+      // (Fix round 1) Both hashes must be present (two missing hashes are not "the same sources"), and the draft's
+      // snapshot list must be the base's own, so the store itself guarantees "over the same sources".
+      if (!draft.sourceSetHash || !head.latestSourceSetHash || head.latestSourceSetHash !== draft.sourceSetHash || stableJson(draft.sourceSnapshots ?? []) !== stableJson(baseData.sourceSnapshots ?? [])) {
+        return { written: false as const, version: head.latestVersion, reason: "source_set_differs" as const };
+      }
       // Immutability: the head says n + 1 does not exist yet; a document there anyway is refused, never replaced.
       if (existing.exists) throw new RubricStoreError("version_exists", `rubric version ${routeKey}/${version} already exists`);
 

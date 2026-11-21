@@ -111,6 +111,18 @@ describe("(#440) the derived pending write", () => {
     assert.equal(((await rubricStore.writeDerivedPendingVersion(draft(), { baseVersion: 1, baseFingerprint: FP })) as any).reason, "no_head");
   });
 
+  test("(fix round 1) the same sources at the store level: missing hashes, or a snapshot list unlike the base's, are refused", async () => {
+    // Both hashes missing: never read as "the same".
+    resetStore();
+    seed({ latestSourceSetHash: undefined });
+    assert.equal(((await rubricStore.writeDerivedPendingVersion(draft({ sourceSetHash: undefined }), { baseVersion: 1, baseFingerprint: FP })) as any).reason, "source_set_differs");
+    // The hash agrees but the draft lists another snapshot than the stored base.
+    resetStore();
+    seed();
+    assert.equal(((await rubricStore.writeDerivedPendingVersion(draft({ sourceSnapshots: [{ sourceId: "s", contentHash: "other" }] }), { baseVersion: 1, baseFingerprint: FP })) as any).reason, "source_set_differs");
+    assert.equal(versionDoc(KEY, 2), undefined);
+  });
+
   test("never overwrites: a version 2 document that exists although the head does not point at it is refused", async () => {
     seed();
     store.set(`visaRubrics/${KEY}/rubricVersions/2`, { reviewStatus: "rejected", marker: "keep me" });

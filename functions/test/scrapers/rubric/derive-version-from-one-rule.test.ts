@@ -24,11 +24,13 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { deriveVersion, keptResultOf, planLines, projectProblem, rulesThatDiffer, runDerive, type DeriveRunDeps } from "../../../src/scrapers/rubric/scripts/derive-version-from-one-rule";
-import { RubricCheckerService } from "../../../src/scrapers/rubric/rubric-checker";
+import { RubricCheckerService, viewOf } from "../../../src/scrapers/rubric/rubric-checker";
+import { lexiconFor } from "../../../src/scrapers/language/language-lexicon";
 import { SnapshotQuoteIndex } from "../../../src/scrapers/rubric/rubric-quote";
 import { readLeadInList } from "../../../src/scrapers/rubric/rubric-list-items";
 import { RUBRIC_REVIEW_FIELDS, type AssessmentCriterion, type RubricHead, type VisaRubric } from "../../../src/types/rubric";
 import { MemoryLedger, ScriptedProvider, isTriggerRequest, seenRules, settingsWith } from "./checker-fakes";
+import { DEFAULT_PUBLISH_SETTINGS, type LoadedPublishSettings } from "../../../src/scrapers/rubric/rubric-publish-settings";
 import { DESTINATIONS, HEAD, ID, KEY, LEAD25, LEAD32, LEAD5, PAGE, PLAIN, POLARITY_LINE, UNREADABLE, outFor, version1 } from "./derive-version-fixtures";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -265,12 +267,12 @@ describe("(#440) the dry run: what version 2 contains and what its publish would
     assert.equal(s.alreadyExists, true);
     assert.equal(s.written, false);
     assert.equal(writes.length, 0);
-    assert.ok(d.lines.some((l) => l.includes("version 2 already exists")));
+    assert.ok(d.lines.some((l) => l.includes("a version 2 already exists on the target (not compared with this build)")));
   });
 
   test("with --write the draft goes to the store's narrow write with the base's fingerprint", async () => {
     const calls: any[] = [];
-    const d = depsOf(HEAD(), { writeDerived: async (draft, o) => (calls.push({ draft, o }), { written: true, version: 2 }) });
+    const d = depsOf(HEAD(), { writeDerived: async (draft, o) => (calls.push({ draft, o }), { written: true, version: 2 }), readPublishSettings: manual });
     const v1 = version1();
     const s = await runDerive({ v1, out: await outFor(v1), snapshot: PAGE }, { write: true }, d);
     assert.equal(s.written, true);
@@ -280,5 +282,94 @@ describe("(#440) the dry run: what version 2 contains and what its publish would
     assert.equal(calls[0].o.baseFingerprint, derivedBaseFingerprint(v1));
     assert.equal(calls[0].draft.reviewStatus, "pending_review");
     assert.equal(calls[0].draft.createdAt, "now");
+  });
+});
+
+// ============================================
+// (#440 fix round 1) The write refuses while automatic publishing covers this route
+// ============================================
+
+/** Publish settings as the loader returns them (the mode and allow-list overridable; `readError` for a failed read). */
+const publishSettings = (over: Partial<LoadedPublishSettings["settings"]> = {}, readError?: string) => async (): Promise<LoadedPublishSettings> =>
+  ({ settings: { ...DEFAULT_PUBLISH_SETTINGS, ...over }, exists: true, problems: [], ...(readError !== undefined ? { readError } : {}) });
+const manual = publishSettings({ mode: "manual" });
+
+describe("(#440 fix round 1) auto_publish_on: no version 2 while the trigger or the sweep would check it without reuse", () => {
+  /** A write run over the given settings reader; returns the summary, the printed lines and the writes made. */
+  async function writeWith(readPublishSettings: DeriveRunDeps["readPublishSettings"], write = true) {
+    const writes: unknown[] = [];
+    const d = depsOf(HEAD(), { writeDerived: async (x) => (writes.push(x), { written: true, version: 2 }), ...(readPublishSettings ? { readPublishSettings } : {}) });
+    const s = await runDerive({ v1: version1(), out: await outFor(), snapshot: PAGE }, { write }, d);
+    return { s, lines: d.lines, writes };
+  }
+
+  test("mode auto with this route allowed (no allow-list, or one naming it): refused, nothing written", async () => {
+    for (const reader of [publishSettings({ mode: "auto" }), publishSettings({ mode: "auto", routeAllowlist: [KEY] })]) {
+      const { s, lines, writes } = await writeWith(reader);
+      assert.equal(s.refusal, "auto_publish_on");
+      assert.equal(writes.length, 0);
+      assert.ok(lines.includes("refused (auto_publish_on); nothing was written."));
+    }
+  });
+
+  test("settings that cannot be read, a reader that throws, or no reader at all: refused (fail closed)", async () => {
+    for (const reader of [publishSettings({ mode: "manual" }, "unavailable"), async () => { throw new Error("read failed"); }, undefined]) {
+      const { s, writes } = await writeWith(reader as any);
+      assert.equal(s.refusal, "auto_publish_on");
+      assert.equal(writes.length, 0);
+    }
+  });
+
+  test("manual mode, or auto mode with an allow-list that leaves this route out: the write goes ahead", async () => {
+    for (const reader of [manual, publishSettings({ mode: "auto", routeAllowlist: ["QM_route-one"] })]) {
+      const { s, writes } = await writeWith(reader);
+      assert.equal(s.refusal, null);
+      assert.equal(s.written, true);
+      assert.equal(writes.length, 1);
+    }
+  });
+
+  test("the dry run prints the refusal as a line and goes on (nothing written either way)", async () => {
+    const { s, lines, writes } = await writeWith(publishSettings({ mode: "auto" }), false);
+    assert.equal(s.refusal, null);
+    assert.equal(writes.length, 0);
+    assert.ok(lines.some((l) => l.startsWith("a write would be refused (auto_publish_on: publish mode auto and this route allowed)")));
+    assert.ok(lines.some((l) => l.startsWith("(dry run: nothing was written")) || lines.some((l) => l.includes("dry run: nothing was written")));
+  });
+});
+
+describe("(#440 fix round 1) a rule whose list lines changed is asked again", () => {
+  test("version 1 checked when its cut lists were accepted (as on the real record); version 2 re-reads one: only that rule is asked", async () => {
+    const v1 = version1();
+    const ledger = new MemoryLedger();
+    const svc1 = new RubricCheckerService({ provider: () => new ScriptedProvider(), readSnapshot: async () => PAGE, loadSettings: settingsWith(), ledger, nowMs: () => Date.parse("2026-11-21T10:00:00Z"), sleep: async () => undefined });
+    // The list reader of version 1's time accepted a list cut to "(a)": every rule whose quote is found had a
+    // view and got letters (the real version 1 record has letters for its cut-list rules). Simulated for the
+    // version 1 run only by showing every found quote.
+    const index = new SnapshotQuoteIndex(PAGE, lexiconFor("en"));
+    (svc1 as any).buildViews = async (rules: AssessmentCriterion[], _i: unknown, rubric?: VisaRubric) => {
+      const m = new Map();
+      for (const r of rules) {
+        const f = index.locate(r.source.quote);
+        if (f.ok) m.set(r.criterionId, viewOf(r, index, f, rubric?.intakeQuestions ?? []));
+      }
+      return m;
+    };
+    assert.equal((await svc1.check({ routeKey: KEY, version: 1, runId: `${KEY}__v1`, rubric: v1, codeLeftOutIds: [] })).ok, true);
+    assert.ok(ledger.docs.get(`${KEY}__v1`)?.ruleVerdicts.crit_list_25, "version 1 has letters for the cut-list rule");
+
+    // Version 2: only crit_list_25's list lines change (re-read from the page, as the builder does).
+    const reread = (readLeadInList(index, index.locate(LEAD25) as any) as any).items as string[];
+    const v2 = { ...(JSON.parse(JSON.stringify(v1)) as VisaRubric), version: 2, reviewStatus: "pending_review" } as VisaRubric;
+    v2.criteria = v2.criteria.map((c) => (c.criterionId === "crit_list_25" ? { ...c, source: { ...c.source, listItems: reread } } : c));
+    const p2 = new ScriptedProvider();
+    const svc2 = new RubricCheckerService({ provider: () => p2, readSnapshot: async () => PAGE, loadSettings: settingsWith(), ledger, nowMs: () => Date.parse("2026-11-21T11:00:00Z"), sleep: async () => undefined });
+    assert.equal((await svc2.check({ routeKey: KEY, version: 2, runId: `${KEY}__v2`, rubric: v2, codeLeftOutIds: [], reuseFrom: { version: 1, rubric: v1 } })).ok, true);
+    assert.equal(p2.requests.length, 1);
+    assert.deepEqual(seenRules(p2.requests[0]).map((r) => r.title), ["Limited territorial validity cases"]);
+    const rec = ledger.docs.get(`${KEY}__v2`);
+    assert.deepEqual(rec?.reuse?.rules.crit_list_25, { rule: "asked", reason: "rule_changed" });
+    // The 20 plain rules are reused: rebuilding version 1's batches (which held the cut-list rules) proved them.
+    assert.equal(rec?.reuse?.totals.rulesReused, 20);
   });
 });

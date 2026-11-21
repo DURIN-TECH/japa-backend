@@ -29,7 +29,13 @@
  * `writePendingVersion` (which is unchanged): pending only, never approved, never over an existing version,
  * only while the head's approved AND latest version are 1, only for the same snapshots as version 1, and only
  * when the stored version 1 is exactly the `--version` file (content fingerprint). A second run reports that
- * version 2 already exists and writes nothing. No `force` anywhere.
+ * a version 2 already exists and writes nothing. No `force` anywhere.
+ *
+ * AUTOMATIC PUBLISHING MUST BE OFF (fix round 1). Creating version 2 fires the version-created trigger, and on
+ * a project whose publish mode is `auto` with this route allowed that trigger checks the WHOLE rulebook without
+ * reuse (and the hourly sweep re-runs a held version the same way). So the write reads the target's publish
+ * settings first and refuses (`auto_publish_on`) when they cannot be read, or when the mode is `auto` and the
+ * route is allowed. The dry run prints the same refusal as a line. Nothing here changes a setting.
  *
  * PLANNED REQUESTS (printed, 0 model calls): what `publish:rubric --reuse-check-from 1` would send for
  * version 2: the rule check (rules reused from version 1 vs asked now, and the requests that makes), the
@@ -84,7 +90,8 @@ import { fromFirestoreRest, placeQuestions } from "./redraft-competence-rule";
  *    `out_questions_not_placed`: the result does not belong to this version 1;
  *  - `competence_problems_on_version:<codes>`: the block fails the code check on the built version 2;
  *  - `head_moved`, `source_set_differs`, `no_head`, `base_missing`, `base_changed`: the target project no longer
- *    matches the inputs (the head moved since they were read, or the stored version 1 is not the file).
+ *    matches the inputs (the head moved since they were read, or the stored version 1 is not the file);
+ *  - `auto_publish_on`: the target's publish settings are unreadable, or automatic publishing covers this route.
  */
 export type DeriveRefusal = string;
 
@@ -385,6 +392,13 @@ export function planLines(plan: PublishPlan): string[] {
   const c = plan.check;
   const t = c.reuse?.totals;
   if (t) lines.push(`rule check: ${t.rulesReused} rule(s) reused from version 1, ${t.rulesAsked} asked again; triggers ${t.triggersReused} reused, ${t.triggersAsked} asked again; intention-to-stay readings reused ${t.polarityReused}; stored re-drafts carried ${t.repairsCarried} (with their check ${t.repairChecksCarried}).`);
+  // (Fix round 1) Why the asked rules are asked, by reason code (e.g. `base_answer_mismatch` when version 1's
+  // audit letters were overwritten), so an unexpected count is seen before any spend.
+  if (c.reuse) {
+    const byReason = new Map<string, number>();
+    for (const l of Object.values(c.reuse.rules)) if (l.rule === "asked") byReason.set(l.reason ?? "unknown", (byReason.get(l.reason ?? "unknown") ?? 0) + 1);
+    lines.push(`rule check asked again, by reason: ${byReason.size === 0 ? "none" : [...byReason].sort(([a], [b]) => a.localeCompare(b)).map(([r, n]) => `${r} ${n}`).join(", ")}.`);
+  }
   if (c.kind === "held") lines.push(`rule check: would HOLD before any request (${c.reasonCodes.join(", ")}).`);
   else {
     lines.push(`rule check requests: ${c.check}; trigger check requests: ${c.trigger}; intention-to-stay requests: ${c.polarity}; repair requests at most ${c.repairAtMost}.`);
@@ -407,9 +421,25 @@ export interface DeriveRunDeps {
   writeDerived?: (draft: Omit<VisaRubric, "version">, opts: { baseVersion: number; baseFingerprint: string }) => Promise<import("../rubric.store").DerivedWriteResult>;
   // What the plan reads; absent = no plan printed.
   plan?: PlanSources;
+  // (#440 fix round 1) The publish settings of the TARGET project (`appConfig/rubricPublishSettings`). Read
+  // before any write: absent (offline) or unreadable means a write is refused (see `autoPublishOn`).
+  readPublishSettings?: () => Promise<import("../rubric-publish-settings").LoadedPublishSettings>;
   // The creation time of version 2 (the write only).
   now: () => unknown;
   print: (line: string) => void;
+}
+
+/**
+ * (#440 fix round 1) True when creating version 2 on the target would let the AUTOMATIC paths check it: the
+ * version-created trigger runs the whole pipeline on a new pending version, and the hourly sweep re-runs a
+ * held one, both WITHOUT `reuseFrom`, so every rule would be sent to the models (a whole-rulebook spend) and
+ * the trigger could publish version 2 before the reuse run. That happens when the publish mode is `auto` and
+ * this route is allowed. Settings that could not be read (or were not read at all) count as "on": fail closed.
+ * No setting is changed here; the owner sets the mode. Pure.
+ */
+export function autoPublishOn(loaded: import("../rubric-publish-settings").LoadedPublishSettings | null | undefined, routeKey: string, routeAllowed: (s: import("../rubric-publish-settings").RubricPublishSettings, key: string) => boolean): boolean {
+  if (!loaded || loaded.readError !== undefined) return true;
+  return loaded.settings.mode === "auto" && routeAllowed(loaded.settings, routeKey);
 }
 
 /** What a run did (for tests and the exit code). */
@@ -447,7 +477,7 @@ export async function runDerive(inputs: { v1: VisaRubric; out: any; snapshot: Gu
   const v2Number = CHECK_REUSE_PAIR.toVersion;
   const alreadyThere = head.approvedVersion === CHECK_REUSE_PAIR.fromVersion && head.latestVersion === v2Number;
   if (!alreadyThere && (head.approvedVersion !== CHECK_REUSE_PAIR.fromVersion || head.latestVersion !== CHECK_REUSE_PAIR.fromVersion)) return stop("head_moved");
-  if (head.latestSourceSetHash !== built.draft.sourceSetHash) return stop("source_set_differs");
+  if (!head.latestSourceSetHash || head.latestSourceSetHash !== built.draft.sourceSetHash) return stop("source_set_differs");
 
   // ---- what version 2 contains (ids and code words only) ----
   deps.print(`${inputs.v1.routeKey}: version ${v2Number} built from version ${CHECK_REUSE_PAIR.fromVersion} (0 model calls).`);
@@ -463,9 +493,28 @@ export async function runDerive(inputs: { v1: VisaRubric; out: any; snapshot: Gu
 
   if (alreadyThere) {
     summary.alreadyExists = true;
-    deps.print(`version ${v2Number} already exists on the target; nothing was written.`);
+    deps.print(`a version ${v2Number} already exists on the target (not compared with this build); nothing was written.`);
     return summary;
   }
+
+  // ---- (#440 fix round 1) automatic publishing must be off for this route before version 2 exists ----
+  // Read on every run that can reach the project; offline it is not read, and a write is impossible there.
+  const { routeAllowed } = await import("../rubric-publish-settings");
+  let loaded: import("../rubric-publish-settings").LoadedPublishSettings | null | undefined;
+  if (deps.readPublishSettings) {
+    try {
+      loaded = await deps.readPublishSettings();
+    } catch {
+      loaded = null;
+    }
+  }
+  const autoOn = autoPublishOn(loaded, inputs.v1.routeKey, routeAllowed);
+  if (autoOn) {
+    const why = loaded === undefined ? "publish settings not read (offline)" : loaded === null || loaded.readError !== undefined ? "publish settings unreadable" : "publish mode auto and this route allowed";
+    // The dry run says so as a refusal line and goes on; the write stops here.
+    if (opts.write) return stop("auto_publish_on");
+    deps.print(`a write would be refused (auto_publish_on: ${why}). Keep the publish mode manual until the publish:rubric --reuse-check-from ${CHECK_REUSE_PAIR.fromVersion} run has finished.`);
+  } else deps.print("  publish settings: automatic publishing does not apply to this route (a write may go ahead).");
   if (!opts.write) {
     deps.print(`\n(dry run: nothing was written. Add --write to store version ${v2Number} as a pending draft.)`);
     return summary;
@@ -482,7 +531,7 @@ export async function runDerive(inputs: { v1: VisaRubric; out: any; snapshot: Gu
   }
   if (result.reason === "already_exists") {
     summary.alreadyExists = true;
-    deps.print(`version ${result.version} already exists on the target; nothing was written.`);
+    deps.print(`a version ${result.version} already exists on the target (not compared with this build); nothing was written.`);
     return summary;
   }
   return stop(result.reason);
@@ -559,6 +608,7 @@ async function main(): Promise<void> {
     deps = {
       readHead: (key) => rubricStore.getHead(key),
       writeDerived: (draft, o) => rubricStore.writeDerivedPendingVersion(draft, o),
+      readPublishSettings: loadPublishSettings,
       plan: { loadSettings: loadPublishSettings, loadCheckerRecord: (runId) => firestoreCheckerLedger.load(runId), readSnapshot },
       now: () => Timestamp.now(),
       print: (l) => console.log(l),

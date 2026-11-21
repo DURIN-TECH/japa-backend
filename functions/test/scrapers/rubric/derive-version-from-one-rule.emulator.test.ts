@@ -31,6 +31,7 @@ import { db } from "../../../src/utils/firebase";
 import { rubricStore } from "../../../src/scrapers/rubric/rubric.store";
 import { RubricCheckerService, firestoreCheckerLedger } from "../../../src/scrapers/rubric/rubric-checker";
 import { runDerive } from "../../../src/scrapers/rubric/scripts/derive-version-from-one-rule";
+import { loadPublishSettings } from "../../../src/scrapers/rubric/rubric-publish-settings";
 import { MemoryLedger, ScriptedProvider, settingsWith } from "./checker-fakes";
 import { HEAD, KEY, PAGE, outFor, version1 } from "./derive-version-fixtures";
 
@@ -74,6 +75,8 @@ suite("(#440) version 2 from version 1 plus a one-rule result, on the Firestore 
     runDerive({ v1: version1(), out: await outFor(), snapshot: PAGE }, { write: true }, {
       readHead: (key) => rubricStore.getHead(key),
       writeDerived: (draft, o) => rubricStore.writeDerivedPendingVersion(draft, o),
+      // The real loader: no settings doc on the emulator reads as the manual default.
+      readPublishSettings: loadPublishSettings,
       plan: { loadSettings: settingsWith(), loadCheckerRecord: (id) => firestoreCheckerLedger.load(id), readSnapshot: async () => PAGE, provider: new ScriptedProvider() },
       now: () => NOW,
       print: (l) => lines.push(l),
@@ -111,7 +114,7 @@ suite("(#440) version 2 from version 1 plus a one-rule result, on the Firestore 
     assert.equal(s.refusal, null);
     assert.equal(s.written, false);
     assert.equal(s.alreadyExists, true);
-    assert.ok(lines.some((l) => l.includes("version 2 already exists")));
+    assert.ok(lines.some((l) => l.includes("a version 2 already exists")));
     assert.equal((await versionRef(3).get()).exists, false);
     assert.deepEqual((await versionRef(2).get()).data(), before2);
     assert.equal(((await headRef().get()).data() as any).latestVersion, 2);

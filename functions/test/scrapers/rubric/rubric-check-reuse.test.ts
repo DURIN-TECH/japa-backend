@@ -224,6 +224,30 @@ describe("(#440) reuse: anything that changed is asked again", () => {
     assert.equal(polarityRequests(sent).length, 2);
   });
 
+  test("(fix round 1) a byte-identical rule shown a different window (the text around its quote moved): view_changed, asked again", async () => {
+    const r = rig();
+    const v1 = version1();
+    assert.equal((await r.svc().check(v1Input(v1))).ok, true);
+    // The words shown around rule 5's quote differ on THIS check (its own line gains words before the quote; the
+    // window is the quote's own line), under the same hash: the first read (this version's views) gets the
+    // changed text; the base rebuild and the polarity read the text version 1 was checked on. Every rule is
+    // byte-identical, and its quote is still found.
+    const moved = lines(24);
+    moved[4] = `R5.1 (as amended later) ${qt(5)}`;
+    const MOVED: GuidanceSnapshotContent = pageOf(0, moved);
+    let reads = 0;
+    const p2 = new Models();
+    const svc2 = new RubricCheckerService({ provider: () => p2, readSnapshot: async () => (++reads === 1 ? MOVED : PAGE), loadSettings: settingsWith(), ledger: r.ledger, nowMs: () => Date.parse("2026-11-21T11:00:00Z"), sleep: async () => undefined });
+    await svc2.check(v2Input(v1, version2(v1)));
+    const rec = r.ledger.docs.get(V2_RUN);
+    assert.equal(rec?.reuse?.rules["crit-0005"].reason, "view_changed");
+    // Only rules whose window holds the added line are asked; each of them for `view_changed`.
+    const asked = Object.entries(rec?.reuse?.rules ?? {}).filter(([, l]) => l.rule === "asked");
+    assert.ok(asked.length > 0 && asked.every(([, l]) => l.reason === "view_changed"));
+    assert.ok((rec?.reuse?.totals.rulesReused ?? 0) > 0, "the rules far from the change are reused");
+    assert.deepEqual(askedTitles(p2.requests).sort(), asked.map(([id]) => `Matter ${Number(id.slice(5))}`).sort());
+  });
+
   test("the intention-to-stay reading is reused only for the same quote", async () => {
     const { sent } = await v1ThenV2(undefined, { v2Over: { intentPolarityProposal: PROPOSAL(OTHER_POLARITY_LINE) } as any });
     assert.equal(polarityRequests(sent).length, 2);
