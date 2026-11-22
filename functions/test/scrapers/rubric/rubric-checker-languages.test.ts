@@ -93,7 +93,11 @@ describe("the prompts say a quote may be in any language", () => {
 
 // Pinned at the #242 bump (v6; v5 was 894d66bb... at the #220 bump). v5 was #220's language wording merged with #226's bar-stage wording. Another change to these prompts needs its own version bump and a new pin here.
 const CHECKER_PINNED_HASH = "9e49085b9ac950adf79e7ddc5d583ca718d75cd2c674e76149ee2e40f3aa9070";
-const QUESTION_PINNED_HASH: Record<string, string> = { "question-check-2026-11-14.1": "9ac4afe53da9d37bc3331164ec2e4ce41d37f8e4b5e8466654e09dc82f42509b" };
+// (#461) The 2026-11-22.1 bump changed the PAYLOAD (list lines), not the prompts: the same hash, pinned under the new version.
+const QUESTION_PINNED_HASH: Record<string, string> = {
+  "question-check-2026-11-14.1": "9ac4afe53da9d37bc3331164ec2e4ce41d37f8e4b5e8466654e09dc82f42509b",
+  "question-check-2026-11-22.1": "9ac4afe53da9d37bc3331164ec2e4ce41d37f8e4b5e8466654e09dc82f42509b",
+};
 
 describe("the rule check over a Spanish rule", () => {
   test("the model is shown the Spanish quote verbatim beside the English title, with its Spanish surroundings", async () => {

@@ -40,7 +40,10 @@ import { DATA_ONLY_RULE, wrapUntrusted } from "../../services/ai/prompt-safety";
 
 /** Version of the prompts and schemas below. Recorded on every plan. */
 // 2026-11-14.1 (#220): the official sentence may be in any language; the wording for applicants is English by design.
-export const QUESTION_CHECK_PROMPT_VERSION = "question-check-2026-11-14.1";
+// 2026-11-22.1 (#461): a linked rule that introduces a list is shown with its list lines (the words applicants see),
+//   so a question's payload changes for those rules. The prompts themselves are unchanged; the bump keeps a plan
+//   recorded under the old payload apart from one recorded under the new one.
+export const QUESTION_CHECK_PROMPT_VERSION = "question-check-2026-11-22.1";
 
 /** The aspects checked for a question. */
 export const QUESTION_ASPECTS = ["asks_only_what_quote_requires", "answer_type_fits", "neutral_wording"] as const;
@@ -105,9 +108,24 @@ export class QuestionCheckError extends Error {
 /** At most this many quotes are shown for one question. */
 export const MAX_QUOTES_PER_QUESTION = 3;
 /** A quote or wording longer than this is cut (marked) in the payload. */
-const MAX_FIELD_CHARS = 1_500;
+export const MAX_FIELD_CHARS = 1_500;
 
 const clip = (text: string): string => (text.length > MAX_FIELD_CHARS ? `${text.slice(0, MAX_FIELD_CHARS)} [shortened]` : text);
+
+/**
+ * (#461) The official words of a linked rule as the question check is shown them: its `source.quote`, then,
+ * when the rule introduces a list (`source.listItems`, the lines read from the snapshot by code, #222), each
+ * stored list line exactly as stored, in stored order, one per line. Those lines are what applicants see under
+ * the rule, so a question asking for a case named only in a list line is judged against that line too.
+ * A rule with no list (no `listItems`, or an EMPTY list) is shown its quote alone, exactly as before #461, so
+ * the payload of a question linked only to such rules is byte-for-byte unchanged. Nothing here is typed: every
+ * word is copied from the stored rule. The `MAX_FIELD_CHARS` cut applies to the whole text (see `clip`).
+ */
+export function questionQuoteOf(rule: Pick<AssessmentCriterion, "source">): string {
+  const quote = rule.source?.quote ?? "";
+  const list = rule.source?.listItems;
+  return list && list.length > 0 ? [quote, ...list].join("\n") : quote;
+}
 
 /** One item as the model sees it (ids are batch-local). */
 interface PayloadItem {
@@ -128,11 +146,23 @@ export const DESTINATION_OPTIONS_LINE = "one option for each member country of t
 
 /**
  * The items to check, in rubric order: every question with the quotes of its
- * linked rules (at most 3, in rubric order), every document item with its own
- * quote. Questions linked to no rule in `criteria` are still checked (with no
+ * linked rules (at most 3, in rubric order; (#461) each with its list lines,
+ * see `questionQuoteOf`), every document item with its own quote (unchanged:
+ * a document item carries its own `source.quote`, never a rule's list).
+ * Questions linked to no rule in `criteria` are still checked (with no
  * quote they cannot pass, which is correct: nothing supports them).
+ *
+ * (#461) `shortenedQuotes` counts the quotes (of questions and document items) that
+ * were longer than `MAX_FIELD_CHARS` and so were cut and marked `[shortened]`: the
+ * dry runs print it, so a list long enough to be cut is seen before any spend.
  */
-export function buildCheckItems(view: { criteria: AssessmentCriterion[]; intakeQuestions: IntakeQuestion[]; evidenceItems: EvidenceItem[] }): { questions: CheckItem[]; evidence: CheckItem[] } {
+export function buildCheckItems(view: { criteria: AssessmentCriterion[]; intakeQuestions: IntakeQuestion[]; evidenceItems: EvidenceItem[] }): { questions: CheckItem[]; evidence: CheckItem[]; shortenedQuotes: number } {
+  let shortenedQuotes = 0;
+  // A quote as shown, counting the ones the cut shortens.
+  const quoteShown = (text: string): string => {
+    if (text.length > MAX_FIELD_CHARS) shortenedQuotes += 1;
+    return clip(text);
+  };
   const criteria = new Map(view.criteria.map((c) => [c.criterionId, c]));
   const order = new Map(view.criteria.map((c, i) => [c.criterionId, i]));
   const questions: CheckItem[] = view.intakeQuestions.map((q) => {
@@ -156,7 +186,8 @@ export function buildCheckItems(view: { criteria: AssessmentCriterion[]; intakeQ
           ? { options: [DESTINATION_OPTIONS_LINE, ...(q.options ?? []).map((o) => clip(o.label))] }
           : q.options && q.options.length > 0 ? { options: q.options.map((o) => clip(o.label)) } : {}),
         ...(q.party ? { about_party: q.party } : {}),
-        quotes: linked.slice(0, MAX_QUOTES_PER_QUESTION).map((c) => clip(c.source?.quote ?? "")),
+        // (#461) Each quote with its rule's list lines (if any); still at most 3 quotes, each cut at MAX_FIELD_CHARS.
+        quotes: linked.slice(0, MAX_QUOTES_PER_QUESTION).map((c) => quoteShown(questionQuoteOf(c))),
       },
     };
   });
@@ -167,10 +198,10 @@ export function buildCheckItems(view: { criteria: AssessmentCriterion[]; intakeQ
       document: clip(e.title),
       ...(e.expects?.documentType ? { document_type: clip(e.expects.documentType) } : {}),
       whose_document: e.party,
-      quote: clip(e.source?.quote ?? ""),
+      quote: quoteShown(e.source?.quote ?? ""),
     },
   }));
-  return { questions, evidence };
+  return { questions, evidence, shortenedQuotes };
 }
 
 /** Deterministic batches: in order, closing at the item count or the character budget. */
