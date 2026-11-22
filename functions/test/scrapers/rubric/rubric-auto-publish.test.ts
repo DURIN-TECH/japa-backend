@@ -1496,6 +1496,8 @@ describe("(#440) auto-publish: reuseCheckFromVersion reaches the check as the st
     assert.equal(reuse?.version, 1);
     assert.equal(reuse?.rubric.version, 1);
     assert.equal(reuse?.rubric.criteria.length, 10, "the base as stored, unfiltered");
+    // (#461) No listed pair names a hop for this route and step: no `via` is read or passed.
+    assert.equal(reuse?.via, undefined);
     // A run without the choice (the admin endpoint's call) passes no reuse.
     await quiet(() => svc.runOnDraft(ID_A2, { trigger: "admin_endpoint" }));
     assert.equal(checker.calls.length, 2);

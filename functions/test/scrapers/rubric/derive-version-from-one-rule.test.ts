@@ -245,7 +245,7 @@ describe("(#440) the dry run: what version 2 contains and what its publish would
     // Version 1's own full check asked 2 batches (its 20 readable rules) and 2 readings; without reuse version 2
     // would ask 3 batches (23 readable rules) and 2 readings. With reuse: the changed rules' one batch only.
     assert.equal(fullV1Requests, 4);
-    assert.ok(planLines(s.plan as any).some((l) => l.startsWith("question wording check (no reuse, #441):")));
+    assert.ok(planLines(s.plan as any).some((l) => l.startsWith("question wording check (no reuse, #463; every item asked):")));
 
     // And the check of version 2 with reuse (fake provider) sends exactly the planned request.
     const p2 = new ScriptedProvider();
