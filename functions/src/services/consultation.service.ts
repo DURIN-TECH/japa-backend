@@ -51,6 +51,8 @@ import type {
 // Issue #317: when a slot starts, in ONE helper (re-exported below).
 export { slotStartsAt, slotEndsAt } from "../consultations/slot-time";
 import { slotStartsAt } from "../consultations/slot-time";
+// Issue #472: the one "has this slot already started?" rule, and the zone check.
+import { isKnownTimeZone, isSlotInPast, SLOT_IN_PAST_CODE, SLOT_IN_PAST_MESSAGE } from "../consultations/slot-time";
 
 // ============================================
 // STATUS TRANSITION RULES (issue #151)
@@ -333,7 +335,15 @@ export interface EditRefusal {
   ok: false;
   // FEE_RELEASED (issue #317 review fix): rescheduling a PAID booking whose
   // fee was already released (the meeting has happened).
-  code: "FORBIDDEN" | "VALIDATION_ERROR" | "BOOKING_NOT_EDITABLE" | "PAYMENT_IN_PROGRESS" | "FEE_RELEASED";
+  // SLOT_IN_PAST (issue #472): the edit would move the booking to a slot
+  // that has already started.
+  code:
+    | "FORBIDDEN"
+    | "VALIDATION_ERROR"
+    | "BOOKING_NOT_EDITABLE"
+    | "PAYMENT_IN_PROGRESS"
+    | "FEE_RELEASED"
+    | typeof SLOT_IN_PAST_CODE;
   httpStatus: 400 | 403 | 409;
   message: string;
 }
@@ -484,7 +494,8 @@ function isHttpsUrl(value: unknown): boolean {
  *  - `scheduledTime` neither 24-hour `HH:mm` nor 12-hour `h:mm AM/PM`
  *    (either is stored as `HH:mm`, see `normalizeScheduledTime`);
  *  - `durationMinutes` not a whole number from 5 to 480;
- *  - `timezone` not a non-empty string;
+ *  - `timezone` not a real IANA zone (issue #472: it used to be any
+ *    non-empty string, and an unknown one was silently read as Lagos);
  *  - `meetingPlatform` not zoom / google_meet / teams;
  *  - `type` not a ConsultationType;
  *  - `meetingLink` not an `https://` URL;
@@ -528,6 +539,9 @@ export function parseEditBody(body: unknown): ParsedEdit {
       break;
     case "timezone":
       if (typeof value !== "string" || !value.trim()) return bad("timezone must be a non-empty string");
+      // Issue #472: a zone this runtime does not know ("Mars/Base") is a 400,
+      // not a booking quietly read in Africa/Lagos.
+      if (!isKnownTimeZone(value)) return bad("timezone must be an IANA time zone such as Africa/Lagos");
       updates.timezone = value;
       break;
     case "meetingLink":
@@ -610,6 +624,46 @@ export function slotChanges(current: Consultation, updates: EditUpdates): boolea
     const stored = (current as unknown as Record<string, unknown>)[field];
     return comparableSlotValue(next) !== comparableSlotValue(stored);
   });
+}
+
+/**
+ * Issue #472: true when this edit moves the booking's START to an instant
+ * that has already started at `at`. Pure.
+ *
+ * The slot judged is the MERGED one: the edit's schedule values over the
+ * stored ones (only `scheduledTime` sent keeps the stored `scheduledDate`
+ * and `timezone`). It is judged only when its START differs from the stored
+ * start: an edit that leaves the start where it is (only `durationMinutes`,
+ * or the same time in another spelling) is not a move into the past, so the
+ * #316 table still lets the agent fix the length of a booking whose slot has
+ * begun. A slot whose date cannot be read at all is not judged here (the
+ * value checks already refused a bad `scheduledDate` in the request).
+ *
+ * @param current the booking as read in the edit's transaction
+ * @param updates the checked values from `parseEditBody`
+ * @param at the server clock
+ */
+export function movesIntoPast(current: Consultation, updates: EditUpdates, at: Date): boolean {
+  const merged = {
+    scheduledDate: (updates.scheduledDate ?? current.scheduledDate) as Consultation["scheduledDate"],
+    scheduledTime: (updates.scheduledTime ?? current.scheduledTime) as Consultation["scheduledTime"],
+    timezone: (updates.timezone ?? current.timezone) as Consultation["timezone"],
+  };
+  try {
+    const newStart = slotStartsAt(merged).getTime();
+    // The start does not move: nothing to judge (see above).
+    let oldStart: number | null = null;
+    try {
+      oldStart = slotStartsAt(current).getTime();
+    } catch {
+      oldStart = null; // no readable stored slot: any readable new one is a move
+    }
+    if (oldStart === newStart) return false;
+    return isSlotInPast(merged, at);
+  } catch {
+    // No readable merged date (bad legacy data): leave the edit to the other rules.
+    return false;
+  }
 }
 
 /**
@@ -2607,6 +2661,23 @@ class ConsultationService {
 
       const decision = decideEdit(actorFor(current), current, fieldNames, at);
       if (!decision.ok) return { kind: "refused", refusal: decision };
+
+      // Issue #472: an edit that really MOVES the slot (`slotChanges`) may
+      // not move its START to a time that has already started. Judged here,
+      // inside the transaction, on the freshly read booking and the server
+      // clock, with the MERGED slot: new values over the stored ones (only
+      // `scheduledTime` sent keeps the stored `scheduledDate` and
+      // `timezone`). Refused before anything is written or notified.
+      // An edit that does NOT move the start (meeting link, summary, only
+      // the duration, or resending the stored schedule) is never refused
+      // here, so the #316 table is unchanged for a booking whose slot has
+      // passed.
+      if (slotChanges(current, updates) && movesIntoPast(current, updates, at)) {
+        return {
+          kind: "refused",
+          refusal: { ok: false, code: SLOT_IN_PAST_CODE, httpStatus: 400, message: SLOT_IN_PAST_MESSAGE },
+        };
+      }
 
       const write: Record<string, unknown> = { updatedAt: Timestamp.fromDate(at) };
       for (const field of fieldNames) write[field] = updates[field];

@@ -233,16 +233,30 @@ describe("fee hold: Seli never funds a refund an agent can trigger", () => {
     assert.equal((await balanceOf(agent)).availableBalance, 900_000);
   });
 
-  test("a reschedule never releases the fee sooner (earlier or past dates keep the hold); a later one extends it", async () => {
+  test("a reschedule into the past is refused and leaves the hold (#472); a later one extends it", async () => {
     const fee = await bookAndPay("c1");
     const releaseAt = fee.feeHold.releaseAt.toMillis();
-    // Moved into the past: the hold does not move.
-    assert.equal((await edit(agent, { scheduledDate: "2026-11-01" })).status, 200);
+    // Moved into the past: since #472 the move itself is refused (400
+    // SLOT_IN_PAST), so the hold cannot move sooner through it either.
+    const intoPast = await edit(agent, { scheduledDate: "2026-11-01" });
+    assert.equal(intoPast.status, 400);
+    assert.equal(intoPast.body.error, "SLOT_IN_PAST");
     assert.equal(feeOf("c1")!.feeHold.releaseAt.toMillis(), releaseAt);
     assert.equal((await balanceOf(agent)).heldBalance, 900_000);
     // Moved a week later: the hold moves with it.
     assert.equal((await edit(agent, { scheduledDate: "2026-11-27" })).status, 200);
     assert.equal(feeOf("c1")!.feeHold.releaseAt.toMillis(), releaseAt + 7 * 86_400_000);
+  });
+
+  test("a reschedule earlier but still in the future never releases the fee sooner (the hold is unchanged)", async () => {
+    const fee = await bookAndPay("c1");
+    const releaseAt = fee.feeHold.releaseAt.toMillis();
+    // 12:00 Lagos today = 11:00Z, two hours after the harness's now: earlier
+    // than the slot paid for, but not started, so #472 lets it through.
+    const earlier = await edit(agent, { scheduledDate: "2026-11-13", scheduledTime: "12:00" });
+    assert.equal(earlier.status, 200);
+    assert.equal(feeOf("c1")!.feeHold.releaseAt.toMillis(), releaseAt, "the hold did not move sooner");
+    assert.equal((await balanceOf(agent)).heldBalance, 900_000, "the fee is still held");
   });
 });
 
@@ -353,9 +367,14 @@ describe("an agent moving a paid booking earlier never costs the client their re
     assert.equal(refundRows()[0].reason, "client_cancelled");
   });
 
-  test("rescheduled into the past: the client cancels and is fully refunded", async () => {
+  test("a reschedule into the past is refused (#472): the booking keeps its slot and the client's cancel is still fully refunded", async () => {
     await bookAndPay("c1");
-    assert.equal((await edit(agent, { scheduledDate: "2026-11-01" })).status, 200);
+    // Before #472 the agent could move a paid booking into the past; the
+    // move is now refused and nothing is written, so the refund rule reads
+    // the slot the client paid for (24 h+ away: full refund).
+    const intoPast = await edit(agent, { scheduledDate: "2026-11-01" });
+    assert.equal(intoPast.status, 400);
+    assert.equal(intoPast.body.error, "SLOT_IN_PAST");
     const out = await setStatus(client, "cancelled", "c1");
     assert.equal(out.status, 200);
     assert.equal(out.body.data.refund?.status, "processing");
