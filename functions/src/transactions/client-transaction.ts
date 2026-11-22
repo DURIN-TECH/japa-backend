@@ -73,7 +73,9 @@ export const CLIENT_TRANSACTION_FIELDS = [
  *  - "on_its_way": `pending` / `processing` (Paystack has it, or soon will);
  *  - "refunded": `completed`;
  *  - "delayed": `failed`, or HELD for an admin (`refundHeldReason`);
- *  - "none_due": an admin closed it as `nothing_to_refund` (`closed`).
+ *  - "none_due": an admin closed it as `nothing_to_refund` (`closed`), or
+ *    (issue #465) it is HELD because Paystack's fee covers the whole payment
+ *    (`fee_not_less_than_amount`): nothing is owed back, so not "delayed".
  */
 export type ClientRefundState = "on_its_way" | "refunded" | "delayed" | "none_due";
 
@@ -85,6 +87,8 @@ export function clientRefundState(
   txn: Pick<Transaction, "status"> & Partial<Pick<Transaction, "refundHeldReason">>
 ): ClientRefundState {
   if (txn.status === "closed") return "none_due";
+  // Issue #465: Paystack's fee is the whole charge or more: no refund due.
+  if (txn.refundHeldReason === "fee_not_less_than_amount") return "none_due";
   if (txn.refundHeldReason || txn.status === "failed") return "delayed";
   if (txn.status === "completed") return "refunded";
   return "on_its_way";

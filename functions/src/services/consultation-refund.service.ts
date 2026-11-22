@@ -1380,6 +1380,13 @@ export type CloseExceptionOutcome =
   | { kind: "not_closable"; why: "agent_caused" | "not_held_fee_not_less_than_amount" | "refund_exists" };
 
 /** What a refund webhook did. */
+/**
+ * Issue #465: the client's notice when a client-caused cancel refund is held
+ * with `fee_not_less_than_amount` (Paystack's fee covers the whole payment).
+ */
+export const NO_REFUND_DUE_MESSAGE =
+  "Your consultation was cancelled. The payment provider\u2019s processing fee covers the whole payment, so there\u2019s no refund due.";
+
 export type RefundWebhookOutcome = "not_refund_event" | "unknown_refund" | "unchanged" | "applied";
 
 class ConsultationRefundService {
@@ -3163,6 +3170,14 @@ class ConsultationRefundService {
   async notifyCreated(row: Transaction, booking: Consultation, debit: Transaction | null = null): Promise<void> {
     const currency = row.currency as Money["currency"];
     const common = { type: "consultation_refunded" as const, relatedEntityType: "consultation" as const, relatedEntityId: booking.id };
+    // Issue #465 (user decision on #356, 2026-11-22): a client-caused refund
+    // held because Paystack's fee covers the whole payment owes the client
+    // nothing: say so now, never "Refund delayed". Money is unchanged (the
+    // row stays held for the admin close).
+    if (row.refundHeldReason === "fee_not_less_than_amount") {
+      await this.notifyNoRefundDue(row, booking);
+      return;
+    }
     if (row.refundHeldReason) {
       await this.notifyDelayed(row);
       return;
@@ -3272,6 +3287,23 @@ class ConsultationRefundService {
         relatedEntityId: debit.consultationId ?? debit.id,
       })
       .catch((e) => console.error("[refund] fee-debit notify failed:", e));
+  }
+
+  /**
+   * Issue #465: tell the client no refund is due, because the payment
+   * provider's processing fee covers the whole payment. Never fails the caller.
+   */
+  private async notifyNoRefundDue(row: Transaction, booking: Consultation): Promise<void> {
+    await notificationService
+      .notifyUser({
+        userId: booking.userId ?? row.userId,
+        type: "consultation_refunded",
+        title: "No refund due",
+        body: NO_REFUND_DUE_MESSAGE,
+        relatedEntityType: "consultation",
+        relatedEntityId: booking.id,
+      })
+      .catch((e) => console.error("[refund] no-refund-due notify failed:", e));
   }
 
   /** Tell the client their refund is delayed (a row became `failed`). */
