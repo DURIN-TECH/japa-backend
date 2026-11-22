@@ -161,6 +161,21 @@ const FULL_BOOKING: Required<Consultation> = {
   paidOnSupersededReference: true,
   // Issue #405: the sweep's payment-grace clock after a reschedule (internal).
   paymentGraceStartsAt: Timestamp.fromMillis(1_755_555_555_000),
+  // Issue #411: the abandoned-booking sweep's bookkeeping (internal).
+  graceRestartCount: 7,
+  sweepSetAside: true,
+  sweepReview: {
+    unresolvedRuns: 24,
+    fingerprint: "HIDDEN-sweep-fingerprint",
+    lastOutcome: "in_progress",
+    lastRunAt: Timestamp.fromMillis(1_766_666_666_000),
+    setAsideAt: Timestamp.fromMillis(1_766_666_666_000),
+    checkouts: [
+      { reference: "HIDDEN-sweep-reference", state: "in_progress", final: false, checkedAt: Timestamp.fromMillis(1_766_666_666_000) },
+    ],
+  },
+  // Issue #411 (from #391): a guest's pay-link expiry (internal clock).
+  payLinkExpiresAt: Timestamp.fromMillis(1_777_777_777_000),
   supersededCheckouts: [
     {
       reference: "HIDDEN-superseded-reference",
@@ -252,6 +267,11 @@ const HIDDEN_FIELDS: readonly (keyof Consultation)[] = [
   "paidOnSupersededReference",
   // Issue #405: when the sweep's 24-hour payment grace restarted (internal clock).
   "paymentGraceStartsAt",
+  // Issue #411: the sweep's bookkeeping and a guest's pay-link expiry.
+  "graceRestartCount",
+  "sweepSetAside",
+  "sweepReview",
+  "payLinkExpiresAt",
   // Internal: how it was booked, and the uid of whoever cancelled it.
   "bookedVia",
   "cancelledBy",
@@ -271,6 +291,8 @@ const HIDDEN_VALUES: readonly string[] = [
   "1722222222", // paystackPaidAt seconds
   "1733333333", // supersededAt seconds
   "1744444444", // the superseded checkout's fxRateAsOf seconds
+  "1766666666", // issue #411: the sweep's bookkeeping times
+  "1777777777", // issue #411: payLinkExpiresAt seconds
   "hold", // fxRateSource
   "public_page", // bookedVia
   "NOT-IN-THE-TYPE", // the undeclared fields seeded below

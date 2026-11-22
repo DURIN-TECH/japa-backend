@@ -745,8 +745,19 @@ function mirrorUpdate(
  *
  * @param opts.guestBooking the booking was made by a guest on a public page
  * @param opts.bookingAwaitingPayment the booking still awaits payment (default true)
+ * @param opts.bookingCancelled (issue #411) the booking was cancelled right
+ *   after this refund (the sweep's settle-then-cancel): "cancelled", no "pay again"
  */
-export function rescheduledRefundMessage(opts: { guestBooking?: boolean; bookingAwaitingPayment?: boolean } = {}): string {
+export function rescheduledRefundMessage(
+  opts: { guestBooking?: boolean; bookingAwaitingPayment?: boolean; bookingCancelled?: boolean } = {}
+): string {
+  // Issue #411 (orchestrator, review round 1): the abandoned-booking sweep
+  // refunded a late payment on a retired checkout and then CANCELLED the
+  // booking in the same run. "Pay again" would be wrong: there is nothing
+  // left to pay for.
+  if (opts.bookingCancelled) {
+    return "Your consultation was cancelled, so we're refunding your payment in full. Your refund is on its way.";
+  }
   const base = "Your consultation moved, so we're refunding your payment in full. Your refund is on its way.";
   if (opts.bookingAwaitingPayment === false) return base;
   return opts.guestBooking
@@ -3202,6 +3213,8 @@ class ConsultationRefundService {
       bookingAwaitingPayment?: boolean;
       /** Issue #413 (C): the booking was made by a guest on a public page (emailed pay link). */
       guestBooking?: boolean;
+      /** Issue #411: the sweep cancelled the booking right after this refund (no "pay again"). */
+      bookingCancelled?: boolean;
     } = {}
   ): Promise<void> {
     const currency = row.currency as Money["currency"];

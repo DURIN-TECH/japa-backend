@@ -688,6 +688,20 @@ export function writeUnappliedRefund(
 }
 
 /** What settling a successful Paystack payment did. */
+/**
+ * Issue #411 (review round 1): a refund notice `settlePayment` did NOT send
+ * because its caller asked it to wait (`deferRefundNotice`): the abandoned-
+ * booking sweep may cancel the booking right after, and the client's notice
+ * must then say so instead of "pay again". The caller sends it with
+ * `sendDeferredRefundNotice` once it knows, exactly once.
+ */
+export interface DeferredRefundNotice {
+  /** What `settlePayment` wrote (the exception, its refund and any fee debit). */
+  written: UnappliedRefundWrite;
+  /** The refund row after its first Paystack try. */
+  row: Transaction;
+}
+
 export type SettleOutcome =
   /** The booking is now paid by this payment and its fee Transaction is written. */
   | { kind: "confirmed"; consultation: Consultation; transaction: Transaction; viaSuperseded: boolean }
@@ -698,16 +712,16 @@ export type SettleOutcome =
    * Recorded in consultationPaymentExceptions and refunded (issue #354); no
    * fee Transaction.
    */
-  | { kind: "refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null }
+  | { kind: "refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice }
   /** The booking is no longer awaiting payment (cancelled...): recorded and refunded (#354); no fee Transaction. */
-  | { kind: "not_payable_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null }
+  | { kind: "not_payable_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice }
   /**
    * Issue #354: paid on a checkout RETIRED when the booking was rescheduled
    * after its quote lock (`retiredBy: "reschedule"`). The booking is NOT
    * confirmed and stays `pending_payment`; the payment is recorded and
    * refunded in full. The client pays again for the new time.
    */
-  | { kind: "rescheduled_refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null }
+  | { kind: "rescheduled_refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice }
   /** Paystack's amount or currency differs from what that checkout asked: nothing written. */
   | { kind: "mismatch" }
   /** Nothing chargeable stored for that checkout: nothing written. */
@@ -783,7 +797,14 @@ export type SettleOutcome =
 export async function settlePayment(
   consultationId: string,
   reference: string,
-  reported: PaystackTransactionLookup
+  reported: PaystackTransactionLookup,
+  /**
+   * Issue #411 (review round 1): `deferRefundNotice` keeps the refund
+   * notices of a refund THIS call created (the refund itself is still sent
+   * to Paystack now) and returns them as `deferredNotice`, for a caller that
+   * may cancel the booking next (the sweep, the admin sweep cancel).
+   */
+  options: { deferRefundNotice?: boolean } = {}
 ): Promise<SettleOutcome | null> {
   const ref = collections.consultations.doc(consultationId);
   const exceptionRef = collections.consultationPaymentExceptions.doc(reference);
@@ -1012,10 +1033,61 @@ export async function settlePayment(
   // inside the callback, so TypeScript's narrowing is widened back here.
   const fresh = created as UnappliedRefundWrite | null;
   if (fresh?.refund && outcome && "refund" in outcome) {
+    if (options.deferRefundNotice) {
+      const row = await sendUnappliedRefund(fresh);
+      return { ...outcome, refund: row, deferredNotice: { written: fresh, row } };
+    }
     const sent = await startUnappliedRefund(fresh);
     return { ...outcome, refund: sent };
   }
   return outcome;
+}
+
+/**
+ * Send a refund notice `settlePayment` deferred (issue #411, review round
+ * 1). With `bookingCancelled` (the caller cancelled the booking right
+ * after), a refund for a moved booking says the booking was cancelled and
+ * never asks the client to pay again. Never throws.
+ */
+export async function sendDeferredRefundNotice(notice: DeferredRefundNotice, opts: { bookingCancelled: boolean }): Promise<void> {
+  try {
+    await notifyUnappliedRefundWrite(notice.written, notice.row, opts);
+  } catch (error) {
+    console.error(`[consultation] deferred refund notice for ${notice.row.id} failed:`, error);
+  }
+}
+
+/**
+ * Send a just-written refund of an unapplied payment to Paystack (issue
+ * #354), without telling anyone. Never throws (a failure is left to the
+ * 15-minute retry job).
+ *
+ * @returns the row as it stands after the first Paystack try
+ */
+async function sendUnappliedRefund(written: UnappliedRefundWrite): Promise<Transaction> {
+  const { consultationRefundService } = await import("./consultation-refund.service");
+  const refund = written.refund!;
+  try {
+    return (await consultationRefundService.processRefund(refund.id)) ?? refund;
+  } catch (error) {
+    console.error(`[consultation] refund ${refund.id} could not be sent yet; the retry job will:`, error);
+    return refund;
+  }
+}
+
+/** Tell both sides about a refund of an unapplied payment (issue #354), see `startUnappliedRefund`. */
+async function notifyUnappliedRefundWrite(
+  written: UnappliedRefundWrite,
+  row: Transaction,
+  opts: { bookingCancelled?: boolean } = {}
+): Promise<void> {
+  const { consultationRefundService } = await import("./consultation-refund.service");
+  await consultationRefundService.notifyUnappliedRefund(row, written.exception, {
+    bookingAwaitingPayment: opts.bookingCancelled ? false : written.bookingAwaitingPayment,
+    guestBooking: written.guestBooking,
+    ...(opts.bookingCancelled ? { bookingCancelled: true } : {}),
+  });
+  if (written.debit) await consultationRefundService.notifyFeeDebit(written.debit);
 }
 
 /**
@@ -1034,19 +1106,8 @@ export async function settlePayment(
  * @returns the row as it stands after the first Paystack try
  */
 export async function startUnappliedRefund(written: UnappliedRefundWrite): Promise<Transaction> {
-  const { consultationRefundService } = await import("./consultation-refund.service");
-  const refund = written.refund!;
-  let row = refund;
-  try {
-    row = (await consultationRefundService.processRefund(refund.id)) ?? refund;
-  } catch (error) {
-    console.error(`[consultation] refund ${refund.id} could not be sent yet; the retry job will:`, error);
-  }
-  await consultationRefundService.notifyUnappliedRefund(row, written.exception, {
-    bookingAwaitingPayment: written.bookingAwaitingPayment,
-    guestBooking: written.guestBooking,
-  });
-  if (written.debit) await consultationRefundService.notifyFeeDebit(written.debit);
+  const row = await sendUnappliedRefund(written);
+  await notifyUnappliedRefundWrite(written, row);
   return row;
 }
 

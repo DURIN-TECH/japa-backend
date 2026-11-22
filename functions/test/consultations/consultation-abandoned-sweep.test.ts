@@ -107,6 +107,8 @@ async function seedPending(id: string, hoursAgo: number, overrides: Record<strin
     quoteLockedAt: Timestamp.fromMillis(expiresAt - 30 * 60_000),
     quoteExpiresAt: Timestamp.fromMillis(expiresAt),
     createdAt: T0, updatedAt: T0,
+    // Issue #411: what booking creation writes (the sweep selects on it).
+    sweepSetAside: false,
     ...overrides,
   });
 }
@@ -116,6 +118,36 @@ function booking(id: string): Record<string, any> {
   const found = docsIn("consultations").find(([docId]) => docId === id);
   assert.ok(found, `booking ${id} exists`);
   return found[1];
+}
+
+/**
+ * Issue #411: a sweep result with the counters a test names and 0 for the
+ * rest (the #411 counters included). `lookups` is compared by the tests
+ * about it, so `counts` leaves it out.
+ */
+function R(named: Record<string, number>): Record<string, number> {
+  return {
+    scanned: 0, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 0, errors: 0,
+    leftForCap: 0, setAside: 0, released: 0, ...named,
+  };
+}
+
+/** A sweep result without its `lookups` count (see `R`). */
+function counts(result: Record<string, number> | object): Record<string, number> {
+  const { lookups: _lookups, ...rest } = result as Record<string, number>;
+  void _lookups;
+  return rest;
+}
+
+/**
+ * Issue #411: booking `id` as stored, WITHOUT the sweep's own bookkeeping
+ * (`sweepReview`): a run that leaves a booking now records what it learned,
+ * but must change nothing else.
+ */
+function withoutSweep(id: string): string {
+  const { sweepReview: _ignored, ...rest } = booking(id);
+  void _ignored;
+  return JSON.stringify(rest);
 }
 
 /** Assert booking `id` was closed by the system at the harness clock's "now". */
@@ -203,7 +235,7 @@ describe("sweepAbandonedBookings", () => {
     paystackAbandoned("ref-b1", "b1");
 
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 1, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 });
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 }));
     assertSystemCancelled("b1");
     // The checkout fields are kept (a late payment is matched against them).
     assert.equal(booking("b1").transactionId, "ref-b1");
@@ -247,7 +279,7 @@ describe("sweepAbandonedBookings", () => {
     paystackPaid("ref-b1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" });
 
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 1, leftInProgress: 0, skipped: 0, errors: 0 });
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 0, settled: 1, leftInProgress: 0, skipped: 0, errors: 0 }));
     const b = booking("b1");
     assert.equal(b.status, "scheduled");
     assert.equal(b.paymentStatus, "paid");
@@ -263,10 +295,10 @@ describe("sweepAbandonedBookings", () => {
   test("paid, but not what the checkout asked (underpaid): neither settled nor cancelled", async () => {
     await seedPending("b1", 40, { transactionId: "ref-b1", checkoutUrl: "https://checkout.paystack.test/ref-b1" });
     paystackPaid("ref-b1", "b1", { amountMinor: FEE_KOBO - 1, currency: "NGN" });
-    const before = JSON.stringify(booking("b1"));
+    const before = withoutSweep("b1");
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
-    assert.equal(JSON.stringify(booking("b1")), before);
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 }));
+    assert.equal(withoutSweep("b1"), before);
     assert.equal(docsIn("transactions").length, 0);
   });
 
@@ -274,22 +306,22 @@ describe("sweepAbandonedBookings", () => {
     test(`IN PROGRESS at Paystack ('${status}'): left alone`, async () => {
       await seedPending("b1", 100, { transactionId: "ref-b1", checkoutUrl: "https://checkout.paystack.test/ref-b1" });
       paystackStatus("ref-b1", "b1", status);
-      const before = JSON.stringify(booking("b1"));
+      const before = withoutSweep("b1");
       const result = await consultationService.sweepAbandonedBookings();
-      assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 1, skipped: 0, errors: 0 });
-      assert.equal(JSON.stringify(booking("b1")), before);
+      assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 0, settled: 0, leftInProgress: 1, skipped: 0, errors: 0 }));
+      assert.equal(withoutSweep("b1"), before);
     });
   }
 
   test("not yet 24 hours past the lock: not even scanned; one clock hour later it is cancelled", async () => {
     await seedPending("recent", 23.5);
     await seedPending("inside-lock", -0.25); // its lock is still open
-    const before = { a: JSON.stringify(booking("recent")), b: JSON.stringify(booking("inside-lock")) };
+    const before = { a: withoutSweep("recent"), b: withoutSweep("inside-lock") };
 
     const first = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(first, { scanned: 0, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 });
-    assert.equal(JSON.stringify(booking("recent")), before.a);
-    assert.equal(JSON.stringify(booking("inside-lock")), before.b);
+    assert.deepEqual(counts(first), R({ scanned: 0, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 }));
+    assert.equal(withoutSweep("recent"), before.a);
+    assert.equal(withoutSweep("inside-lock"), before.b);
 
     // The sweep reads the charge path's clock: move it, no waiting.
     harness.clock.advanceHours(1);
@@ -297,7 +329,7 @@ describe("sweepAbandonedBookings", () => {
     assert.equal(second.scanned, 1);
     assert.equal(second.cancelled, 1);
     assertSystemCancelled("recent");
-    assert.equal(JSON.stringify(booking("inside-lock")), before.b);
+    assert.equal(withoutSweep("inside-lock"), before.b);
   });
 
   test("legacy rows (no quoteExpiresAt), paid, free and already-cancelled bookings are not touched", async () => {
@@ -310,11 +342,11 @@ describe("sweepAbandonedBookings", () => {
     });
     await seedPending("paid", 72, { status: "scheduled", paymentStatus: "paid", transactionId: "ref-paid", paidAt: T0 });
     await seedPending("cancelled", 72, { status: "cancelled", cancelledBy: "uid-client1", cancelledAt: T0 });
-    const before = ["legacy", "paid", "cancelled"].map((id) => JSON.stringify(booking(id)));
+    const before = ["legacy", "paid", "cancelled"].map((id) => withoutSweep(id));
 
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 0, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 });
-    assert.deepEqual(["legacy", "paid", "cancelled"].map((id) => JSON.stringify(booking(id))), before);
+    assert.deepEqual(counts(result), R({ scanned: 0, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 }));
+    assert.deepEqual(["legacy", "paid", "cancelled"].map((id) => withoutSweep(id)), before);
   });
 
   test("guest bookings are swept like any other", async () => {
@@ -354,11 +386,11 @@ describe("sweepAbandonedBookings", () => {
     paystackAbandoned("ref-first", "first");
     paystackAbandoned("ref-second", "second");
     harness.failNextLookup = true; // the oldest lock is looked up first
-    const before = JSON.stringify(booking("first"));
+    const before = withoutSweep("first");
 
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 2, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 1 });
-    assert.equal(JSON.stringify(booking("first")), before, "not cancelled without Paystack's answer");
+    assert.deepEqual(counts(result), R({ scanned: 2, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 1 }));
+    assert.equal(withoutSweep("first"), before, "not cancelled without Paystack's answer");
     assertSystemCancelled("second");
 
     // The next run picks the first one up again.
@@ -405,7 +437,7 @@ describe("sweepAbandonedBookings: a change between the Paystack check and the ca
     };
 
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 }));
     const b = booking("b1");
     assert.equal(b.status, "scheduled");
     assert.equal(b.paymentStatus, "paid");
@@ -665,7 +697,7 @@ describe("decideAbandonedCheckouts (pure, issue #397)", () => {
 });
 
 describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)", () => {
-  test("every checkout is looked up once: the live one and each superseded entry", async () => {
+  test("every checkout is looked up once: each superseded entry (stored order), then the live one (#411 order)", async () => {
     await seedPending("b1", 30, {
       transactionId: "live-1",
       supersededCheckouts: [entry("old-1", false), entry("old-2", true)],
@@ -675,18 +707,19 @@ describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)"
     paystackStatus("old-2", "b1", "failed");
     const seen = countLookups();
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(seen, ["live-1", "old-1", "old-2"]);
-    assert.deepEqual(result, { scanned: 1, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 });
+    // Issue #411: retired / superseded first, in stored order, the live one last.
+    assert.deepEqual(seen, ["old-1", "old-2", "live-1"]);
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 }));
     assertSystemCancelled("b1");
   });
 
   test("a retired checkout IN PROGRESS: left (nothing written, leftInProgress 1)", async () => {
     await seedPending("b1", 30, { supersededCheckouts: [entry("old-1", true)] });
     paystackStatus("old-1", "b1", "ongoing");
-    const before = JSON.stringify(booking("b1"));
+    const before = withoutSweep("b1");
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 1, skipped: 0, errors: 0 });
-    assert.equal(JSON.stringify(booking("b1")), before);
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 0, settled: 0, leftInProgress: 1, skipped: 0, errors: 0 }));
+    assert.equal(withoutSweep("b1"), before);
     assert.equal(docsIn("transactions").length, 0);
     assert.equal(docsIn("consultationPaymentExceptions").length, 0);
   });
@@ -705,7 +738,7 @@ describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)"
     paystackPaid("old-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" }, harness.clock.now(), { fees: 20_000 });
 
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 1, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 });
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 }));
     assertSystemCancelled("b1");
 
     const exceptions = docsIn("consultationPaymentExceptions");
@@ -736,22 +769,24 @@ describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)"
     paystackPaid("old-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" });
     paystackStatus("old-2", "b1", "ongoing");
 
-    // Run 1: old-2 is in flight, so nothing at all is written.
+    // Run 1: old-2 is in flight, so the booking is left. Issue #411: but
+    // old-1, PAID and looked up first, is settled now (exception + refund).
     const first = await consultationService.sweepAbandonedBookings();
     assert.equal(first.leftInProgress, 1);
-    assert.equal(docsIn("consultationPaymentExceptions").length, 0);
+    assert.equal(docsIn("consultationPaymentExceptions").length, 1);
+    assert.equal(refundsOf("b1").length, 1);
 
-    // Meanwhile the payer's verify records old-1 (exception + refund).
+    // Meanwhile the payer's verify of old-1 finds it recorded: nothing new.
     const out = await verify("old-1");
     assert.equal(out.status, 409, JSON.stringify(out.body));
     assert.equal(docsIn("consultationPaymentExceptions").length, 1);
     assert.equal(refundsOf("b1").length, 1);
 
-    // Run 2: old-2 failed for good. old-1 is paid again at Paystack, settled
-    // again (idempotent: nothing new), and no longer keeps the booking alive.
+    // Run 2: old-2 failed for good. old-1 is recorded as handled (not looked
+    // up again, #411) and no longer keeps the booking alive.
     paystackStatus("old-2", "b1", "abandoned");
     const second = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(second, { scanned: 1, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 });
+    assert.deepEqual(counts(second), R({ scanned: 1, cancelled: 1, settled: 0, leftInProgress: 0, skipped: 0, errors: 0 }));
     assertSystemCancelled("b1");
     assert.equal(docsIn("consultationPaymentExceptions").length, 1);
     assert.equal(refundsOf("b1").length, 1, "still one refund");
@@ -762,7 +797,7 @@ describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)"
     paystackAbandoned("live-1", "b1");
     paystackPaid("old-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" });
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 1, leftInProgress: 0, skipped: 0, errors: 0 });
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 0, settled: 1, leftInProgress: 0, skipped: 0, errors: 0 }));
     const b = booking("b1");
     assert.equal(b.status, "scheduled");
     assert.equal(b.paymentStatus, "paid");
@@ -775,10 +810,10 @@ describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)"
   test("a superseded checkout paid with the WRONG amount: left for review (skipped), never cancelled", async () => {
     await seedPending("b1", 30, { supersededCheckouts: [entry("old-1", true)] });
     paystackPaid("old-1", "b1", { amountMinor: FEE_KOBO - 1, currency: "NGN" });
-    const before = JSON.stringify(booking("b1"));
+    const before = withoutSweep("b1");
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
-    assert.equal(JSON.stringify(booking("b1")), before);
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 }));
+    assert.equal(withoutSweep("b1"), before);
     assert.equal(docsIn("transactions").length, 0);
   });
 
@@ -786,17 +821,19 @@ describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)"
     await seedPending("b1", 30, { transactionId: "live-1", supersededCheckouts: [entry("old-1", true)] });
     paystackAbandoned("live-1", "b1");
     paystackAbandoned("old-1", "b1");
-    // The live one answers, then the superseded one fails.
+    // Issue #411: the superseded one is asked first and fails: the lookups
+    // stop there, except for the live one (review round 1: always asked, so
+    // a paid live checkout is always settled).
     let calls = 0;
     harness.onLookup = async (reference: string) => {
       calls++;
       if (reference === "old-1") throw new Error("PAYSTACK_ERROR: 502 Bad Gateway");
       return undefined;
     };
-    const before = JSON.stringify(booking("b1"));
+    const before = withoutSweep("b1");
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 0, errors: 1 });
-    assert.equal(JSON.stringify(booking("b1")), before);
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 0, errors: 1 }));
+    assert.equal(withoutSweep("b1"), before);
     assert.equal(calls, 2);
   });
 
@@ -829,7 +866,7 @@ describe("sweepAbandonedBookings: retired and superseded checkouts (issue #397)"
       return undefined;
     };
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 }));
     assert.equal(booking("b1").status, "pending_payment");
   });
 
@@ -910,7 +947,7 @@ describe("sweepAbandonedBookings after an agent-side reschedule (issue #405)", (
     // Right after the move, and 24 hours later: skipped, no Paystack call.
     const seen = countLookups();
     const first = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(first, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
+    assert.deepEqual(counts(first), R({ scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 }));
     harness.clock.advanceHours(24);
     const atDay = await consultationService.sweepAbandonedBookings();
     assert.equal(atDay.skipped, 1);
@@ -986,7 +1023,7 @@ describe("sweepAbandonedBookings after an agent-side reschedule (issue #405)", (
       return undefined;
     };
     const result = await consultationService.sweepAbandonedBookings();
-    assert.deepEqual(result, { scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 });
+    assert.deepEqual(counts(result), R({ scanned: 1, cancelled: 0, settled: 0, leftInProgress: 0, skipped: 1, errors: 0 }));
     assert.equal(booking("b1").status, "pending_payment");
     assert.ok(booking("b1").paymentGraceStartsAt);
   });

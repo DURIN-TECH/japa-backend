@@ -246,6 +246,8 @@ describe("sweepAbandonedBookings on the real query engine (issue #288)", () => {
       quoteLockedAt: new Date(expiresAt - 30 * 60_000),
       quoteExpiresAt: new Date(expiresAt),
       createdAt: now, updatedAt: now,
+      // Issue #411: what booking creation writes (the sweep selects on it).
+      sweepSetAside: false,
       ...extra,
     });
   }
@@ -280,7 +282,11 @@ describe("sweepAbandonedBookings on the real query engine (issue #288)", () => {
     const { consultationService } = await import("../../src/services/consultation.service");
     const result = await consultationService.sweepAbandonedBookings();
     // The query returned the four bookings past the cutoff, and only those.
-    assert.deepEqual(result, { scanned: 4, cancelled: 2, settled: 1, leftInProgress: 1, skipped: 0, errors: 0 });
+    // Issue #411: the new counters (three Paystack lookups: the no-checkout booking needs none).
+    assert.deepEqual(result, {
+      scanned: 4, cancelled: 2, settled: 1, leftInProgress: 1, skipped: 0, errors: 0,
+      leftForCap: 0, setAside: 0, released: 0, lookups: 3,
+    });
 
     for (const id of ["s288-abandoned", "s288-no-checkout"]) {
       const b = await stored("consultations", id);

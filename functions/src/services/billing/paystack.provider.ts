@@ -351,7 +351,7 @@ export class PaystackProvider implements BillingProvider {
         // Issue #354: Paystack's processing fee on this charge (minor units).
         fees?: unknown;
       };
-    }>(`/transaction/verify/${encodeURIComponent(reference)}`);
+    }>(`/transaction/verify/${encodeURIComponent(reference)}`, { timeout: PAYSTACK_LOOKUP_TIMEOUT_MS });
     const data = res.data.data;
     if (!data) return null;
     return toTransactionLookup(data);
@@ -416,11 +416,13 @@ export class PaystackProvider implements BillingProvider {
    */
   async findRefundsForTransaction(reference: string): Promise<PaystackRefund[]> {
     const verify = await this.client().get<{ data?: { id?: unknown } }>(
-      `/transaction/verify/${encodeURIComponent(reference)}`
+      `/transaction/verify/${encodeURIComponent(reference)}`,
+      { timeout: PAYSTACK_LOOKUP_TIMEOUT_MS }
     );
     const transactionId = verify.data.data?.id;
     const res = await this.client().get<{ data?: unknown }>("/refund", {
       params: { ...(transactionId !== undefined ? { transaction: transactionId } : {}), perPage: 100 },
+      timeout: PAYSTACK_LOOKUP_TIMEOUT_MS,
     });
     const rows = Array.isArray(res.data.data) ? (res.data.data as Record<string, unknown>[]) : [];
     return rows
@@ -446,7 +448,9 @@ export class PaystackProvider implements BillingProvider {
    *   cannot be reached
    */
   async fetchRefund(refundId: string): Promise<PaystackRefund | null> {
-    const res = await this.client().get<{ data?: unknown }>(`/refund/${encodeURIComponent(refundId)}`);
+    const res = await this.client().get<{ data?: unknown }>(`/refund/${encodeURIComponent(refundId)}`, {
+      timeout: PAYSTACK_LOOKUP_TIMEOUT_MS,
+    });
     return toPaystackRefund(res.data.data);
   }
 
@@ -654,6 +658,17 @@ export function toTransactionLookup(data: {
 export { isWellFormedFee } from "../../money/paystack-fee";
 
 /** One refund as Paystack reports it (issue #317). */
+/**
+ * Issue #411 (review round 1): how long a READ-ONLY Paystack lookup (verify
+ * a transaction, list or fetch refunds) may take before it is given up, in
+ * ms. A hung call then fails like any network error (the sweep counts it as
+ * a failed lookup, never as an answer, and does not count it toward
+ * set-aside), instead of using up a whole scheduled run. Writes (charges,
+ * refunds) keep axios's default: a timed-out write may still have reached
+ * Paystack, and every caller already looks up before it repeats one.
+ */
+export const PAYSTACK_LOOKUP_TIMEOUT_MS = 10_000;
+
 export interface PaystackRefund {
   /** Paystack's refund id (a number in its API, kept as a string). */
   id: string;

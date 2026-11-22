@@ -1405,7 +1405,33 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   // moved after its quote lock gives the client the full 24 hours to pay for
   // the new time. Absent on a booking never moved while unpaid.
   paymentGraceStartsAt?: Timestamp;
-  
+
+  // ---- Issue #411: abandoned-booking sweep bookkeeping ----
+  // Issue #411: how many times the agent side MOVED this booking while it was
+  // unpaid, each one restarting its payment grace (#405). Only counted (no
+  // cap, orchestrator decision 2026-11-21); shown on the admin sweep-review
+  // list. Absent until the first such move.
+  graceRestartCount?: number;
+  // Issue #411: true once the sweep has SET ASIDE this booking (it stayed
+  // unresolved for SWEEP_SET_ASIDE_AFTER_RUNS runs): the sweep's query no
+  // longer selects it, so it stops taking a batch slot, and it is listed for
+  // admins (`GET /consultations/sweep-review`). Written `false` when a
+  // pending_payment booking is created, because Firestore's equality filter
+  // never matches a MISSING field (rows made before #411 get it from
+  // `npm run backfill:sweep-lane`). Cleared by a reschedule, by the sweep's
+  // release pass when the booking's checkouts or grace change, and by an
+  // admin re-check that finds nothing in flight any more.
+  sweepSetAside?: boolean;
+  // Issue #411: what the sweep last learned about this booking (sweep-owned;
+  // see `ConsultationSweepReview`). Never read by the money paths.
+  sweepReview?: ConsultationSweepReview;
+  // Issue #411 (decision 2026-11-21, from #391): when the one-time pay link
+  // emailed to a GUEST (`bookedVia: "public_page"`) after an agent-side move
+  // expires. #391 sets it (the link itself lives in `consultationPayLinks`).
+  // The sweep's payment grace for a guest booking runs until the later of
+  // the normal grace and this, never past the slot start.
+  payLinkExpiresAt?: Timestamp;
+
   // After consultation
   summary?: string;
   recordingUrl?: string;
@@ -1499,6 +1525,93 @@ export interface NoShowReport {
   resolvedBy?: string;
   /** The refund row written for `agent_no_show`. */
   refundId?: string;
+}
+
+// ============================================
+// Abandoned-booking sweep bookkeeping (issue #411)
+// ============================================
+
+/**
+ * Why a sweep run (or an admin re-check) left a booking unresolved:
+ *  - `in_progress`: a checkout is still in progress at Paystack (a bank
+ *    transfer may still land);
+ *  - `review`:      a paid checkout could not be applied or recorded by
+ *    `settlePayment` (wrong amount, ...): a human must look;
+ *  - `lookup_failed`: asking Paystack failed (network, 5xx, 401);
+ *  - `not_found`:   Paystack answered "not found" for a reference it
+ *    generated itself (fail closed: never cancelled on that answer);
+ *  - `error`:       anything else failed while handling the booking;
+ *  - `too_many_checkouts`: more references than one run may look up.
+ */
+export type SweepUnresolvedOutcome =
+  | "in_progress"
+  | "review"
+  | "lookup_failed"
+  | "not_found"
+  | "error"
+  // The booking carries more checkout references than one run may look up
+  // (SWEEP_MAX_LOOKUPS_PER_RUN), so the sweep can never check them all
+  // before a cancel: counted, so it is set aside for an admin (whose
+  // actions have no run budget).
+  | "too_many_checkouts";
+
+/**
+ * The last known state of ONE checkout reference of a booking, as the sweep
+ * recorded it:
+ *  - `final_unpaid`:   final at Paystack and unpaid (failed, abandoned, or
+ *                      one of OUR references Paystack never saw). FINAL;
+ *  - `paid_handled`:   paid, and `settlePayment` recorded it as an exception
+ *                      and refunded it (#354). FINAL;
+ *  - `paid_confirmed`: paid, and it confirmed the booking. FINAL;
+ *  - `paid_review`:    paid, but `settlePayment` could not apply or record it;
+ *  - `in_progress`:    still in progress at Paystack;
+ *  - `lookup_failed` / `not_found`: the lookup failed (see above).
+ * A FINAL reference is never looked up again by the sweep.
+ */
+export type SweepCheckoutKnownState =
+  | "final_unpaid"
+  | "paid_handled"
+  | "paid_confirmed"
+  | "paid_review"
+  | "in_progress"
+  | "lookup_failed"
+  | "not_found";
+
+/** One checkout reference as recorded by the sweep (issue #411). */
+export interface SweepCheckoutRecord {
+  /** The Paystack reference. */
+  reference: string;
+  /** Its last known state. */
+  state: SweepCheckoutKnownState;
+  /** True when that state can no longer change (no further lookups). */
+  final: boolean;
+  /** When the sweep (or an admin re-check) learned it. */
+  checkedAt: Timestamp;
+  /** The `settlePayment` outcome kind, when the reference was settled. */
+  settleOutcome?: string;
+}
+
+/**
+ * The sweep's bookkeeping on one booking (issue #411), written only by the
+ * sweep and the admin sweep-review actions, never by a money path.
+ */
+export interface ConsultationSweepReview {
+  /** Consecutive runs that left the booking unresolved, for the same `fingerprint`. */
+  unresolvedRuns: number;
+  /** Why the last unresolved run left it. */
+  lastOutcome?: SweepUnresolvedOutcome;
+  /** When that run was. */
+  lastRunAt?: Timestamp;
+  /**
+   * The booking's checkouts and grace when the counter was last written
+   * (`sweepFingerprint`). A booking whose fingerprint changed (re-priced,
+   * rescheduled, a new pay link) starts its count again.
+   */
+  fingerprint: string;
+  /** When the booking was set aside (absent when it is not). */
+  setAsideAt?: Timestamp;
+  /** Last known state of each checkout reference the sweep has seen. */
+  checkouts: SweepCheckoutRecord[];
 }
 
 /**

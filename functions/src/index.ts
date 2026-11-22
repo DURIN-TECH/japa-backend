@@ -506,18 +506,40 @@ export const sendUnreadMessageReminders = functions
 /**
  * Hourly: cancel consultation bookings that were never paid (issue #288).
  *
- * A `pending_payment` booking whose quote lock (`quoteExpiresAt`) ended more
- * than 24 hours ago is closed as the system (`cancelledBy: "system"`), guest
- * bookings included, at most 200 per run. Before a booking is cancelled its
- * current checkout is checked at Paystack: one that was PAID is settled
- * instead (the booking is confirmed), one still IN PROGRESS is left for a
- * later run. Nobody is notified of a system cancel. The rules and the writes
- * live in `consultationService.sweepAbandonedBookings`.
+ * A `pending_payment` booking whose payment grace ended more than 24 hours
+ * ago is closed as the system (`cancelledBy: "system"`), guest bookings
+ * included, at most 200 per run. Nobody is notified of a system cancel. The
+ * rules and the writes live in `consultationService.sweepAbandonedBookings`:
+ *  - the grace runs from the later of the quote lock's end and the last time
+ *    the agent side moved the unpaid booking (#405); a guest's live pay link
+ *    (`payLinkExpiresAt`, #391/#411) extends it, never past the slot start;
+ *  - EVERY checkout of the booking is checked at Paystack, the live one and
+ *    each retired or re-priced one (#397). A PAID one is settled through
+ *    `settlePayment` (the booking confirmed, or the payment recorded and
+ *    refunded under #354); one still IN PROGRESS keeps the booking for a
+ *    later run;
+ *  - (#411) retired checkouts are looked up before the live one and the
+ *    lookups stop at the first one in progress; a reference already final
+ *    is skipped while the booking is left, but every reference is asked
+ *    about once more just before a cancel (an "abandoned" checkout can still
+ *    be paid); a run makes at most SWEEP_MAX_LOOKUPS_PER_RUN Paystack calls
+ *    and leaves the rest for the next run;
+ *  - (#411) a booking left because a checkout is in progress still gets
+ *    every PAID retired checkout settled (refunded) in that run; only the
+ *    cancel waits;
+ *  - (#411) a booking left unresolved for SWEEP_SET_ASIDE_AFTER_RUNS runs is
+ *    SET ASIDE: no longer selected (it stops taking a batch slot), never
+ *    cancelled by the sweep, and listed for admins at
+ *    `GET /consultations/sweep-review` (check again / cancel from there).
+ *    A re-price, a reschedule or a new pay link releases it.
+ * The sweep never writes a money row itself.
  *
  * Secrets: PAYSTACK_SECRET_KEY, for the Paystack lookup (the same key the
  * `api` function uses). No email secrets: this job sends nothing.
- * Timeout: one Paystack call per booking, so the full 9 minutes are allowed.
- * Index: consultations(status, quoteExpiresAt) in firestore.indexes.json.
+ * Timeout: up to SWEEP_MAX_LOOKUPS_PER_RUN Paystack calls, so the full 9
+ * minutes are allowed.
+ * Index: consultations(status, sweepSetAside, quoteExpiresAt) in
+ * firestore.indexes.json.
  */
 export const sweepAbandonedConsultations = functions
   .runWith({ timeoutSeconds: 540, memory: "256MB", secrets: ["PAYSTACK_SECRET_KEY"] })
@@ -530,7 +552,10 @@ export const sweepAbandonedConsultations = functions
       console.log(
         `Abandoned consultation sweep: ${result.scanned} scanned, ${result.cancelled} cancelled, ` +
           `${result.settled} settled as paid, ${result.leftInProgress} left in progress, ` +
-          `${result.skipped} skipped, ${result.errors} errors`
+          `${result.skipped} skipped, ${result.errors} errors, ` +
+          // Issue #411: the lookup cap, set-aside and release counts.
+          `${result.leftForCap} left for the lookup cap, ${result.setAside} set aside, ` +
+          `${result.released} released, ${result.lookups} Paystack lookups`
       );
     } catch (error) {
       // Logged, never thrown: a failed run is simply retried by the next one.
