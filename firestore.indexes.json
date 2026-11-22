@@ -335,6 +335,24 @@
       "queryScope": "COLLECTION",
       "fields": [
         {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "sweepSetAside",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "quoteExpiresAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "consultations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
           "fieldPath": "agencyId",
           "order": "ASCENDING"
         },

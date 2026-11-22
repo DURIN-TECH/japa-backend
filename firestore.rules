@@ -779,6 +779,18 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // ---- Guest pay-again links (issue #391), explicit deny ----
+    // consultationPayLinks/{sha256(token)}: one-time links that let a guest
+    // pay for a rescheduled booking without signing in. The doc names the
+    // booking, its agency and the refunded Paystack reference. Read and
+    // written by the backend only (the two public pay-link routes, the mint
+    // after a refund, settlePayment). Denied for every client, admins
+    // included: a client that could list them could find other people's
+    // bookings, and one that could write them could revive a dead link.
+    match /consultationPayLinks/{linkId} {
+      allow read, write: if false;
+    }
+
     // ---- Consultation booking locks (issue #288), explicit deny ----
     // consultationBookingLocks/{hash of client uid + agent uid}: one document
     // per client and agent pair, read and written by the backend inside the

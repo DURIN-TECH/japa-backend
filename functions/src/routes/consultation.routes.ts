@@ -3,6 +3,9 @@ import { consultationController } from "../controllers/consultation.controller";
 import { verifyAuth } from "../middleware/auth";
 import { requireFeature } from "../middleware/authz";
 import { FEATURES } from "@durin-tech/authz";
+// Issue #391: the guest pay-again link routes, and their per-IP brake.
+import { consultationPayLinkController } from "../controllers/consultation-pay-link.controller";
+import { payLinkRateLimit } from "../middleware/public-rate-limit";
 
 const router = Router();
 
@@ -10,6 +13,20 @@ const router = Router();
 // before "/:id" so "public" isn't matched as a consultation id.
 router.post("/public/verify", (req, res) =>
   consultationController.verifyPublicConsultation(req, res)
+);
+
+// Issue #391: PUBLIC — no auth. A guest's one-time pay-again link (emailed
+// after a refund caused by a reschedule): read that ONE booking's summary
+// and today's price (`lookup`), and open a checkout on it (`checkout`). The
+// token is in the JSON BODY (`{ token }`), never in the path or query
+// (decision 2026-11-21: a path lands in Cloud Run request logs). Defined
+// before "/:id" (multi-segment "/public/..." paths, so "/:id" could never
+// match them anyway). Rate-limited per IP; the token never signs anyone in.
+router.post("/public/pay-links/lookup", payLinkRateLimit, (req, res) =>
+  consultationPayLinkController.getPayLink(req, res)
+);
+router.post("/public/pay-links/checkout", payLinkRateLimit, (req, res) =>
+  consultationPayLinkController.checkout(req, res)
 );
 
 // /stats must come before /:id to avoid "stats" matching as an id
@@ -37,6 +54,13 @@ router.get("/payment-exceptions", verifyAuth, (req, res) =>
 // token; the controller answers 403 for anyone but an admin.
 router.get("/no-show-reports", verifyAuth, (req, res) =>
   consultationController.listNoShowReports(req, res)
+);
+
+// Issue #411: admin list of bookings the abandoned-booking sweep set aside.
+// Before /:id, so "sweep-review" is never read as a booking id. 401 without
+// a token (verifyAuth); the controller answers 403 for anyone but an admin.
+router.get("/sweep-review", verifyAuth, (req, res) =>
+  consultationController.listSweepReview(req, res)
 );
 
 router.get("/:id", verifyAuth, (req, res) =>
@@ -94,6 +118,16 @@ router.post("/:id/refund/resolve-mismatch", verifyAuth, (req, res) =>
 // anyone but an admin, before anything is read.
 router.post("/:id/payment-exceptions/:exceptionId/close", verifyAuth, (req, res) =>
   consultationController.closePaymentException(req, res)
+);
+
+// Issue #411: an admin looks a set-aside booking up again (settling a paid
+// checkout only through settlePayment), or cancels it with the sweep's own
+// safety checks. Admin only: the controller answers 403 before any read.
+router.post("/:id/sweep-review/check", verifyAuth, (req, res) =>
+  consultationController.recheckSweepReview(req, res)
+);
+router.post("/:id/sweep-review/cancel", verifyAuth, (req, res) =>
+  consultationController.cancelSweepReview(req, res)
 );
 
 router.delete("/:id", verifyAuth, (req, res) =>

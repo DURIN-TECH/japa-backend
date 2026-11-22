@@ -109,6 +109,11 @@ export const collections = {
   noShowReports: db.collection("noShowReports"),
   // Issue #181: payment-request payments held for refund (backend only, see firestore.rules).
   paymentRequestExceptions: db.collection("paymentRequestExceptions"),
+  // Issue #391: one-time "pay again" links for guest bookings whose payment
+  // was refunded after a reschedule. Doc id = SHA-256 of the raw token (the
+  // token itself is never stored). Backend only: firestore.rules denies
+  // every client, and the only reads are the two public pay-link routes.
+  consultationPayLinks: db.collection("consultationPayLinks"),
   notifications: db.collection("notifications"),
   // In-app tester feedback (issue #257): one doc per note (userId, kind, message,
   // route, app/device info, optional screenshotPath, status "new"). Written and

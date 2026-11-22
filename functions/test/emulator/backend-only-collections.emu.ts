@@ -48,6 +48,9 @@ const COLLECTIONS = [
   // report, the agent's frozen fee and the admin's decision. Only the API
   // writes them; a client that could write one could freeze an agent's money.
   "noShowReports",
+  // Guest pay-again links (issue #391): booking ids, agency ids and the
+  // refunded Paystack reference. Explicit deny; backend (Admin SDK) only.
+  "consultationPayLinks",
   // Payment requests (issue #181): the agent's dollar price, the charge
   // snapshot, the checkout references and the paid status. Only the API
   // writes them (settlement in one Firestore transaction); a client that

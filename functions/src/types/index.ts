@@ -1405,7 +1405,33 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   // moved after its quote lock gives the client the full 24 hours to pay for
   // the new time. Absent on a booking never moved while unpaid.
   paymentGraceStartsAt?: Timestamp;
-  
+
+  // ---- Issue #411: abandoned-booking sweep bookkeeping ----
+  // Issue #411: how many times the agent side MOVED this booking while it was
+  // unpaid, each one restarting its payment grace (#405). Only counted (no
+  // cap, orchestrator decision 2026-11-21); shown on the admin sweep-review
+  // list. Absent until the first such move.
+  graceRestartCount?: number;
+  // Issue #411: true once the sweep has SET ASIDE this booking (it stayed
+  // unresolved for SWEEP_SET_ASIDE_AFTER_RUNS runs): the sweep's query no
+  // longer selects it, so it stops taking a batch slot, and it is listed for
+  // admins (`GET /consultations/sweep-review`). Written `false` when a
+  // pending_payment booking is created, because Firestore's equality filter
+  // never matches a MISSING field (rows made before #411 get it from
+  // `npm run backfill:sweep-lane`). Cleared by a reschedule, by the sweep's
+  // release pass when the booking's checkouts or grace change, and by an
+  // admin re-check that finds nothing in flight any more.
+  sweepSetAside?: boolean;
+  // Issue #411: what the sweep last learned about this booking (sweep-owned;
+  // see `ConsultationSweepReview`). Never read by the money paths.
+  sweepReview?: ConsultationSweepReview;
+  // Issue #411 (decision 2026-11-21, from #391): when the one-time pay link
+  // emailed to a GUEST (`bookedVia: "public_page"`) after an agent-side move
+  // expires. #391 sets it (the link itself lives in `consultationPayLinks`).
+  // The sweep's payment grace for a guest booking runs until the later of
+  // the normal grace and this, never past the slot start.
+  payLinkExpiresAt?: Timestamp;
+
   // After consultation
   summary?: string;
   recordingUrl?: string;
@@ -1499,6 +1525,93 @@ export interface NoShowReport {
   resolvedBy?: string;
   /** The refund row written for `agent_no_show`. */
   refundId?: string;
+}
+
+// ============================================
+// Abandoned-booking sweep bookkeeping (issue #411)
+// ============================================
+
+/**
+ * Why a sweep run (or an admin re-check) left a booking unresolved:
+ *  - `in_progress`: a checkout is still in progress at Paystack (a bank
+ *    transfer may still land);
+ *  - `review`:      a paid checkout could not be applied or recorded by
+ *    `settlePayment` (wrong amount, ...): a human must look;
+ *  - `lookup_failed`: asking Paystack failed (network, 5xx, 401);
+ *  - `not_found`:   Paystack answered "not found" for a reference it
+ *    generated itself (fail closed: never cancelled on that answer);
+ *  - `error`:       anything else failed while handling the booking;
+ *  - `too_many_checkouts`: more references than one run may look up.
+ */
+export type SweepUnresolvedOutcome =
+  | "in_progress"
+  | "review"
+  | "lookup_failed"
+  | "not_found"
+  | "error"
+  // The booking carries more checkout references than one run may look up
+  // (SWEEP_MAX_LOOKUPS_PER_RUN), so the sweep can never check them all
+  // before a cancel: counted, so it is set aside for an admin (whose
+  // actions have no run budget).
+  | "too_many_checkouts";
+
+/**
+ * The last known state of ONE checkout reference of a booking, as the sweep
+ * recorded it:
+ *  - `final_unpaid`:   final at Paystack and unpaid (failed, abandoned, or
+ *                      one of OUR references Paystack never saw). FINAL;
+ *  - `paid_handled`:   paid, and `settlePayment` recorded it as an exception
+ *                      and refunded it (#354). FINAL;
+ *  - `paid_confirmed`: paid, and it confirmed the booking. FINAL;
+ *  - `paid_review`:    paid, but `settlePayment` could not apply or record it;
+ *  - `in_progress`:    still in progress at Paystack;
+ *  - `lookup_failed` / `not_found`: the lookup failed (see above).
+ * A FINAL reference is never looked up again by the sweep.
+ */
+export type SweepCheckoutKnownState =
+  | "final_unpaid"
+  | "paid_handled"
+  | "paid_confirmed"
+  | "paid_review"
+  | "in_progress"
+  | "lookup_failed"
+  | "not_found";
+
+/** One checkout reference as recorded by the sweep (issue #411). */
+export interface SweepCheckoutRecord {
+  /** The Paystack reference. */
+  reference: string;
+  /** Its last known state. */
+  state: SweepCheckoutKnownState;
+  /** True when that state can no longer change (no further lookups). */
+  final: boolean;
+  /** When the sweep (or an admin re-check) learned it. */
+  checkedAt: Timestamp;
+  /** The `settlePayment` outcome kind, when the reference was settled. */
+  settleOutcome?: string;
+}
+
+/**
+ * The sweep's bookkeeping on one booking (issue #411), written only by the
+ * sweep and the admin sweep-review actions, never by a money path.
+ */
+export interface ConsultationSweepReview {
+  /** Consecutive runs that left the booking unresolved, for the same `fingerprint`. */
+  unresolvedRuns: number;
+  /** Why the last unresolved run left it. */
+  lastOutcome?: SweepUnresolvedOutcome;
+  /** When that run was. */
+  lastRunAt?: Timestamp;
+  /**
+   * The booking's checkouts and grace when the counter was last written
+   * (`sweepFingerprint`). A booking whose fingerprint changed (re-priced,
+   * rescheduled, a new pay link) starts its count again.
+   */
+  fingerprint: string;
+  /** When the booking was set aside (absent when it is not). */
+  setAsideAt?: Timestamp;
+  /** Last known state of each checkout reference the sweep has seen. */
+  checkouts: SweepCheckoutRecord[];
 }
 
 /**
@@ -1632,6 +1745,55 @@ export interface ConsultationPaymentException {
   createdAt: Timestamp;
   /** Last change of `status` / `refundId` (absent until the first change). */
   updatedAt?: Timestamp;
+}
+
+/**
+ * Issue #391: a one-time "pay again" link for a GUEST booking
+ * (`bookedVia: "public_page"`) whose payment on a checkout retired by a
+ * reschedule was refunded (`paid_for_rescheduled_slot`, #354). Emailed to
+ * the guest so they can pay for the new time without signing in.
+ *
+ * Collection `consultationPayLinks`, doc id = the hex SHA-256 of the raw
+ * token. The RAW token is never stored, logged or returned by any API: it
+ * exists only in the email. Backend only: firestore.rules denies every
+ * client (see services/consultation-pay-link.service.ts).
+ *
+ * A link is LIVE while `usedAt` and `supersededAt` are null and `expiresAt`
+ * is in the future, AND its booking is still `pending_payment`. Anything
+ * else is dead and every pay-link route answers the same 410.
+ */
+export interface ConsultationPayLink {
+  /** The doc id: hex SHA-256 of the raw token (also kept in `tokenHash`). */
+  id: string;
+  /** Hex SHA-256 of the raw token, compared in constant time on every lookup. */
+  tokenHash: string;
+  /** The ONE booking this link can pay for. */
+  consultationId: string;
+  /** The booking's agency, and its public slug at mint time (the link's path). */
+  agencyId: string;
+  agencySlug: string;
+  /** The Paystack reference of the refunded payment that caused this link. */
+  exceptionId: string;
+  createdAt: Timestamp;
+  /** The earlier of 72 h after minting and the booking's slot start. */
+  expiresAt: Timestamp;
+  /** Set (in the same transaction) when a payment confirmed the booking. */
+  usedAt: Timestamp | null;
+  /** The Paystack reference of the payment that used it up. */
+  usedByReference?: string;
+  /** Set when a newer link for the same booking was minted (at most one live link). */
+  supersededAt: Timestamp | null;
+  /**
+   * Review round 3 (user decision 2026-11-22): how this link's email went,
+   * from the send status (`emailService.sendNotification`). Absent while the
+   * send has not been recorded. Only "sent" lets the guest copy say "We've
+   * emailed you a link", and only a live SENT link stops a re-mint.
+   */
+  emailStatus?: "sent" | "failed" | "skipped";
+  /** When `emailStatus` was recorded. */
+  emailStatusAt?: Timestamp;
+  /** When the email was sent (only with `emailStatus: "sent"`). */
+  emailedAt?: Timestamp;
 }
 
 /**

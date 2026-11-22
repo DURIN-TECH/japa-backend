@@ -39,6 +39,9 @@ import type { Transaction as FirestoreTransaction } from "firebase-admin/firesto
 import { isWellFormedFee } from "./billing/paystack.provider";
 // Issue #395: Paystack's fee on a CONFIRMED payment is the agent's (credit A - F).
 import { classifyPaystackFee } from "../money/paystack-fee";
+// Issue #391: a guest's one-time "pay again" link after a rescheduled refund
+// (minted when the late payment is recorded; used up when a payment confirms).
+import { hasLiveEmailedPayLink, markPayLinksUsed, readLivePayLinks, sendGuestPayAgainLink } from "./consultation-pay-link.service";
 
 export {
   CHECKOUT_WAIT_ATTEMPTS,
@@ -688,6 +691,24 @@ export function writeUnappliedRefund(
 }
 
 /** What settling a successful Paystack payment did. */
+/**
+ * Issue #411 (review round 1): a refund notice `settlePayment` did NOT send
+ * because its caller asked it to wait (`deferRefundNotice`): the abandoned-
+ * booking sweep may cancel the booking right after, and the client's notice
+ * must then say so instead of "pay again". The caller sends it with
+ * `sendDeferredRefundNotice` once it knows, exactly once.
+ */
+export interface DeferredRefundNotice {
+  /** What `settlePayment` wrote (the exception, its refund and any fee debit). */
+  written: UnappliedRefundWrite;
+  /** The refund row after its first Paystack try. */
+  row: Transaction;
+  /** Issue #391: the guest's pay-again link email went out with the refund (the notice then skips its email). */
+  linkEmailed?: boolean;
+  /** Review round 3: the guest has a live link whose email was SENT (now or earlier): the guest copy. */
+  guestLinked?: boolean;
+}
+
 export type SettleOutcome =
   /** The booking is now paid by this payment and its fee Transaction is written. */
   | { kind: "confirmed"; consultation: Consultation; transaction: Transaction; viaSuperseded: boolean }
@@ -698,16 +719,16 @@ export type SettleOutcome =
    * Recorded in consultationPaymentExceptions and refunded (issue #354); no
    * fee Transaction.
    */
-  | { kind: "refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null }
+  | { kind: "refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice; guestLinkEmailed?: boolean }
   /** The booking is no longer awaiting payment (cancelled...): recorded and refunded (#354); no fee Transaction. */
-  | { kind: "not_payable_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null }
+  | { kind: "not_payable_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice; guestLinkEmailed?: boolean }
   /**
    * Issue #354: paid on a checkout RETIRED when the booking was rescheduled
    * after its quote lock (`retiredBy: "reschedule"`). The booking is NOT
    * confirmed and stays `pending_payment`; the payment is recorded and
    * refunded in full. The client pays again for the new time.
    */
-  | { kind: "rescheduled_refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null }
+  | { kind: "rescheduled_refund_recorded"; consultation: Consultation; exception: ConsultationPaymentException; refund: Transaction | null; deferredNotice?: DeferredRefundNotice; guestLinkEmailed?: boolean }
   /** Paystack's amount or currency differs from what that checkout asked: nothing written. */
   | { kind: "mismatch" }
   /** Nothing chargeable stored for that checkout: nothing written. */
@@ -783,7 +804,14 @@ export type SettleOutcome =
 export async function settlePayment(
   consultationId: string,
   reference: string,
-  reported: PaystackTransactionLookup
+  reported: PaystackTransactionLookup,
+  /**
+   * Issue #411 (review round 1): `deferRefundNotice` keeps the refund
+   * notices of a refund THIS call created (the refund itself is still sent
+   * to Paystack now) and returns them as `deferredNotice`, for a caller that
+   * may cancel the booking next (the sweep, the admin sweep cancel).
+   */
+  options: { deferRefundNotice?: boolean } = {}
 ): Promise<SettleOutcome | null> {
   const ref = collections.consultations.doc(consultationId);
   const exceptionRef = collections.consultationPaymentExceptions.doc(reference);
@@ -793,9 +821,16 @@ export async function settlePayment(
    * Paystack after the commit), with the agent's fee debit when one was written.
    */
   let created: UnappliedRefundWrite | null = null;
+  /**
+   * Issue #391: set inside the transaction when THIS call wrote an exception
+   * (refund started or held), with whether it RECORDED it for the first
+   * time. After the commit a guest booking gets its pay-again link from it.
+   */
+  let recordedException: { written: UnappliedRefundWrite; firstRecorded: boolean } | null = null;
   const outcome = await consultationCharging.runTransaction<SettleOutcome | null>(async (tx) => {
     // A retried transaction starts again from fresh reads.
     created = null;
+    recordedException = null;
     // All reads first (Firestore transactions require reads before writes).
     const snap = await tx.get(ref);
     if (!snap.exists) return null;
@@ -874,6 +909,9 @@ export async function settlePayment(
         now,
       });
       if (written.refund) created = written;
+      // Issue #391: remember what was written (and whether it is new) for
+      // the guest's pay-again link after the commit.
+      recordedException = { written, firstRecorded: !stored };
       return { exception: written.exception, refund: written.refund };
     };
 
@@ -959,6 +997,10 @@ export async function settlePayment(
       updatedAt: now,
     };
     const settled = { ...current, ...updates } as Consultation;
+    // Issue #391: the guest's live pay-again link (if any) is used up by
+    // this confirmation, in this same commit. Read here, before any write
+    // (Firestore: reads first); nothing is read for a non-guest booking.
+    const payLinks = await readLivePayLinks(tx, current, consultationId);
     // Issue #395 (decision 2026-11-17: the agent pays Paystack's fee): the
     // fee for THIS reference, from THIS report, counted only when it is
     // well-formed and in the charged currency. Unknown, or not less than
@@ -1003,6 +1045,8 @@ export async function settlePayment(
     }
     tx.update(ref, updates);
     tx.set(txRef, recorded);
+    // Issue #391: used up exactly when the booking is paid (one commit).
+    markPayLinksUsed(tx, payLinks, now, reference);
     return { kind: "confirmed", consultation: settled, transaction: recorded, viaSuperseded: !!entry };
   });
 
@@ -1011,11 +1055,119 @@ export async function settlePayment(
   // caller found it existing and created nothing. `created` is reassigned
   // inside the callback, so TypeScript's narrowing is widened back here.
   const fresh = created as UnappliedRefundWrite | null;
+  const wrote = recordedException as { written: UnappliedRefundWrite; firstRecorded: boolean } | null;
   if (fresh?.refund && outcome && "refund" in outcome) {
-    const sent = await startUnappliedRefund(fresh);
-    return { ...outcome, refund: sent };
+    if (options.deferRefundNotice) {
+      const sent = await sendUnappliedRefund(fresh, { firstRecorded: wrote?.firstRecorded ?? false });
+      return {
+        ...outcome,
+        refund: sent.row,
+        guestLinkEmailed: sent.guestLinked,
+        deferredNotice: { written: fresh, row: sent.row, linkEmailed: sent.linkEmailed, guestLinked: sent.guestLinked },
+      };
+    }
+    const sent = await sendUnappliedRefund(fresh, { firstRecorded: wrote?.firstRecorded ?? false });
+    await notifyUnappliedRefundWrite(fresh, sent.row, { linkEmailed: sent.linkEmailed, guestLinked: sent.guestLinked });
+    return { ...outcome, refund: sent.row, guestLinkEmailed: sent.guestLinked };
+  }
+  // Issue #391: no refund was started by this call (a refund HELD for an
+  // admin, decision 2026-11-17, or the payment settled AGAIN: a repeat
+  // verify, a webhook retry). The guest still gets a pay-again link:
+  //  - the call that first recorded the payment always mints one;
+  //  - review round 3: any later settle mints and emails a fresh one when
+  //    the booking has no live link whose email was SENT (the last one
+  //    failed), superseding the unsent one. A sent live link is left alone.
+  if (outcome && "exception" in outcome && outcome.exception.reason === "paid_for_rescheduled_slot") {
+    const awaiting = wrote
+      ? wrote.written.bookingAwaitingPayment
+      : outcome.consultation.status === "pending_payment" && outcome.consultation.paymentStatus !== "paid";
+    const sentNow = await sendGuestPayAgainLink(outcome.exception, {
+      bookingAwaitingPayment: awaiting,
+      firstRecorded: wrote?.firstRecorded === true,
+    });
+    const guestLinked = sentNow || (outcome.consultation.bookedVia === "public_page" && (await hasLiveEmailedPayLink(outcome.consultation.id)));
+    return { ...outcome, guestLinkEmailed: guestLinked };
   }
   return outcome;
+}
+
+/**
+ * Send a refund notice `settlePayment` deferred (issue #411, review round
+ * 1). With `bookingCancelled` (the caller cancelled the booking right
+ * after), a refund for a moved booking says the booking was cancelled and
+ * never asks the client to pay again. Never throws.
+ */
+export async function sendDeferredRefundNotice(notice: DeferredRefundNotice, opts: { bookingCancelled: boolean }): Promise<void> {
+  try {
+    await notifyUnappliedRefundWrite(notice.written, notice.row, {
+      ...opts,
+      linkEmailed: notice.linkEmailed,
+      guestLinked: notice.guestLinked,
+    });
+  } catch (error) {
+    console.error(`[consultation] deferred refund notice for ${notice.row.id} failed:`, error);
+  }
+}
+
+/**
+ * Send a just-written refund of an unapplied payment to Paystack (issue
+ * #354), without telling anyone. Never throws (a failure is left to the
+ * 15-minute retry job).
+ *
+ * @returns the row as it stands after the first Paystack try
+ */
+async function sendUnappliedRefund(
+  written: UnappliedRefundWrite,
+  opts: { firstRecorded?: boolean } = {}
+): Promise<{ row: Transaction; linkEmailed: boolean; guestLinked: boolean }> {
+  const { consultationRefundService } = await import("./consultation-refund.service");
+  const refund = written.refund!;
+  let row = refund;
+  try {
+    row = (await consultationRefundService.processRefund(refund.id)) ?? refund;
+  } catch (error) {
+    console.error(`[consultation] refund ${refund.id} could not be sent yet; the retry job will:`, error);
+  }
+  // Issue #391: the guest's pay-again link (no-op for anyone else). Never
+  // throws. Sent with the refund, not with the (maybe deferred) notice: it
+  // sets the booking's `payLinkExpiresAt`, which keeps the #411 sweep from
+  // cancelling a guest booking whose link is live.
+  const linkEmailed = await sendGuestPayAgainLink(written.exception, {
+    bookingAwaitingPayment: written.bookingAwaitingPayment,
+    firstRecorded: opts.firstRecorded ?? false,
+  });
+  // Review round 3: the guest copy follows the RECORD of a sent email (this
+  // one, or an earlier link still live), never `payLinkExpiresAt`.
+  const guestLinked =
+    linkEmailed || (written.guestBooking && !!written.exception.consultationId && (await hasLiveEmailedPayLink(written.exception.consultationId)));
+  return { row, linkEmailed, guestLinked };
+}
+
+/** Tell both sides about a refund of an unapplied payment (issue #354), see `startUnappliedRefund`. */
+async function notifyUnappliedRefundWrite(
+  written: UnappliedRefundWrite,
+  row: Transaction,
+  /**
+   * `linkEmailed`: the pay-link email was SENT by this call (the notice then
+   * skips its own email). `guestLinked` (review round 3): the guest has a
+   * live link whose email was sent, now or earlier (the guest copy).
+   */
+  opts: { bookingCancelled?: boolean; linkEmailed?: boolean; guestLinked?: boolean } = {}
+): Promise<void> {
+  const { consultationRefundService } = await import("./consultation-refund.service");
+  // Review round 1 of #391: the guest copy ("We've emailed you a link")
+  // only when the link email was really sent; a guest without one gets the
+  // refund sentence alone (a guest has no app to "pay again" in).
+  const guestLinked = !!opts.guestLinked || !!opts.linkEmailed;
+  const guestWithoutLink = written.guestBooking && !guestLinked;
+  await consultationRefundService.notifyUnappliedRefund(row, written.exception, {
+    bookingAwaitingPayment: opts.bookingCancelled || guestWithoutLink ? false : written.bookingAwaitingPayment,
+    guestBooking: written.guestBooking && guestLinked,
+    ...(opts.bookingCancelled ? { bookingCancelled: true } : {}),
+    // Issue #391: no second email only when the pay-link email was SENT.
+    ...(opts.linkEmailed ? { skipEmail: true } : {}),
+  });
+  if (written.debit) await consultationRefundService.notifyFeeDebit(written.debit);
 }
 
 /**
@@ -1031,23 +1183,24 @@ export async function settlePayment(
  * The refund service is loaded lazily: it imports this module
  * (`expectedCharge`), so a top-level import would be circular.
  *
+ * Issue #391: for a GUEST booking refunded after a reschedule
+ * (`paid_for_rescheduled_slot`, still awaiting payment) the guest is first
+ * sent a one-time pay-again link by email (`sendGuestPayAgainLink`); the
+ * refund notice then skips its own email, so the guest gets one email.
+ *
+ * @param opts.firstRecorded issue #391: true when the caller recorded the
+ *   exception in this same call (the guest always gets a link then); false
+ *   (default: an admin retry of a held refund) mints a link only when the
+ *   booking has no live one any more
  * @returns the row as it stands after the first Paystack try
  */
-export async function startUnappliedRefund(written: UnappliedRefundWrite): Promise<Transaction> {
-  const { consultationRefundService } = await import("./consultation-refund.service");
-  const refund = written.refund!;
-  let row = refund;
-  try {
-    row = (await consultationRefundService.processRefund(refund.id)) ?? refund;
-  } catch (error) {
-    console.error(`[consultation] refund ${refund.id} could not be sent yet; the retry job will:`, error);
-  }
-  await consultationRefundService.notifyUnappliedRefund(row, written.exception, {
-    bookingAwaitingPayment: written.bookingAwaitingPayment,
-    guestBooking: written.guestBooking,
-  });
-  if (written.debit) await consultationRefundService.notifyFeeDebit(written.debit);
-  return row;
+export async function startUnappliedRefund(
+  written: UnappliedRefundWrite,
+  opts: { firstRecorded?: boolean } = {}
+): Promise<Transaction> {
+  const sent = await sendUnappliedRefund(written, opts);
+  await notifyUnappliedRefundWrite(written, sent.row, { linkEmailed: sent.linkEmailed, guestLinked: sent.guestLinked });
+  return sent.row;
 }
 
 // ============================================

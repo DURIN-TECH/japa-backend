@@ -130,6 +130,9 @@ import type {
   ConsultationPaymentException,
   // Issue #382: a client's "the meeting didn't happen" report.
   NoShowReport,
+  // Issue #391: the channels of a refund notice (email left out when the
+  // guest's pay-link email already went).
+  NotificationChannel,
   // Issue #390: who carries Paystack's fee, and why a refund is held.
   PaystackFeeBorneBy,
   RefundFundedFrom,
@@ -164,6 +167,8 @@ import { formatWithCode } from "../money/money";
 // Review round 1 of #413: what a closed refund reads as (shared with the client view).
 import { CLOSED_REFUND_DESCRIPTION } from "../transactions/client-transaction";
 import { slotStartsAt } from "../consultations/slot-time";
+// Review round 1 of #391: the shared "your consultation moved" copy (own module).
+import { rescheduledRefundMessage } from "../consultations/refund-copy";
 import { feeDebitDocId, mismatchAdjustmentDocId, mismatchTopUpDocId, refundDocId } from "../money/refund-id";
 
 // ============================================
@@ -727,32 +732,11 @@ function mirrorUpdate(
   return exceptionStatus ? { status: exceptionStatus, updatedAt: now } : null;
 }
 
-/**
- * The client's copy for a payment refunded because the booking moved (issue
- * #354 `paid_for_rescheduled_slot`; wording issue #413 C, decision
- * 2026-11-21, plus the guest variant from the coordinator the same day).
- * Shared by the verify 409 `CONSULTATION_RESCHEDULED` message and the
- * refund notification, so the two can never drift apart. Pure.
- *
- * "we're refunding ... on its way", never "we've refunded": the refund may
- * still be pending, or held for an admin (#392 design).
- *
- *  - app client: "... Please pay again for the new time.";
- *  - guest (`bookedVia: "public_page"`): "... We've emailed you a link to
- *    pay for the new time." (#391 sends that email);
- *  - when the booking no longer awaits payment (paid through a fresh
- *    checkout, or cancelled: #354 fix round) the last sentence is left out.
- *
- * @param opts.guestBooking the booking was made by a guest on a public page
- * @param opts.bookingAwaitingPayment the booking still awaits payment (default true)
- */
-export function rescheduledRefundMessage(opts: { guestBooking?: boolean; bookingAwaitingPayment?: boolean } = {}): string {
-  const base = "Your consultation moved, so we're refunding your payment in full. Your refund is on its way.";
-  if (opts.bookingAwaitingPayment === false) return base;
-  return opts.guestBooking
-    ? `${base} We've emailed you a link to pay for the new time.`
-    : `${base} Please pay again for the new time.`;
-}
+// Review round 1 of #391: the "your consultation moved" copy lives in its own
+// module (consultations/refund-copy.ts), so the pay-link service can use it
+// without importing this service (which imports the charge service, which
+// imports the pay-link service: a static cycle). Re-exported for its callers.
+export { rescheduledRefundMessage };
 
 /** A money amount for notification copy, with its ISO code ("NGN 15,000.00"). */
 function describe(amount: Money): string {
@@ -1396,6 +1380,13 @@ export type CloseExceptionOutcome =
   | { kind: "not_closable"; why: "agent_caused" | "not_held_fee_not_less_than_amount" | "refund_exists" };
 
 /** What a refund webhook did. */
+/**
+ * Issue #465: the client's notice when a client-caused cancel refund is held
+ * with `fee_not_less_than_amount` (Paystack's fee covers the whole payment).
+ */
+export const NO_REFUND_DUE_MESSAGE =
+  "Your consultation was cancelled. The payment provider\u2019s processing fee covers the whole payment, so there\u2019s no refund due.";
+
 export type RefundWebhookOutcome = "not_refund_event" | "unknown_refund" | "unchanged" | "applied";
 
 class ConsultationRefundService {
@@ -1807,7 +1798,7 @@ class ConsultationRefundService {
     const rowSnap = await ref.get();
     if (!rowSnap.exists) return this.startHeldExceptionRefund(input);
 
-    return chargeRuntime.runTransaction<ExceptionRetryOutcome>(async (tx) => {
+    const outcome = await chargeRuntime.runTransaction<ExceptionRetryOutcome>(async (tx) => {
       // ---- Reads ----
       const snap = await tx.get(ref);
       if (!snap.exists) return { kind: "not_found" as const };
@@ -1840,6 +1831,35 @@ class ConsultationRefundService {
       delete next.refundFailedAt;
       return { kind: "retried" as const, refund: next };
     });
+    // Review round 3 of #391 (user decision 2026-11-22): an admin retry also
+    // gets the guest a working pay-again link when the last link email
+    // failed (a fresh one, superseding the unsent one; a live SENT link is
+    // left alone). Never throws.
+    if (outcome.kind === "retried") await this.resendGuestPayLinkIfUnsent(rowSnap.data() as Transaction);
+    return outcome;
+  }
+
+  /**
+   * Review round 3 of #391: mint and email a fresh pay-again link for the
+   * guest booking of refund `row` (an unapplied payment's) when its
+   * exception is a rescheduled refund, the booking still awaits payment and
+   * it has no live link whose email was sent. Lazy import: the pay-link
+   * service sits above this one. Never throws.
+   */
+  private async resendGuestPayLinkIfUnsent(row: Transaction): Promise<void> {
+    try {
+      if (!row.paymentExceptionId || !row.consultationId) return;
+      const exSnap = await collections.consultationPaymentExceptions.doc(row.paymentExceptionId).get();
+      const exception = exSnap.exists ? (exSnap.data() as ConsultationPaymentException) : null;
+      if (exception?.reason !== "paid_for_rescheduled_slot") return;
+      const bookingSnap = await collections.consultations.doc(row.consultationId).get();
+      const booking = bookingSnap.exists ? (bookingSnap.data() as Consultation) : null;
+      const awaiting = booking?.status === "pending_payment" && booking.paymentStatus !== "paid";
+      const { sendGuestPayAgainLink } = await import("./consultation-pay-link.service");
+      await sendGuestPayAgainLink(exception, { bookingAwaitingPayment: awaiting, firstRecorded: false });
+    } catch (error) {
+      console.error(`[refund] ${row.id}: could not re-send the guest's pay-again link:`, error);
+    }
   }
 
   /**
@@ -3150,6 +3170,14 @@ class ConsultationRefundService {
   async notifyCreated(row: Transaction, booking: Consultation, debit: Transaction | null = null): Promise<void> {
     const currency = row.currency as Money["currency"];
     const common = { type: "consultation_refunded" as const, relatedEntityType: "consultation" as const, relatedEntityId: booking.id };
+    // Issue #465 (user decision on #356, 2026-11-22): a client-caused refund
+    // held because Paystack's fee covers the whole payment owes the client
+    // nothing: say so now, never "Refund delayed". Money is unchanged (the
+    // row stays held for the admin close).
+    if (row.refundHeldReason === "fee_not_less_than_amount") {
+      await this.notifyNoRefundDue(row, booking);
+      return;
+    }
     if (row.refundHeldReason) {
       await this.notifyDelayed(row);
       return;
@@ -3202,6 +3230,15 @@ class ConsultationRefundService {
       bookingAwaitingPayment?: boolean;
       /** Issue #413 (C): the booking was made by a guest on a public page (emailed pay link). */
       guestBooking?: boolean;
+      /** Issue #411: the sweep cancelled the booking right after this refund (no "pay again"). */
+      bookingCancelled?: boolean;
+      /**
+       * Issue #391: the guest was just emailed a pay-again link (which says
+       * the refund is on its way), so this notice skips its own email and
+       * the guest gets one email, the one with the link. In-app and push
+       * are unchanged (and never carry the link).
+       */
+      skipEmail?: boolean;
     } = {}
   ): Promise<void> {
     const currency = row.currency as Money["currency"];
@@ -3224,6 +3261,8 @@ class ConsultationRefundService {
         body,
         relatedEntityType: "consultation",
         relatedEntityId: exception.consultationId,
+        // Issue #391: no second email when the pay-link email went out.
+        ...(opts.skipEmail ? { channels: ["in_app", "push"] as NotificationChannel[] } : {}),
       })
       .catch((e) => console.error("[refund] unapplied-payment notify failed:", e));
   }
@@ -3248,6 +3287,23 @@ class ConsultationRefundService {
         relatedEntityId: debit.consultationId ?? debit.id,
       })
       .catch((e) => console.error("[refund] fee-debit notify failed:", e));
+  }
+
+  /**
+   * Issue #465: tell the client no refund is due, because the payment
+   * provider's processing fee covers the whole payment. Never fails the caller.
+   */
+  private async notifyNoRefundDue(row: Transaction, booking: Consultation): Promise<void> {
+    await notificationService
+      .notifyUser({
+        userId: booking.userId ?? row.userId,
+        type: "consultation_refunded",
+        title: "No refund due",
+        body: NO_REFUND_DUE_MESSAGE,
+        relatedEntityType: "consultation",
+        relatedEntityId: booking.id,
+      })
+      .catch((e) => console.error("[refund] no-refund-due notify failed:", e));
   }
 
   /** Tell the client their refund is delayed (a row became `failed`). */
