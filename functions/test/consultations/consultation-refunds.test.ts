@@ -233,7 +233,7 @@ describe("fee hold: Seli never funds a refund an agent can trigger", () => {
     assert.equal((await balanceOf(agent)).availableBalance, 900_000);
   });
 
-  test("a reschedule never releases the fee sooner (earlier or past dates keep the hold); a later one extends it", async () => {
+  test("a reschedule into the past is refused and leaves the hold (#472); a later one extends it", async () => {
     const fee = await bookAndPay("c1");
     const releaseAt = fee.feeHold.releaseAt.toMillis();
     // Moved into the past: since #472 the move itself is refused (400
@@ -246,6 +246,17 @@ describe("fee hold: Seli never funds a refund an agent can trigger", () => {
     // Moved a week later: the hold moves with it.
     assert.equal((await edit(agent, { scheduledDate: "2026-11-27" })).status, 200);
     assert.equal(feeOf("c1")!.feeHold.releaseAt.toMillis(), releaseAt + 7 * 86_400_000);
+  });
+
+  test("a reschedule earlier but still in the future never releases the fee sooner (the hold is unchanged)", async () => {
+    const fee = await bookAndPay("c1");
+    const releaseAt = fee.feeHold.releaseAt.toMillis();
+    // 12:00 Lagos today = 11:00Z, two hours after the harness's now: earlier
+    // than the slot paid for, but not started, so #472 lets it through.
+    const earlier = await edit(agent, { scheduledDate: "2026-11-13", scheduledTime: "12:00" });
+    assert.equal(earlier.status, 200);
+    assert.equal(feeOf("c1")!.feeHold.releaseAt.toMillis(), releaseAt, "the hold did not move sooner");
+    assert.equal((await balanceOf(agent)).heldBalance, 900_000, "the fee is still held");
   });
 });
 
