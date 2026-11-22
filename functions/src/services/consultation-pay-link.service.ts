@@ -175,6 +175,34 @@ export function slotStillAhead(booking: Pick<Consultation, "scheduledDate" | "sc
   }
 }
 
+/**
+ * Review round 3: true when a link is live at `at` AND its email was
+ * recorded as sent (`emailStatus: "sent"`). Pure. What "the guest was
+ * emailed a working link" means everywhere (the guest copy, re-minting).
+ */
+export function isLiveEmailedLink(
+  link: Pick<ConsultationPayLink, "usedAt" | "supersededAt" | "expiresAt" | "emailStatus">,
+  at: Date
+): boolean {
+  return link.emailStatus === "sent" && isLinkLive(link, at);
+}
+
+/**
+ * Review round 3: whether booking `consultationId` has a live link whose
+ * email was sent (read now; single-field equality query, no index).
+ * Never throws: a failed read answers false (the copy then makes no claim).
+ */
+export async function hasLiveEmailedPayLink(consultationId: string): Promise<boolean> {
+  try {
+    const snap = await collections.consultationPayLinks.where("consultationId", "==", consultationId).get();
+    const at = chargeRuntime.now();
+    return snap.docs.some((d) => isLiveEmailedLink(d.data() as ConsultationPayLink, at));
+  } catch (error) {
+    console.error(`[pay-link] ${consultationId}: could not read the pay links:`, error);
+    return false;
+  }
+}
+
 /** True when a link is still unused, not superseded and not expired at `at`. Pure. */
 export function isLinkLive(link: Pick<ConsultationPayLink, "usedAt" | "supersededAt" | "expiresAt">, at: Date): boolean {
   if (link.usedAt || link.supersededAt) return false;
@@ -253,7 +281,10 @@ export async function mintPayLink(
       return null;
     }
     const older = existing.docs.map((d) => ({ ref: d.ref, data: d.data() as ConsultationPayLink }));
-    if (opts.onlyIfNoLiveLink && older.some((l) => isLinkLive(l.data, at))) return null;
+    // Review round 3: only a live link whose email was SENT counts. A live
+    // link whose last email failed (or was skipped) is replaced: a fresh one
+    // is minted (superseding it below) and emailed.
+    if (opts.onlyIfNoLiveLink && older.some((l) => isLiveEmailedLink(l.data, at))) return null;
 
     // ---- Writes ----
     const now = Timestamp.fromDate(at);
@@ -398,6 +429,20 @@ async function sendPayLinkEmail(message: PayLinkEmail): Promise<PayLinkEmailStat
   return status;
 }
 
+/** Review round 3: store how link `linkId`'s email went. Never throws (logged). */
+async function recordEmailStatus(linkId: string, status: PayLinkEmailStatus): Promise<void> {
+  const now = Timestamp.fromDate(chargeRuntime.now());
+  try {
+    await collections.consultationPayLinks.doc(linkId).update({
+      emailStatus: status,
+      emailStatusAt: now,
+      ...(status === "sent" ? { emailedAt: now } : {}),
+    });
+  } catch (error) {
+    console.error(`[pay-link] link ${linkId.slice(0, 12)}…: could not record its email status:`, error);
+  }
+}
+
 /**
  * After a late payment on a rescheduled guest booking was recorded (issue
  * #391): mint the booking's pay-again link and email it to the guest.
@@ -410,8 +455,9 @@ async function sendPayLinkEmail(message: PayLinkEmail): Promise<PayLinkEmailStat
  * @param opts.bookingAwaitingPayment whether the booking still awaited
  *   payment in the transaction that wrote it (else nothing to pay for)
  * @param opts.firstRecorded true when this call RECORDED the exception (the
- *   guest is always sent a link then); false when a refund starts later
- *   (a link only when the booking has no live one any more)
+ *   guest is always sent a link then); false when a refund starts later or
+ *   the payment is settled again (a link only when the booking has no live
+ *   link whose email was SENT: review round 3, a failed send is re-minted)
  * @returns true when the pay-again email was SENT (review round 1: a
  *   failed or skipped send is false), and the caller then
  *   leaves the email channel out of its own refund notice, so the guest gets
@@ -433,6 +479,10 @@ export async function sendGuestPayAgainLink(
       url: payLinkUrl(minted.link.agencySlug, minted.token),
       expiresText: describeExpiry(minted.link.expiresAt.toDate(), minted.booking.timezone),
     });
+    // Review round 3: record the send status ON THE LINK, so every later
+    // answer (a repeat verify, the notice of an admin retry) knows whether
+    // the guest was really emailed, and a failed one is re-minted.
+    await recordEmailStatus(minted.link.id, status);
     // Review round 1: only a SENT email counts. A failed or skipped send
     // leaves the refund notice with its own email (the guest still hears
     // about the refund), and the notice does not claim a link was emailed.

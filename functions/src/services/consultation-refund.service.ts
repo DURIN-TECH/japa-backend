@@ -1791,7 +1791,7 @@ class ConsultationRefundService {
     const rowSnap = await ref.get();
     if (!rowSnap.exists) return this.startHeldExceptionRefund(input);
 
-    return chargeRuntime.runTransaction<ExceptionRetryOutcome>(async (tx) => {
+    const outcome = await chargeRuntime.runTransaction<ExceptionRetryOutcome>(async (tx) => {
       // ---- Reads ----
       const snap = await tx.get(ref);
       if (!snap.exists) return { kind: "not_found" as const };
@@ -1824,6 +1824,35 @@ class ConsultationRefundService {
       delete next.refundFailedAt;
       return { kind: "retried" as const, refund: next };
     });
+    // Review round 3 of #391 (user decision 2026-11-22): an admin retry also
+    // gets the guest a working pay-again link when the last link email
+    // failed (a fresh one, superseding the unsent one; a live SENT link is
+    // left alone). Never throws.
+    if (outcome.kind === "retried") await this.resendGuestPayLinkIfUnsent(rowSnap.data() as Transaction);
+    return outcome;
+  }
+
+  /**
+   * Review round 3 of #391: mint and email a fresh pay-again link for the
+   * guest booking of refund `row` (an unapplied payment's) when its
+   * exception is a rescheduled refund, the booking still awaits payment and
+   * it has no live link whose email was sent. Lazy import: the pay-link
+   * service sits above this one. Never throws.
+   */
+  private async resendGuestPayLinkIfUnsent(row: Transaction): Promise<void> {
+    try {
+      if (!row.paymentExceptionId || !row.consultationId) return;
+      const exSnap = await collections.consultationPaymentExceptions.doc(row.paymentExceptionId).get();
+      const exception = exSnap.exists ? (exSnap.data() as ConsultationPaymentException) : null;
+      if (exception?.reason !== "paid_for_rescheduled_slot") return;
+      const bookingSnap = await collections.consultations.doc(row.consultationId).get();
+      const booking = bookingSnap.exists ? (bookingSnap.data() as Consultation) : null;
+      const awaiting = booking?.status === "pending_payment" && booking.paymentStatus !== "paid";
+      const { sendGuestPayAgainLink } = await import("./consultation-pay-link.service");
+      await sendGuestPayAgainLink(exception, { bookingAwaitingPayment: awaiting, firstRecorded: false });
+    } catch (error) {
+      console.error(`[refund] ${row.id}: could not re-send the guest's pay-again link:`, error);
+    }
   }
 
   /**

@@ -1783,6 +1783,17 @@ export interface ConsultationPayLink {
   usedByReference?: string;
   /** Set when a newer link for the same booking was minted (at most one live link). */
   supersededAt: Timestamp | null;
+  /**
+   * Review round 3 (user decision 2026-11-22): how this link's email went,
+   * from the send status (`emailService.sendNotification`). Absent while the
+   * send has not been recorded. Only "sent" lets the guest copy say "We've
+   * emailed you a link", and only a live SENT link stops a re-mint.
+   */
+  emailStatus?: "sent" | "failed" | "skipped";
+  /** When `emailStatus` was recorded. */
+  emailStatusAt?: Timestamp;
+  /** When the email was sent (only with `emailStatus: "sent"`). */
+  emailedAt?: Timestamp;
 }
 
 /**

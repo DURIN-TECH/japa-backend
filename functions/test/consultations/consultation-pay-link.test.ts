@@ -917,3 +917,115 @@ describe("review round 1: email status, guest copy, slot start", () => {
     assert.equal(slotStillAhead({ scheduledDate: "nope", scheduledTime: "nope" } as any, at), false);
   });
 });
+
+// ============================================
+// Review round 3 (#391, user decision 2026-11-22): the guest copy follows the
+// RECORDED send status; an unsent link is re-minted
+// ============================================
+
+describe("review round 3: the link's email status decides the copy and re-minting", () => {
+  /** Make the pay-link email answer `status` from now on. */
+  function emailAnswers(status: "sent" | "failed" | "skipped"): void {
+    payLinkRuntime.sendEmail = async (m) => {
+      emails.push(m);
+      return status;
+    };
+  }
+  const liveLinks = () => links().filter(([, l]) => !l.usedAt && !l.supersededAt);
+
+  test("each link records how its email went", async () => {
+    await lateGuestPayment();
+    const [[, link]] = links();
+    assert.equal(link.emailStatus, "sent");
+    assert.ok(link.emailedAt);
+    assert.ok(link.emailStatusAt);
+  });
+
+  test("QA repro: a failed link email, then a repeat verify, never says 'emailed'; the unsent link is replaced", async () => {
+    emailAnswers("failed");
+    const reference = await lateGuestPayment();
+    assert.equal(lastVerifyMessage, rescheduledRefundMessage({ bookingAwaitingPayment: false }));
+    assert.equal(links()[0][1].emailStatus, "failed");
+
+    // The confirm page reloads: the same verify again, the email still failing.
+    paystackPaid(reference, "c1", FEE_NGN);
+    const again = await verify(reference);
+    assert.equal(again.status, 409);
+    assert.equal(again.body.message, rescheduledRefundMessage({ bookingAwaitingPayment: false }), "still no claim of an email");
+    assert.ok(!/emailed you a link/.test(again.body.message));
+    assert.equal(links().length, 2, "a fresh link was minted for the retry");
+    assert.equal(liveLinks().length, 1, "the unsent one is superseded");
+
+    // The email works now: the next reload mints and emails a fresh link, and says so.
+    emailAnswers("sent");
+    const third = await verify(reference);
+    assert.equal(third.body.message, rescheduledRefundMessage({ guestBooking: true }));
+    assert.equal(links().length, 3);
+    assert.equal(liveLinks()[0][1].emailStatus, "sent");
+    assert.equal((await getLink(lastToken())).status, 200, "the emailed link works");
+
+    // A further reload: the live SENT link is kept (no new link, no new email), and the copy says emailed.
+    const emailsBefore = emails.length;
+    const fourth = await verify(reference);
+    assert.equal(fourth.body.message, rescheduledRefundMessage({ guestBooking: true }));
+    assert.equal(links().length, 3);
+    assert.equal(emails.length, emailsBefore);
+  });
+
+  test("never from payLinkExpiresAt: a live link whose email failed does not make the copy say 'emailed'", async () => {
+    emailAnswers("failed");
+    const reference = await lateGuestPayment();
+    const booking = docsIn("consultations").find(([id]) => id === "c1")![1];
+    assert.ok(booking.payLinkExpiresAt, "the booking carries the (unsent) link's expiry");
+    emailAnswers("skipped");
+    paystackPaid(reference, "c1", FEE_NGN);
+    const again = await verify(reference);
+    assert.ok(!/emailed you a link/.test(again.body.message));
+  });
+
+  test("admin retry of a held refund after a failed link email: a fresh link is minted and emailed, the unsent one superseded", async () => {
+    emailAnswers("failed");
+    const reference = await lateGuestPayment({ fees: undefined });
+    assert.equal(links().length, 1);
+    assert.equal(links()[0][1].emailStatus, "failed");
+    emailAnswers("sent");
+    const refundId = (await import("../../src/money/refund-id")).refundDocId(reference);
+    paystackPaid(reference, "c1", FEE_NGN, harness.clock.now(), { fees: 15_000 });
+    const out = await adminRefund(admin, { refundId });
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.equal(links().length, 2, "re-minted");
+    assert.equal(liveLinks().length, 1);
+    assert.equal(liveLinks()[0][1].emailStatus, "sent");
+    assert.equal((await getLink(lastToken())).status, 200);
+    // The refund notice: the guest copy, and in-app/push only (the link email was this call's).
+    const notice = notified.filter((n) => n.type === "consultation_refunded" && n.userId === client.uid).at(-1)!;
+    assert.equal(notice.body, rescheduledRefundMessage({ guestBooking: true }));
+    assert.deepEqual(notice.channels, ["in_app", "push"]);
+  });
+
+  test("admin retry of a FAILED refund row after a failed link email re-mints too", async () => {
+    emailAnswers("failed");
+    const reference = await lateGuestPayment();
+    const refundId = (await import("../../src/money/refund-id")).refundDocId(reference);
+    // Paystack fails the refund itself.
+    const row = docsIn("transactions").find(([id]) => id === refundId)![1];
+    row.status = "failed";
+    emailAnswers("sent");
+    const out = await adminRefund(admin, { refundId });
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.equal(links().length, 2);
+    assert.equal(liveLinks()[0][1].emailStatus, "sent");
+  });
+
+  test("admin retry while a SENT link is live: no new link", async () => {
+    const reference = await lateGuestPayment({ fees: undefined });
+    const refundId = (await import("../../src/money/refund-id")).refundDocId(reference);
+    paystackPaid(reference, "c1", FEE_NGN, harness.clock.now(), { fees: 15_000 });
+    assert.equal((await adminRefund(admin, { refundId })).status, 200);
+    assert.equal(links().length, 1);
+    // The notice still uses the guest copy (the guest was emailed a working link), with its own email.
+    const notice = notified.filter((n) => n.type === "consultation_refunded" && n.userId === client.uid).at(-1)!;
+    assert.equal(notice.body, rescheduledRefundMessage({ guestBooking: true }));
+    assert.equal(notice.channels, undefined);
+  });
+});

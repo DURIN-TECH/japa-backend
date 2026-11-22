@@ -152,12 +152,11 @@ const BAD_SCHEDULED_TIME = "scheduledTime must be a 24-hour HH:mm or a 12-hour h
  * verify 409 of a payment on a retired checkout. Pure.
  */
 function guestRescheduledCopy(
-  booking: Pick<Consultation, "bookedVia" | "payLinkExpiresAt">,
-  emailedNow: boolean
+  booking: Pick<Consultation, "bookedVia">,
+  linkEmailed: boolean
 ): { guestBooking?: boolean; bookingAwaitingPayment?: boolean } {
   if (booking.bookedVia !== "public_page") return {};
-  const liveLink = !!booking.payLinkExpiresAt && booking.payLinkExpiresAt.toMillis() > chargeRuntime.now().getTime();
-  return emailedNow || liveLink ? { guestBooking: true } : { bookingAwaitingPayment: false };
+  return linkEmailed ? { guestBooking: true } : { bookingAwaitingPayment: false };
 }
 
 export class ConsultationController {
@@ -2738,10 +2737,10 @@ export class ConsultationController {
         error: "CONSULTATION_RESCHEDULED",
         // Issue #413 (C): shared copy ("we're refunding ... on its way"),
         // with the guest variant for a public-page booking (emailed pay link).
-        // Review round 1 of #391: the guest variant ("We've emailed you a
-        // link") only when a link really went out: in this call, or earlier
-        // (the booking still has a live one, `payLinkExpiresAt`). A guest
-        // with neither gets the refund sentence alone.
+        // Review rounds 1 and 3 of #391: the guest variant ("We've emailed
+        // you a link") only when the RECORD says a link email was sent (this
+        // call, or a live earlier link: `guestLinkEmailed`), never from
+        // `payLinkExpiresAt`. A guest without one gets the refund sentence alone.
         message: rescheduledRefundMessage(guestRescheduledCopy(outcome.consultation, outcome.guestLinkEmailed === true)),
         data: { refundPending: true, consultation: bookingSummary(outcome.consultation) },
       });

@@ -41,7 +41,7 @@ import { isWellFormedFee } from "./billing/paystack.provider";
 import { classifyPaystackFee } from "../money/paystack-fee";
 // Issue #391: a guest's one-time "pay again" link after a rescheduled refund
 // (minted when the late payment is recorded; used up when a payment confirms).
-import { markPayLinksUsed, readLivePayLinks, sendGuestPayAgainLink } from "./consultation-pay-link.service";
+import { hasLiveEmailedPayLink, markPayLinksUsed, readLivePayLinks, sendGuestPayAgainLink } from "./consultation-pay-link.service";
 
 export {
   CHECKOUT_WAIT_ATTEMPTS,
@@ -705,6 +705,8 @@ export interface DeferredRefundNotice {
   row: Transaction;
   /** Issue #391: the guest's pay-again link email went out with the refund (the notice then skips its email). */
   linkEmailed?: boolean;
+  /** Review round 3: the guest has a live link whose email was SENT (now or earlier): the guest copy. */
+  guestLinked?: boolean;
 }
 
 export type SettleOutcome =
@@ -1060,24 +1062,31 @@ export async function settlePayment(
       return {
         ...outcome,
         refund: sent.row,
-        guestLinkEmailed: sent.linkEmailed,
-        deferredNotice: { written: fresh, row: sent.row, linkEmailed: sent.linkEmailed },
+        guestLinkEmailed: sent.guestLinked,
+        deferredNotice: { written: fresh, row: sent.row, linkEmailed: sent.linkEmailed, guestLinked: sent.guestLinked },
       };
     }
     const sent = await sendUnappliedRefund(fresh, { firstRecorded: wrote?.firstRecorded ?? false });
-    await notifyUnappliedRefundWrite(fresh, sent.row, { linkEmailed: sent.linkEmailed });
-    return { ...outcome, refund: sent.row, guestLinkEmailed: sent.linkEmailed };
+    await notifyUnappliedRefundWrite(fresh, sent.row, { linkEmailed: sent.linkEmailed, guestLinked: sent.guestLinked });
+    return { ...outcome, refund: sent.row, guestLinkEmailed: sent.guestLinked };
   }
-  // Issue #391 (decision 2026-11-17): a refund HELD for an admin (Paystack's
-  // fee unknown) still gets the guest their pay-again link, as soon as the
-  // late payment is recorded. Only on the call that first recorded it, so a
-  // webhook retry of a held exception sends nothing again.
-  if (wrote?.firstRecorded && !wrote.written.refund) {
-    const linkEmailed = await sendGuestPayAgainLink(wrote.written.exception, {
-      bookingAwaitingPayment: wrote.written.bookingAwaitingPayment,
-      firstRecorded: true,
+  // Issue #391: no refund was started by this call (a refund HELD for an
+  // admin, decision 2026-11-17, or the payment settled AGAIN: a repeat
+  // verify, a webhook retry). The guest still gets a pay-again link:
+  //  - the call that first recorded the payment always mints one;
+  //  - review round 3: any later settle mints and emails a fresh one when
+  //    the booking has no live link whose email was SENT (the last one
+  //    failed), superseding the unsent one. A sent live link is left alone.
+  if (outcome && "exception" in outcome && outcome.exception.reason === "paid_for_rescheduled_slot") {
+    const awaiting = wrote
+      ? wrote.written.bookingAwaitingPayment
+      : outcome.consultation.status === "pending_payment" && outcome.consultation.paymentStatus !== "paid";
+    const sentNow = await sendGuestPayAgainLink(outcome.exception, {
+      bookingAwaitingPayment: awaiting,
+      firstRecorded: wrote?.firstRecorded === true,
     });
-    if (outcome && "refund" in outcome) return { ...outcome, guestLinkEmailed: linkEmailed };
+    const guestLinked = sentNow || (outcome.consultation.bookedVia === "public_page" && (await hasLiveEmailedPayLink(outcome.consultation.id)));
+    return { ...outcome, guestLinkEmailed: guestLinked };
   }
   return outcome;
 }
@@ -1090,7 +1099,11 @@ export async function settlePayment(
  */
 export async function sendDeferredRefundNotice(notice: DeferredRefundNotice, opts: { bookingCancelled: boolean }): Promise<void> {
   try {
-    await notifyUnappliedRefundWrite(notice.written, notice.row, { ...opts, linkEmailed: notice.linkEmailed });
+    await notifyUnappliedRefundWrite(notice.written, notice.row, {
+      ...opts,
+      linkEmailed: notice.linkEmailed,
+      guestLinked: notice.guestLinked,
+    });
   } catch (error) {
     console.error(`[consultation] deferred refund notice for ${notice.row.id} failed:`, error);
   }
@@ -1106,7 +1119,7 @@ export async function sendDeferredRefundNotice(notice: DeferredRefundNotice, opt
 async function sendUnappliedRefund(
   written: UnappliedRefundWrite,
   opts: { firstRecorded?: boolean } = {}
-): Promise<{ row: Transaction; linkEmailed: boolean }> {
+): Promise<{ row: Transaction; linkEmailed: boolean; guestLinked: boolean }> {
   const { consultationRefundService } = await import("./consultation-refund.service");
   const refund = written.refund!;
   let row = refund;
@@ -1123,23 +1136,33 @@ async function sendUnappliedRefund(
     bookingAwaitingPayment: written.bookingAwaitingPayment,
     firstRecorded: opts.firstRecorded ?? false,
   });
-  return { row, linkEmailed };
+  // Review round 3: the guest copy follows the RECORD of a sent email (this
+  // one, or an earlier link still live), never `payLinkExpiresAt`.
+  const guestLinked =
+    linkEmailed || (written.guestBooking && !!written.exception.consultationId && (await hasLiveEmailedPayLink(written.exception.consultationId)));
+  return { row, linkEmailed, guestLinked };
 }
 
 /** Tell both sides about a refund of an unapplied payment (issue #354), see `startUnappliedRefund`. */
 async function notifyUnappliedRefundWrite(
   written: UnappliedRefundWrite,
   row: Transaction,
-  opts: { bookingCancelled?: boolean; linkEmailed?: boolean } = {}
+  /**
+   * `linkEmailed`: the pay-link email was SENT by this call (the notice then
+   * skips its own email). `guestLinked` (review round 3): the guest has a
+   * live link whose email was sent, now or earlier (the guest copy).
+   */
+  opts: { bookingCancelled?: boolean; linkEmailed?: boolean; guestLinked?: boolean } = {}
 ): Promise<void> {
   const { consultationRefundService } = await import("./consultation-refund.service");
   // Review round 1 of #391: the guest copy ("We've emailed you a link")
   // only when the link email was really sent; a guest without one gets the
   // refund sentence alone (a guest has no app to "pay again" in).
-  const guestWithoutLink = written.guestBooking && !opts.linkEmailed;
+  const guestLinked = !!opts.guestLinked || !!opts.linkEmailed;
+  const guestWithoutLink = written.guestBooking && !guestLinked;
   await consultationRefundService.notifyUnappliedRefund(row, written.exception, {
     bookingAwaitingPayment: opts.bookingCancelled || guestWithoutLink ? false : written.bookingAwaitingPayment,
-    guestBooking: written.guestBooking && !!opts.linkEmailed,
+    guestBooking: written.guestBooking && guestLinked,
     ...(opts.bookingCancelled ? { bookingCancelled: true } : {}),
     // Issue #391: no second email only when the pay-link email was SENT.
     ...(opts.linkEmailed ? { skipEmail: true } : {}),
@@ -1176,7 +1199,7 @@ export async function startUnappliedRefund(
   opts: { firstRecorded?: boolean } = {}
 ): Promise<Transaction> {
   const sent = await sendUnappliedRefund(written, opts);
-  await notifyUnappliedRefundWrite(written, sent.row, { linkEmailed: sent.linkEmailed });
+  await notifyUnappliedRefundWrite(written, sent.row, { linkEmailed: sent.linkEmailed, guestLinked: sent.guestLinked });
   return sent.row;
 }
 
