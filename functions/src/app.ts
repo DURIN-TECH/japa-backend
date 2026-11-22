@@ -83,6 +83,13 @@ import { entryRequirementsRoutes, adminEntryRuleRoutes } from "./entry-requireme
 // Create Express app
 const app = express();
 
+// Review round 1 of #391 (orchestrator decision): trust exactly ONE proxy
+// hop, the Google front end in front of gen1 Cloud Functions, so `req.ip` is
+// the address that front end saw (the rightmost `X-Forwarded-For` entry it
+// appends). Never `true`: the leftmost entries are whatever the client sent.
+// The public pay-link rate limit is keyed on this `req.ip`.
+app.set("trust proxy", 1);
+
 // Middleware
 app.use(cors({
   origin: true
@@ -207,6 +214,20 @@ app.use("/admin/users", adminUsersRouter);
 
 // Error handling
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  // Issue #391: a body that is not valid JSON reaches here from
+  // express.json(). Its error carries the raw body (`err.body`) and V8's
+  // message quotes part of it, which could be a guest's pay-link token: log
+  // only that it happened, never the body.
+  if ((err as { type?: string }).type === "entity.parse.failed") {
+    // Review round 1: the client's input, not our error: 400, never 500.
+    console.warn("Request body is not valid JSON (body not logged)");
+    res.status(400).json({
+      success: false,
+      error: "VALIDATION_ERROR",
+      message: "The request body is not valid JSON",
+    });
+    return;
+  }
   console.error("Unhandled error:", err);
   res.status(500).json({
     success: false,

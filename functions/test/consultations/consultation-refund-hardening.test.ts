@@ -35,7 +35,7 @@ import {
 } from "./refund-fixtures";
 import { notificationService } from "../../src/services/notification.service";
 import {
-  consultationRefundService, matchProviderRefund, MAX_REFUND_ATTEMPTS, refundShortfall,
+  consultationRefundService, matchProviderRefund, MAX_REFUND_ATTEMPTS, NO_REFUND_DUE_MESSAGE, refundShortfall,
 } from "../../src/services/consultation-refund.service";
 import { consultationController } from "../../src/controllers/consultation.controller";
 import { transactionController } from "../../src/controllers/transaction.controller";
@@ -546,6 +546,46 @@ describe("B: an admin closes a held client-cancel refund (fee >= charge) as noth
     await heldFeeNotLess();
     assert.equal(bookingOf("c1")!.refundStatus, "failed");
     assert.equal(bookingOf("c1")!.refundHeldReason, "fee_not_less_than_amount");
+  });
+
+  test("#465: the client is told at once that no refund is due (never 'Refund delayed'), sees the held reason and refundState none_due; money unchanged; the close still works", async () => {
+    const held = await heldFeeNotLess();
+    // The notice: "no refund due", once; no "Refund delayed".
+    const toClient = notified.filter((n) => n.userId === client.uid);
+    assert.equal(toClient.filter((n) => n.type === "consultation_refund_delayed").length, 0);
+    const noRefund = toClient.filter((n) => n.body === NO_REFUND_DUE_MESSAGE);
+    assert.equal(noRefund.length, 1);
+    assert.equal(
+      NO_REFUND_DUE_MESSAGE,
+      "Your consultation was cancelled. The payment provider\u2019s processing fee covers the whole payment, so there\u2019s no refund due."
+    );
+    // The client's booking view carries the held reason.
+    const view = await getBooking(client);
+    assert.equal(view.status, 200);
+    assert.equal(view.body.data.refundHeldReason, "fee_not_less_than_amount");
+    // The client's transaction view: none_due.
+    const list = await listTransactions(client);
+    const refund = (list.body.data as any[]).find((t) => t.type === "refund");
+    assert.equal(refund.refundState, "none_due");
+    // Money unchanged: still held at 0, the fee still frozen, nothing moved.
+    assert.equal(held.amount, 0);
+    assert.equal(held.status, "failed");
+    assert.equal(feeOf("c1")!.feeHoldFrozenByRefundId, held.id);
+    assert.equal(harness.refundCalls.length, 0);
+    // The admin close still works.
+    const out = await closeHeld(admin);
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.equal(refundRows()[0].status, "closed");
+  });
+
+  test("#465: a hold for another reason (Paystack's fee unknown) still says 'Refund delayed'", async () => {
+    await bookAndPay("c1", { fees: undefined });
+    assert.equal((await setStatus(client, "cancelled", "c1")).status, 200);
+    assert.equal(refundRows()[0].refundHeldReason, "paystack_fee_unknown");
+    assert.equal(delayedNotices(), 1);
+    assert.ok(!notified.some((n) => n.body === NO_REFUND_DUE_MESSAGE));
+    const refund = ((await listTransactions(client)).body.data as any[]).find((t) => t.type === "refund");
+    assert.equal(refund.refundState, "delayed");
   });
 
   test("closing: no Paystack call, no money; the row is closed and leaves the failed list; the fee unfreezes; nobody gets anything", async () => {

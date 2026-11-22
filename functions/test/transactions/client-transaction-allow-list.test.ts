@@ -444,7 +444,10 @@ describe("client transaction allow-list (issue #329)", () => {
     ["processing", { status: "processing" }, "on_its_way"],
     ["completed", { status: "completed" }, "refunded"],
     ["failed at Paystack", { status: "failed" }, "delayed"],
-    ["HELD for an admin (failed, amount 0)", { status: "failed", amount: 0, refundHeldReason: "fee_not_less_than_amount" }, "delayed"],
+    // Issue #465: held because Paystack's fee covers the whole payment: no refund due.
+    ["HELD with fee_not_less_than_amount (failed, amount 0)", { status: "failed", amount: 0, refundHeldReason: "fee_not_less_than_amount" }, "none_due"],
+    // Any other hold stays "delayed".
+    ["HELD for an admin, fee unknown (failed, amount 0)", { status: "failed", amount: 0, refundHeldReason: "paystack_fee_unknown" }, "delayed"],
     ["closed as nothing_to_refund", { status: "closed", amount: 0, refundHeldReason: "fee_not_less_than_amount" }, "none_due"],
   ];
   for (const [name, over, state] of REFUND_STATES) {

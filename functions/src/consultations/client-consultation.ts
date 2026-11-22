@@ -75,6 +75,9 @@ export const CLIENT_CONSULTATION_FIELDS = [
   "cancellationReason",
   // Issue #317: where the booking's refund stands (no ids, no Paystack data).
   "refundStatus",
+  // Issue #465: why a refund is held (e.g. `fee_not_less_than_amount`: no
+  // refund due), so the app can say so instead of "delayed".
+  "refundHeldReason",
   // Issue #382: the "the meeting didn't happen" report (for #442).
   "canReportNoShow",
   "noShowReport",
@@ -144,6 +147,13 @@ export interface ClientConsultation extends ClientChargeFields {
 
   /** Issue #317: where the refund of this booking's fee stands, if one was started. */
   refundStatus?: Consultation["refundStatus"];
+
+  /**
+   * Issue #465: why the booking's refund is held for an admin, when it is
+   * (`fee_not_less_than_amount`: Paystack's fee covers the whole payment, so
+   * no refund is due; `paystack_fee_unknown`: delayed).
+   */
+  refundHeldReason?: Consultation["refundHeldReason"];
 
   /**
    * Issue #382: whether the client may report now that the meeting did not
@@ -242,6 +252,8 @@ export function toClientConsultation(
 
   // Refund status only (issue #317): never the refund id or Paystack data.
   if (c.refundStatus !== undefined) out.refundStatus = c.refundStatus;
+  // Issue #465: the held reason (a fixed code, nothing internal).
+  if (c.refundHeldReason !== undefined) out.refundHeldReason = c.refundHeldReason;
 
   return out;
 }

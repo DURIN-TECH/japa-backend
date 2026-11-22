@@ -194,8 +194,8 @@ const FULL_BOOKING: Required<Consultation> = {
   // Issue #317: the refund row's id is internal; its status is shown.
   refundId: "HIDDEN-refund-row-id",
   refundStatus: "processing",
-  // Issue #413: the booking's mirror of a HELD refund's reason (hidden: the
-  // client reads `refundStatus`, and the transaction's `refundState`).
+  // Issue #413: the booking's mirror of a HELD refund's reason; issue #465:
+  // shown to the client (a fixed code), so the app can say "no refund due".
   refundHeldReason: "fee_not_less_than_amount",
   // Issue #382: the booking's mirror of its no-show report (shown: status and times).
   noShowReport: { status: "open", createdAt: at(5) },
@@ -241,6 +241,8 @@ const SHOWN_FROM: Partial<Record<keyof Consultation, readonly string[]>> = {
   cancellationReason: ["cancellationReason"],
   // Issue #317: where the refund stands (no ids).
   refundStatus: ["refundStatus"],
+  // Issue #465: why the refund is held (a fixed code).
+  refundHeldReason: ["refundHeldReason"],
   // Issue #382: the report's status and times only.
   noShowReport: ["noShowReport"],
   createdAt: ["createdAt"],
@@ -267,7 +269,7 @@ const HIDDEN_FIELDS: readonly (keyof Consultation)[] = [
   "paidOnSupersededReference",
   // Issue #405: when the sweep's 24-hour payment grace restarted (internal clock).
   "paymentGraceStartsAt",
-  // Issue #411: the sweep's bookkeeping and a guest's pay-link expiry.
+  // Issue #411: the sweep's bookkeeping; issue #391 / #411: a guest's pay-link expiry.
   "graceRestartCount",
   "sweepSetAside",
   "sweepReview",
@@ -277,8 +279,6 @@ const HIDDEN_FIELDS: readonly (keyof Consultation)[] = [
   "cancelledBy",
   // Issue #317: the refund row id (`refund_<Paystack reference>`).
   "refundId",
-  // Issue #413: internal reason a refund is held for an admin.
-  "refundHeldReason",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */
@@ -292,7 +292,7 @@ const HIDDEN_VALUES: readonly string[] = [
   "1733333333", // supersededAt seconds
   "1744444444", // the superseded checkout's fxRateAsOf seconds
   "1766666666", // issue #411: the sweep's bookkeeping times
-  "1777777777", // issue #411: payLinkExpiresAt seconds
+  "1777777777", // issue #391 / #411: payLinkExpiresAt seconds
   "hold", // fxRateSource
   "public_page", // bookedVia
   "NOT-IN-THE-TYPE", // the undeclared fields seeded below
@@ -493,6 +493,8 @@ describe("client consultation allow-list (issue #332)", () => {
       cancellationReason: "Travel moved",
       // Issue #317: the refund's status (its id stays hidden).
       refundStatus: "processing",
+      // Issue #465: the held reason is shown.
+      refundHeldReason: "fee_not_less_than_amount",
       // Issue #382: not worked out here (false), and the report's status and time only.
       canReportNoShow: false,
       noShowReport: { status: "open", createdAt: at(5) },
