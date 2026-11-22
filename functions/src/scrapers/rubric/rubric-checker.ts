@@ -44,9 +44,9 @@ import { SnapshotQuoteIndex, type QuoteLookup } from "./rubric-quote";
 import { quoteIsLeadIn, verifyListItems } from "./rubric-list-items";
 import { RubricExtractionService, RunStop, isTransientProviderError, possibleDuplicateFlags, type RedraftOutcome } from "./rubric-extraction.service";
 import { RUBRIC_REPAIR_PROMPT_VERSION, RUBRIC_SYSTEM_PROMPT } from "./rubric-prompt";
-import { REDRAFT_DUPLICATE_REASON, REPAIR_WINDOW_CHARS, ruleHashOf } from "./rubric-repair";
-// (#440) The one rulebook and version pair whose check answers may be reused (see that module).
-import { CHECK_REUSE_PAIR } from "../../services/rubric-check-reuse-pair";
+import { REDRAFT_DUPLICATE_REASON, REPAIR_WINDOW_CHARS, ruleHashOf, stableJson } from "./rubric-repair";
+// (#440, #461) The one rulebook and its version pairs whose check answers may be reused (see that module).
+import { CHECK_REUSE_PAIR, CHECK_REUSE_PAIRS, checkReusePairFor } from "../../services/rubric-check-reuse-pair";
 
 // ============================================
 // INDEPENDENT RULE CHECK — VERDICTS TO ACTIONS, AND THE RUN (issue #202, part of #200)
@@ -386,7 +386,10 @@ export interface RubricCheckInputShape {
   // intention-to-stay reading) that did not change. Named on the call, never a setting; allowed only for the
   // one pair in `CHECK_REUSE_PAIR` (anything else holds `checker_reuse_refused:<code>` before any spend). The
   // caller passes the base version as stored (UNFILTERED). Absent = the check behaves exactly as before.
-  reuseFrom?: { version: number; rubric: VisaRubric };
+  // (#461) `via`: for a pair that names a `viaVersion` (version 2 -> 3), the version the BASE itself reused its
+  // answers from (as stored, UNFILTERED). The proof of a rule the base reused follows that ONE hop back; a pair
+  // that names one refuses a call without it (`via_mismatch`), a pair that names none refuses one with it.
+  reuseFrom?: { version: number; rubric: VisaRubric; via?: { version: number; rubric: VisaRubric } };
 }
 export type RubricCheckOutcomeShape =
   | {
@@ -482,6 +485,9 @@ export interface RubricCheckerRun {
 export interface CheckReuseRecord {
   fromVersion: number;
   fromRunId: string;
+  // (#461) Present when the base's own reuse was followed one hop back: the version and run the answers of the
+  // rules the base reused were proven on.
+  via?: { version: number; runId: string };
   rules: Record<string, { rule: "reused" | "asked"; reason?: string; trigger?: "reused" | "asked"; triggerReason?: string }>;
   totals: { rulesReused: number; rulesAsked: number; triggersReused: number; triggersAsked: number; polarityReused: number; repairsCarried: number; repairChecksCarried: number };
 }
@@ -531,7 +537,8 @@ export interface StoredRedraft {
 //      checker's system prompt) hashes the same on both versions;
 //   3. the model id of each role and `CHECKER_PROMPT_VERSION` are those of the base record;
 //   4. the answer is PROVEN to be that rule's: the base version's batches are rebuilt from
-//      the base version itself (the rules the base record has letters for, in rulebook
+//      the base version itself (the rules the base record has letters for (#461: and, on a
+//      record that reused answers itself, only the rules it asked about), in rulebook
 //      order, cut like the run cut them), and only a stored answer found under the rebuilt
 //      request's hash is read, its letters cross-checked with the record's audit letters.
 //      A stored answer that matches no rebuilt request is never read.
@@ -539,9 +546,14 @@ export interface StoredRedraft {
 // of unchanged rules follow the same rules (see `planReuse`). A reused answer then goes
 // through exactly the same table, repair and gates as a fresh one: reuse decides nothing new.
 //
-// ONE PAIR ONLY (owner decision, #440): the rulebook and the from/to versions in `CHECK_REUSE_PAIR`
-// (services/rubric-check-reuse-pair.ts, kept out of this generic module). Not a setting, no override.
-export { CHECK_REUSE_PAIR };
+// (#461) A base version that itself reused answers (its record has a reuse account) holds only the answers
+// it ASKED for: its batches are rebuilt from those rules alone, and an answer it reused is proven ONE hop
+// back, on the version it came from (`reuseFrom.via`), with the base's audit letters tied to it. Never two hops.
+//
+// ONE RULEBOOK, LISTED PAIRS ONLY (owner decisions, #440 and #461): the rulebook and the from/to versions in
+// `CHECK_REUSE_PAIRS` (services/rubric-check-reuse-pair.ts, kept out of this generic module). Not a setting,
+// no override.
+export { CHECK_REUSE_PAIR, CHECK_REUSE_PAIRS };
 
 /**
  * (#440) Why `input.reuseFrom` cannot be used (a code word), or null when it may. Checked before any read or
@@ -551,12 +563,25 @@ export { CHECK_REUSE_PAIR };
 export function checkReuseRefusal(input: RubricCheckInputShape): string | null {
   const from = input.reuseFrom;
   if (!from) return null;
-  if (input.routeKey !== CHECK_REUSE_PAIR.routeKey || input.rubric.routeKey !== input.routeKey) return "rulebook_not_allowed";
-  if (from.version !== CHECK_REUSE_PAIR.fromVersion || input.version !== CHECK_REUSE_PAIR.toVersion || input.rubric.version !== input.version) return "version_not_allowed";
+  // The rulebook first: no pair at all names it.
+  if (!CHECK_REUSE_PAIRS.some((p) => p.routeKey === input.routeKey) || input.rubric.routeKey !== input.routeKey) return "rulebook_not_allowed";
+  // Then the exact step (from -> to): only the pairs in the list (#440: 1 -> 2; #461: 2 -> 3).
+  const pair = checkReusePairFor(input.routeKey, from.version, input.version);
+  if (!pair || input.rubric.version !== input.version) return "version_not_allowed";
   if (!from.rubric || from.rubric.routeKey !== input.routeKey || from.rubric.version !== from.version || !Array.isArray(from.rubric.criteria)) return "base_mismatch";
   // Only answers that a published version stood on are reused.
   if (from.rubric.reviewStatus !== "approved") return "base_not_approved";
   if (input.runId !== `${input.routeKey}__v${input.version}`) return "run_id_mismatch";
+  // (#461) The one hop back: exactly the pair's `viaVersion`, the same rulebook, the whole stored version, and a
+  // version that was itself approved (it stays `approved` with `supersededAt` once replaced). A pair with no hop
+  // takes none.
+  const via = from.via;
+  if (pair.viaVersion === undefined) {
+    if (via !== undefined) return "via_not_allowed";
+  } else {
+    if (!via || via.version !== pair.viaVersion || !via.rubric || via.rubric.routeKey !== input.routeKey || via.rubric.version !== via.version || !Array.isArray(via.rubric.criteria)) return "via_mismatch";
+    if (via.rubric.reviewStatus !== "approved") return "via_not_approved";
+  }
   return null;
 }
 
@@ -575,6 +600,37 @@ interface ReusePlan {
   // The base version's stored re-drafts of rules reused here (see `planReuse`).
   repairs: Record<string, StoredRedraft>;
   record: CheckReuseRecord;
+}
+
+/**
+ * (#461) What ONE stored check record proves about the version it is the record of (see `proveRecord`): the
+ * base version's record, or the one hop back. Only answers found under a request rebuilt from that version.
+ */
+interface ProvenRecord {
+  rec: RubricCheckerRun | null;
+  // Why nothing of this record can be used (a code), or null.
+  recordProblem: string | null;
+  // Why nothing of one role can be used (the record's problem, or another model), or null.
+  roleProblem: (role: "verification" | "judgement") => string | null;
+  // The record's own reuse account (a record of a check that itself reused answers), if any.
+  account: CheckReuseRecord | undefined;
+  byId: Map<string, AssessmentCriterion>;
+  questions: NonNullable<VisaRubric["intakeQuestions"]>;
+  // That version's views of the rules its record has letters for.
+  views: Map<string, CheckerRuleView>;
+  // Proven verdict rows and trigger verdicts per role, and the rules whose stored answer disagrees with the audit letters.
+  rows: { verification: Map<string, VerdictRow>; judgement: Map<string, VerdictRow> };
+  auditMismatch: Set<string>;
+  triggers: { verification: Map<string, TriggerVerdict>; judgement: Map<string, TriggerVerdict> };
+  // Proven intention-to-stay readings, by request hash.
+  polarity: Record<string, StoredResponse>;
+  // The record's stored re-drafts (rule, attempt), the replacements' views on that version, and the proven checks.
+  entries: (readonly [AssessmentCriterion, StoredRedraft])[];
+  replacementViews: Map<string, CheckerRuleView>;
+  ordinaryRow: Map<string, string>;
+  ordinaryTrigger: Map<string, string>;
+  protectedProven: Record<string, StoredResponse>;
+  protectedJobsProven: Map<string, number>;
 }
 
 /** (#440) What a check would send (see `RubricCheckerService.planRequests`). */
@@ -929,7 +985,14 @@ export class RubricCheckerService {
       const from = input.reuseFrom;
       const fromRunId = `${input.routeKey}__v${from.version}`;
       const baseRecord = await this.at(stage, "ledger", () => this.deps.ledger.load(fromRunId));
-      reuse = await this.at(stage, "snapshot_read", () => this.planReuse({ rules, views, questions, models, limits, indexes, current: rubric, base: from.rubric, baseRecord, fromRunId, fromVersion: from.version, routeKey: input.routeKey }));
+      // (#461) The one hop back (only for a pair that names it; `checkReuseRefusal` made sure it is that version).
+      let via: { version: number; rubric: VisaRubric; runId: string; record: RubricCheckerRun | null } | undefined;
+      if (from.via) {
+        const viaRunId = `${input.routeKey}__v${from.via.version}`;
+        const viaRecord = await this.at(stage, "ledger", () => this.deps.ledger.load(viaRunId));
+        via = { version: from.via.version, rubric: from.via.rubric, runId: viaRunId, record: viaRecord };
+      }
+      reuse = await this.at(stage, "snapshot_read", () => this.planReuse({ rules, views, questions, models, limits, indexes, current: rubric, base: from.rubric, baseRecord, fromRunId, fromVersion: from.version, routeKey: input.routeKey, ...(via ? { via } : {}) }));
     }
 
     // ---- who is protected, and who cannot be read ----
@@ -1767,26 +1830,220 @@ export class RubricCheckerService {
   // ---------- (#440) reuse of an earlier version's answers ----------
 
   /**
-   * Work out which of the base version's answers this check may reuse (the rules in the section header
-   * above `CHECK_REUSE_PAIR`). Reads the base version's cited snapshots; never calls a model. Every rule of
-   * `rules` that has a view gets a line in the record: `reused`, or `asked` with the first condition that failed.
+   * (#440, #461) Rebuild what ONE stored check record can prove, from the version it was the record of. Reads
+   * that version's cited snapshots; never calls a model. Shared by the base version and (#461) the one hop
+   * back, so both are proven the same way.
    *
-   * Steps:
-   *  1. the base record as a whole: it must exist, be the base version's own record (`runId`, `routeKey`,
-   *     `version`) and carry the current `CHECKER_PROMPT_VERSION`; per role, the same model id;
-   *  2. the base batches rebuilt from the BASE version: the rules the record has audit letters for, in
-   *     rulebook order (protected first, then ordinary; two roles for protected), each shown through `viewOf`
-   *     with the base version's questions. The list check of today is not applied here: a rule that had a
-   *     view when the base was checked must be in its batch again for the hashes to match, and the hash is
-   *     the proof. A stored answer is read only under a rebuilt hash, with the right role and model;
-   *  3. the same for the trigger batches, the intention-to-stay readings, and the checks of the base
-   *     version's stored replacements;
-   *  4. per rule of THIS version: reused only when the rule is identical, the proven base answer exists for
-   *     every role it needs, and the rule's one-rule request hashes the same on both versions;
+   *  1. the record as a whole: it must exist, be that version's own record (`runId`, `routeKey`, `version`) and
+   *     carry the current `CHECKER_PROMPT_VERSION`; per role, the current model id;
+   *  2. the version's own views (its cited snapshots, in its own language, its own questions) of every rule the
+   *     record has audit letters for (the list check of today is not applied: a rule that had a view when the
+   *     version was checked must be in its batch again for the hashes to match, and the hash is the proof);
+   *  3. its batches rebuilt the way its run cut them, and only a stored answer found under a rebuilt hash, with
+   *     the right role and model, is read; its letters must agree with the record's audit letters:
+   *       - a record WITHOUT a reuse account (a plain check, e.g. version 1) asked every rule: the batches are
+   *         rebuilt from every rule with letters (as in #440);
+   *       - (#461) a record WITH a reuse account (a check that itself reused answers, e.g. version 2) sent only
+   *         the rules its account marks `asked` (and only the triggers marked `asked`), batched among
+   *         themselves: the batches are rebuilt from those alone. Its REUSED rules are in no rebuilt batch, so
+   *         nothing of theirs is proven here (the hop, in `planReuse`, proves them from the version they came from);
+   *  4. the same for the trigger batches, the intention-to-stay readings (found by exact request hash), and the
+   *     checks of the record's stored replacements (for a record with a reuse account: only the re-drafts of
+   *     rules it asked about, grouped as its repair step grouped them; a different grouping makes the hashes
+   *     differ, and then nothing is proven: fail closed).
+   */
+  private async proveRecord(p: {
+    rubric: VisaRubric;
+    rec: RubricCheckerRun | null;
+    runId: string;
+    version: number;
+    routeKey: string;
+    models: { verification: string; judgement: string };
+    limits: { maxOutputTokens: number; timeoutMs: number };
+  }): Promise<ProvenRecord> {
+    type Role = "verification" | "judgement";
+    const roles: readonly Role[] = ["verification", "judgement"];
+    const rec = p.rec;
+    // ---- 1. the record as a whole ----
+    let recordProblem: string | null = null;
+    if (!rec) recordProblem = "base_record_missing";
+    else if (rec.runId !== p.runId || rec.routeKey !== p.routeKey || rec.version !== p.version) recordProblem = "base_record_mismatch";
+    else if (rec.promptVersion !== CHECKER_PROMPT_VERSION) recordProblem = "prompt_version_changed";
+    const roleProblem = (role: Role): string | null => recordProblem ?? (rec?.models?.[role] !== p.models[role] ? "model_changed" : null);
+    /** A stored answer under a rebuilt request hash, with the right role and the current model; else null. */
+    const answerFor = (job: Job): StoredResponse | null => {
+      if (!rec || roleProblem(job.role)) return null;
+      const hit = rec.responses?.[job.hash];
+      return hit && hit.role === job.role && hit.model === p.models[job.role] ? hit : null;
+    };
+    // (#461) A record that reused answers itself: only what it ASKED is in its stored batches.
+    const account = rec && !recordProblem ? rec.reuse : undefined;
+    const askedRule = (id: string): boolean => !account || account.rules?.[id]?.rule === "asked";
+    const askedTrigger = (id: string): boolean => !account || account.rules?.[id]?.trigger === "asked";
+
+    // ---- 2. the version's own views ----
+    const rules = p.rubric.criteria ?? [];
+    const questions = p.rubric.intakeQuestions ?? [];
+    const byId = new Map(rules.map((r) => [r.criterionId, r]));
+    // A separate cache: this version is read in the language ITS snapshots were registered in.
+    const indexes = new Map<string, Promise<SnapshotQuoteIndex>>();
+    const indexOf = (sourceId: string, hash: string): Promise<SnapshotQuoteIndex> => {
+      const key = `${sourceId}:${hash}`;
+      let ready = indexes.get(key);
+      if (!ready) {
+        ready = this.deps.readSnapshot(sourceId, hash).then((c) => indexInItsLanguage(c, p.rubric, sourceId));
+        indexes.set(key, ready);
+      }
+      return ready;
+    };
+    /** The view of a rule (or replacement) as this version's check showed it; null when it cannot be rebuilt. */
+    const viewOfHere = async (rule: AssessmentCriterion): Promise<CheckerRuleView | null> => {
+      try {
+        const index = await indexOf(rule.source.sourceId, rule.source.contentHash);
+        const found = index.locate(rule.source.quote);
+        return found.ok ? viewOf(rule, index, found, questions) : null;
+      } catch {
+        // A snapshot that cannot be read proves nothing: those rules are asked, never assumed.
+        return null;
+      }
+    };
+    const views = new Map<string, CheckerRuleView>();
+    if (rec && !recordProblem) {
+      for (const r of rules) {
+        if (!rec.ruleVerdicts?.[r.criterionId]) continue;
+        const v = await viewOfHere(r);
+        if (v) views.set(r.criterionId, v);
+      }
+    }
+    const composition = rules.filter((r) => views.has(r.criterionId) && askedRule(r.criterionId));
+    const compProtected = composition.filter(isProtectedRule);
+    const compOrdinary = composition.filter((r) => !isProtectedRule(r));
+
+    // ---- 3. the proven rows ----
+    const rows: Record<Role, Map<string, VerdictRow>> = { verification: new Map(), judgement: new Map() };
+    const auditMismatch = new Set<string>();
+    for (const role of roles) {
+      const groups = role === "verification" ? [compProtected, compOrdinary] : [compProtected];
+      for (const group of groups) {
+        for (const job of this.batchJobs(role, group, views, p.limits)) {
+          const hit = answerFor(job);
+          if (!hit?.rows) continue;
+          (job.criterionIds ?? []).forEach((id, k) => {
+            const row = decodeRow(hit.rows?.[handleFor(k)]);
+            if (!row) return;
+            // The record's audit letters for the rule must agree with the answer they were taken from.
+            const audit = rec?.ruleVerdicts?.[id]?.[role];
+            if (audit !== undefined && audit !== encodeRow(row)) {
+              auditMismatch.add(id);
+              return;
+            }
+            rows[role].set(id, row);
+          });
+        }
+      }
+    }
+
+    // ---- 4. the proven trigger verdicts ----
+    const triggers: Record<Role, Map<string, TriggerVerdict>> = { verification: new Map(), judgement: new Map() };
+    const triggered = rules.filter((r) => views.has(r.criterionId) && r.trigger !== undefined && isValidTrigger(r.trigger, questions) && askedTrigger(r.criterionId));
+    for (const role of roles) {
+      const groups = role === "verification" ? [triggered.filter(isProtectedRule), triggered.filter((r) => !isProtectedRule(r))] : [triggered.filter(isProtectedRule)];
+      for (const g of groups) {
+        for (const job of this.triggerJobs(role, g, views, questions, p.limits)) {
+          const hit = answerFor(job);
+          if (!hit?.triggers) continue;
+          (job.criterionIds ?? []).forEach((id, k) => {
+            const v = hit.triggers?.[handleFor(k)];
+            if (v === "yes" || v === "no" || v === "unsure") triggers[role].set(id, v);
+          });
+        }
+      }
+    }
+
+    // ---- 4b. the intention-to-stay readings: an identical request finds them by hash ----
+    const polarity: Record<string, StoredResponse> = {};
+    const proposal = p.rubric.intentPolarityProposal;
+    if (proposal && proposal.value !== "not_assessed" && proposal.source?.quote) {
+      for (const role of roles) {
+        const job = this.polarityJob(role, proposal.source.quote, p.limits);
+        const hit = answerFor(job);
+        if (hit && typeof hit.answer === "string") polarity[job.hash] = hit;
+      }
+    }
+
+    // ---- 4c. the checks of the record's stored replacements ----
+    const entries = rec && !recordProblem
+      ? rules.map((r) => [r, rec.repairs?.[r.criterionId]] as const).filter((e): e is readonly [AssessmentCriterion, StoredRedraft] => e[1] !== undefined)
+      : [];
+    // Every replacement's view on this version (used to compare what the model was shown); the BATCHES below are
+    // rebuilt only from the replacements this record's run checked (all of them, or (#461) those of asked rules).
+    const replacementViews = new Map<string, CheckerRuleView>();
+    for (const [, e] of entries) {
+      if (e.kind !== "replacement" || !e.replacement) continue;
+      const v = await viewOfHere(e.replacement);
+      if (v) replacementViews.set(e.replacement.criterionId, v);
+    }
+    const checkedHere = entries.filter(([o]) => askedRule(o.criterionId));
+    // Ordinary replacements with a stored check by the verification model (one group, rulebook order); protected
+    // ones by both models (one group), as the repair step asked them.
+    const ordViews = checkedHere.filter(([o, e]) => !isProtectedRule(o) && e.kind === "replacement" && e.replacement && e.ordinaryCheck).map(([, e]) => e.replacement as AssessmentCriterion).filter((x) => replacementViews.has(x.criterionId));
+    const ordinaryRow = new Map<string, string>();
+    const ordinaryTrigger = new Map<string, string>();
+    for (const job of this.batchJobs("verification", ordViews, replacementViews, p.limits)) {
+      const hit = answerFor(job);
+      (job.criterionIds ?? []).forEach((id, k) => {
+        const row = hit?.rows?.[handleFor(k)];
+        if (row !== undefined && decodeRow(row)) ordinaryRow.set(id, row);
+      });
+    }
+    for (const job of this.triggerJobs("verification", ordViews.filter((x) => x.trigger !== undefined && isValidTrigger(x.trigger, questions)), replacementViews, questions, p.limits)) {
+      const hit = answerFor(job);
+      (job.criterionIds ?? []).forEach((id, k) => {
+        const v = hit?.triggers?.[handleFor(k)];
+        if (v !== undefined) ordinaryTrigger.set(id, v);
+      });
+    }
+    // Protected: every proven answer of their check, by request hash (an identical request finds it).
+    const protViews = checkedHere.filter(([o, e]) => isProtectedRule(o) && e.kind === "replacement" && e.replacement).map(([, e]) => e.replacement as AssessmentCriterion).filter((x) => replacementViews.has(x.criterionId));
+    const protTriggered = protViews.filter((x) => x.trigger !== undefined && isValidTrigger(x.trigger, questions));
+    const protectedProven: Record<string, StoredResponse> = {};
+    const protectedJobsProven = new Map<string, number>();
+    for (const role of roles) {
+      for (const job of [...this.batchJobs(role, protViews, replacementViews, p.limits), ...this.triggerJobs(role, protTriggered, replacementViews, questions, p.limits)]) {
+        const hit = answerFor(job);
+        if (!hit) continue;
+        protectedProven[job.hash] = hit;
+        for (const id of job.criterionIds ?? []) protectedJobsProven.set(id, (protectedJobsProven.get(id) ?? 0) + 1);
+      }
+    }
+    return { rec, recordProblem, roleProblem, account, byId, questions, views, rows, auditMismatch, triggers, polarity, entries, replacementViews, ordinaryRow, ordinaryTrigger, protectedProven, protectedJobsProven };
+  }
+
+  /**
+   * Work out which of the base version's answers this check may reuse (the rules in the section header
+   * above `CHECK_REUSE_PAIR`). Never calls a model. Every rule of `rules` that has a view gets a line in the
+   * record: `reused`, or `asked` with the first condition that failed.
+   *
+   *  1. the base version's record is proven against the base version (`proveRecord`);
+   *  2. (#461) when the base record itself REUSED answers (it has a reuse account), its reused rules were never
+   *     sent on the base version, so their answers are proven ONE hop back: the account must name exactly the
+   *     `via` version's run (`fromRunId`, `fromVersion`), and that run's record is proven against the `via`
+   *     version the same way. A missing `via`, another run named, or a `via` record that cannot be proven means
+   *     those rules are asked. The `via` record's own reused rules are in none of its rebuilt batches, so a
+   *     second hop is never followed;
+   *  3. per rule of THIS version, by where the base got its answer:
+   *       - asked on the base (or the base reused nothing): reused only when the rule is identical to the base's
+   *         (`ruleHashOf`), the proven base answer exists for every role it needs, and the rule's one-rule request
+   *         hashes the same on both versions (as in #440);
+   *       - reused by the base from `via`: reused only when the rule is identical on `via`, the base and here; the
+   *         answer is proven on `via` (and agrees with `via`'s audit letters); the BASE's audit letters
+   *         (`ruleVerdicts`) agree with that answer; and the one-rule request hashes the same on all three;
+   *     the trigger likewise, by where the base got ITS verdict (`trigger` in the base's account);
+   *  4. the intention-to-stay readings: found by exact request hash in the base record, or the `via` record;
    *  5. the base version's stored re-draft of a REUSED rule (same rule hash) is carried over. An ordinary
-   *     replacement keeps its stored check only when that check is proven (rebuilt like step 2) and the
-   *     replacement shows the model exactly what it showed on the base version; otherwise only its check is
-   *     asked again (the replacement itself is not re-drafted).
+   *     replacement keeps its stored check only when that check is proven (on the base, or (#461) for a rule the
+   *     base reused, on `via` with the base's stored attempt identical to `via`'s) and the replacement shows the
+   *     model exactly what it showed there; otherwise only its check is asked again (no new re-draft).
    */
   private async planReuse(p: {
     rules: readonly AssessmentCriterion[];
@@ -1802,239 +2059,171 @@ export class RubricCheckerService {
     fromRunId: string;
     fromVersion: number;
     routeKey: string;
+    // (#461) The version the base reused its answers from, and its record (only for a pair that names one).
+    via?: { version: number; rubric: VisaRubric; runId: string; record: RubricCheckerRun | null };
   }): Promise<ReusePlan> {
     type Role = "verification" | "judgement";
     const record: CheckReuseRecord = { fromVersion: p.fromVersion, fromRunId: p.fromRunId, rules: {}, totals: { rulesReused: 0, rulesAsked: 0, triggersReused: 0, triggersAsked: 0, polarityReused: 0, repairsCarried: 0, repairChecksCarried: 0 } };
     const plan: ReusePlan = { rows: { verification: new Map(), judgement: new Map() }, triggers: { verification: new Map(), judgement: new Map() }, reusedRules: new Set(), reusedTriggers: new Set(), proven: {}, repairs: {}, record };
     const roles: readonly Role[] = ["verification", "judgement"];
-
-    // ---- 1. the base record as a whole ----
-    const rec = p.baseRecord;
-    let recordProblem: string | null = null;
-    if (!rec) recordProblem = "base_record_missing";
-    else if (rec.runId !== p.fromRunId || rec.routeKey !== p.routeKey || rec.version !== p.fromVersion) recordProblem = "base_record_mismatch";
-    else if (rec.promptVersion !== CHECKER_PROMPT_VERSION) recordProblem = "prompt_version_changed";
-    /** Why nothing of a role can be reused (a code), or null. */
-    const roleProblem = (role: Role): string | null => recordProblem ?? (rec?.models?.[role] !== p.models[role] ? "model_changed" : null);
-    /** A stored base answer under a rebuilt request hash, with the right role and the current model; else null. */
-    const answerFor = (job: Job): StoredResponse | null => {
-      if (!rec || roleProblem(job.role)) return null;
-      const hit = rec.responses?.[job.hash];
-      return hit && hit.role === job.role && hit.model === p.models[job.role] ? hit : null;
-    };
     /** The one-rule request of a view, hashed: what "the model is shown the same about this rule" compares. */
     const ruleFingerprint = (role: Role, view: CheckerRuleView): string => llmRequestHash(buildBatchRequest(role, [view], p.limits));
     const triggerFingerprint = (role: Role, view: TriggerCheckView): string => llmRequestHash(buildTriggerRequest(role, [view], p.limits));
 
-    // ---- 2. the base version's own views (its own cited snapshots, in its own language) ----
-    const baseRules = p.base.criteria ?? [];
-    const baseQuestions = p.base.intakeQuestions ?? [];
-    const baseById = new Map(baseRules.map((r) => [r.criterionId, r]));
-    // A separate cache: the base is read in the language ITS snapshots were registered in.
-    const baseIndexes = new Map<string, Promise<SnapshotQuoteIndex>>();
-    const baseIndexOf = (sourceId: string, hash: string): Promise<SnapshotQuoteIndex> => {
-      const key = `${sourceId}:${hash}`;
-      let ready = baseIndexes.get(key);
-      if (!ready) {
-        ready = this.deps.readSnapshot(sourceId, hash).then((c) => indexInItsLanguage(c, p.base, sourceId));
-        baseIndexes.set(key, ready);
+    // ---- 1. the base record ----
+    const A = await this.proveRecord({ rubric: p.base, rec: p.baseRecord, runId: p.fromRunId, version: p.fromVersion, routeKey: p.routeKey, models: p.models, limits: p.limits });
+
+    // ---- 2. (#461) one hop back, only when the base itself reused answers ----
+    let H: ProvenRecord | null = null;
+    let hopProblem: string | null = null;
+    if (A.account) {
+      if (!p.via) hopProblem = "base_answer_not_stored";
+      else if (A.account.fromRunId !== p.via.runId || A.account.fromVersion !== p.via.version) hopProblem = "hop_not_allowed";
+      else {
+        H = await this.proveRecord({ rubric: p.via.rubric, rec: p.via.record, runId: p.via.runId, version: p.via.version, routeKey: p.routeKey, models: p.models, limits: p.limits });
+        record.via = { version: p.via.version, runId: p.via.runId };
       }
-      return ready;
+    }
+    /** Where the base got a rule's answer: on the base itself (`A`), one hop back (`H`), or nowhere. */
+    const sourceOfRule = (id: string): "base" | "hop" | "none" => {
+      if (!A.account) return "base";
+      const line = A.account.rules?.[id];
+      return line?.rule === "asked" ? "base" : line?.rule === "reused" ? "hop" : "none";
     };
-    /** The view of a base rule (or replacement) as the base check showed it; null when it cannot be rebuilt. */
-    const baseViewOf = async (rule: AssessmentCriterion): Promise<CheckerRuleView | null> => {
-      try {
-        const index = await baseIndexOf(rule.source.sourceId, rule.source.contentHash);
-        const found = index.locate(rule.source.quote);
-        return found.ok ? viewOf(rule, index, found, baseQuestions) : null;
-      } catch {
-        // A base snapshot that cannot be read proves nothing: those rules are asked, never assumed.
-        return null;
-      }
+    const sourceOfTrigger = (id: string): "base" | "hop" | "none" => {
+      if (!A.account) return "base";
+      const line = A.account.rules?.[id];
+      return line?.trigger === "asked" ? "base" : line?.trigger === "reused" ? "hop" : "none";
     };
-    const baseViews = new Map<string, CheckerRuleView>();
-    if (rec && !recordProblem) {
-      for (const r of baseRules) {
-        if (!rec.ruleVerdicts?.[r.criterionId]) continue;
-        const v = await baseViewOf(r);
-        if (v) baseViews.set(r.criterionId, v);
-      }
-    }
-    const composition = baseRules.filter((r) => baseViews.has(r.criterionId));
-    const baseProtected = composition.filter(isProtectedRule);
-    const baseOrdinary = composition.filter((r) => !isProtectedRule(r));
 
-    // ---- 2b. the proven base rows ----
-    const provenRows: Record<Role, Map<string, VerdictRow>> = { verification: new Map(), judgement: new Map() };
-    const auditMismatch = new Set<string>();
-    for (const role of roles) {
-      const groups = role === "verification" ? [baseProtected, baseOrdinary] : [baseProtected];
-      for (const group of groups) {
-        for (const job of this.batchJobs(role, group, baseViews, p.limits)) {
-          const hit = answerFor(job);
-          if (!hit?.rows) continue;
-          (job.criterionIds ?? []).forEach((id, k) => {
-            const row = decodeRow(hit.rows?.[handleFor(k)]);
-            if (!row) return;
-            // The record's audit letters for the rule must agree with the answer they were taken from.
-            const audit = rec?.ruleVerdicts?.[id]?.[role];
-            if (audit !== undefined && audit !== encodeRow(row)) {
-              auditMismatch.add(id);
-              return;
-            }
-            provenRows[role].set(id, row);
-          });
-        }
-      }
-    }
-
-    // ---- 3. the proven base trigger verdicts ----
-    const provenTriggers: Record<Role, Map<string, TriggerVerdict>> = { verification: new Map(), judgement: new Map() };
-    const baseTriggered = composition.filter((r) => r.trigger !== undefined && isValidTrigger(r.trigger, baseQuestions));
-    for (const role of roles) {
-      const group = role === "verification" ? [baseTriggered.filter(isProtectedRule), baseTriggered.filter((r) => !isProtectedRule(r))] : [baseTriggered.filter(isProtectedRule)];
-      for (const g of group) {
-        for (const job of this.triggerJobs(role, g, baseViews, baseQuestions, p.limits)) {
-          const hit = answerFor(job);
-          if (!hit?.triggers) continue;
-          (job.criterionIds ?? []).forEach((id, k) => {
-            const v = hit.triggers?.[handleFor(k)];
-            if (v === "yes" || v === "no" || v === "unsure") provenTriggers[role].set(id, v);
-          });
-        }
-      }
-    }
-
-    // ---- 3b. the intention-to-stay readings: an identical request finds them by hash ----
-    const proposal = p.base.intentPolarityProposal;
-    if (proposal && proposal.value !== "not_assessed" && proposal.source?.quote) {
-      for (const role of roles) {
-        const job = this.polarityJob(role, proposal.source.quote, p.limits);
-        const hit = answerFor(job);
-        if (hit && typeof hit.answer === "string") plan.proven[job.hash] = hit;
-      }
-    }
-
-    // ---- 4. each rule of this version ----
+    // ---- 3. each rule of this version ----
     for (const r of p.rules) {
       const view = p.views.get(r.criterionId);
       // A rule with no view sends nothing (it is left out or held as before): nothing to reuse or ask.
       if (!view) continue;
       const id = r.criterionId;
-      const b = baseById.get(id);
+      const b = A.byId.get(id);
       const need: readonly Role[] = isProtectedRule(r) ? roles : ["verification"];
+      const from = sourceOfRule(id);
       let reason: string | null = null;
+      let provenFrom: ProvenRecord = A;
       if (!b || ruleHashOf(b) !== ruleHashOf(r)) reason = "rule_changed";
-      for (const role of need) {
-        if (reason) break;
-        const bv = baseViews.get(id);
-        reason = roleProblem(role) ?? (auditMismatch.has(id) ? "base_answer_mismatch" : !bv || !provenRows[role].has(id) ? "no_base_answer" : ruleFingerprint(role, bv) !== ruleFingerprint(role, view) ? "view_changed" : null);
+      else if (from === "none") reason = "no_base_answer";
+      else if (from === "base") {
+        for (const role of need) {
+          if (reason) break;
+          const bv = A.views.get(id);
+          reason = A.roleProblem(role) ?? (A.auditMismatch.has(id) ? "base_answer_mismatch" : !bv || !A.rows[role].has(id) ? "no_base_answer" : ruleFingerprint(role, bv) !== ruleFingerprint(role, view) ? "view_changed" : null);
+        }
+      } else {
+        // (#461) Reused by the base from `via`: prove it on `via`, and tie the base's audit letters to it.
+        const h = H;
+        const b1 = h?.byId.get(id);
+        if (hopProblem || !h) reason = hopProblem ?? "base_answer_not_stored";
+        else if (!b1 || ruleHashOf(b1) !== ruleHashOf(r)) reason = "rule_changed";
+        for (const role of need) {
+          if (reason || !h) break;
+          const hv = h.views.get(id);
+          const bv = A.views.get(id);
+          const hopRow = h.rows[role].get(id);
+          reason =
+            h.roleProblem(role) ?? A.roleProblem(role) ??
+            (h.auditMismatch.has(id) ? "base_answer_mismatch" : !hv || !hopRow ? "no_base_answer" :
+              A.rec?.ruleVerdicts?.[id]?.[role] !== encodeRow(hopRow) ? "base_answer_mismatch" :
+                !bv || ruleFingerprint(role, hv) !== ruleFingerprint(role, bv) || ruleFingerprint(role, bv) !== ruleFingerprint(role, view) ? "view_changed" : null);
+        }
+        if (h) provenFrom = h;
       }
       if (reason) {
         record.rules[id] = { rule: "asked", reason };
       } else {
         plan.reusedRules.add(id);
-        for (const role of need) plan.rows[role].set(id, provenRows[role].get(id) as VerdictRow);
+        for (const role of need) plan.rows[role].set(id, provenFrom.rows[role].get(id) as VerdictRow);
         record.rules[id] = { rule: "reused" };
       }
-      // The trigger, when this version checks it: reused only with the rule itself, and the same proof.
+      // The trigger, when this version checks it: reused only with the rule itself, and the same proof, taken
+      // from wherever the base took ITS trigger verdict.
       if (r.trigger !== undefined && isValidTrigger(r.trigger, p.questions)) {
         let treason: string | null = reason ? "rule_asked" : null;
-        const bv = baseViews.get(id);
+        const tfrom = sourceOfTrigger(id);
+        const src: ProvenRecord | null = tfrom === "base" ? A : tfrom === "hop" ? H : null;
+        if (!treason && tfrom === "hop" && (hopProblem || !H)) treason = hopProblem ?? "base_answer_not_stored";
+        // The chain of versions the trigger was shown on: the source, (#461) plus the base when the source is `via`.
+        const chain: ProvenRecord[] = src === null ? [] : src === A ? [A] : [src, A];
         for (const role of need) {
           if (treason) break;
-          if (!b || !b.trigger || !isValidTrigger(b.trigger, baseQuestions) || !provenTriggers[role].has(id)) treason = "no_base_answer";
-          else if (triggerFingerprint(role, triggerViewOf(b, bv, baseQuestions)) !== triggerFingerprint(role, triggerViewOf(r, view, p.questions))) treason = "view_changed";
+          if (src === null) {
+            treason = "no_base_answer";
+            break;
+          }
+          for (const lvl of chain) {
+            if (treason) break;
+            const lr = lvl.byId.get(id);
+            if (!lr || !lr.trigger || ruleHashOf(lr) !== ruleHashOf(r) || !isValidTrigger(lr.trigger, lvl.questions) || (lvl === src && !src.triggers[role].has(id))) treason = "no_base_answer";
+            else if (triggerFingerprint(role, triggerViewOf(lr, lvl.views.get(id), lvl.questions)) !== triggerFingerprint(role, triggerViewOf(r, view, p.questions))) treason = "view_changed";
+          }
         }
         if (treason) record.rules[id] = { ...record.rules[id], trigger: "asked", triggerReason: treason };
-        else {
+        else if (src) {
           plan.reusedTriggers.add(id);
-          for (const role of need) plan.triggers[role].set(id, provenTriggers[role].get(id) as TriggerVerdict);
+          for (const role of need) plan.triggers[role].set(id, src.triggers[role].get(id) as TriggerVerdict);
           record.rules[id] = { ...record.rules[id], trigger: "reused" };
         }
       }
     }
 
+    // ---- 4. the intention-to-stay readings (exact request hash: base first, then the hop) ----
+    Object.assign(plan.proven, H?.polarity ?? {}, A.polarity);
+    // The checks of protected replacements, by exact request hash too (base wins).
+    Object.assign(plan.proven, H?.protectedProven ?? {}, A.protectedProven);
+
     // ---- 5. the base version's stored re-drafts of rules reused here ----
-    if (rec && !recordProblem) {
-      const entries = baseRules.map((r) => [r, rec.repairs?.[r.criterionId]] as const).filter((e): e is readonly [AssessmentCriterion, StoredRedraft] => e[1] !== undefined);
-      // The checks of the base replacements, rebuilt the way the base run asked them: ordinary replacements
-      // with a stored check by the verification model (one group, rulebook order); protected ones by both
-      // models (one group). A different grouping in the base run makes the hashes differ: then nothing is proven.
-      const ordinaryReplacements = entries.filter(([o, e]) => !isProtectedRule(o) && e.kind === "replacement" && e.replacement && e.ordinaryCheck).map(([, e]) => e.replacement as AssessmentCriterion);
-      const protectedReplacements = entries.filter(([o, e]) => isProtectedRule(o) && e.kind === "replacement" && e.replacement).map(([, e]) => e.replacement as AssessmentCriterion);
-      const replacementViews = new Map<string, CheckerRuleView>();
-      for (const rep of [...ordinaryReplacements, ...protectedReplacements]) {
-        const v = await baseViewOf(rep);
-        if (v) replacementViews.set(rep.criterionId, v);
+    for (const [original, entry] of A.entries) {
+      const id = original.criterionId;
+      const here = p.rules.find((r) => r.criterionId === id);
+      // Only for a rule reused here, unchanged (the stored attempt is keyed by the rule's hash).
+      if (!here || !plan.reusedRules.has(id) || entry.ruleHash !== ruleHashOf(here)) continue;
+      record.totals.repairsCarried += 1;
+      if (entry.kind !== "replacement" || !entry.replacement) {
+        plan.repairs[id] = entry;
+        continue;
       }
-      // Ordinary: the proven row (and trigger verdict) of each replacement.
-      const ordViews = ordinaryReplacements.filter((x) => replacementViews.has(x.criterionId));
-      const provenOrdinaryRow = new Map<string, string>();
-      const provenOrdinaryTrigger = new Map<string, string>();
-      for (const job of this.batchJobs("verification", ordViews, replacementViews, p.limits)) {
-        const hit = answerFor(job);
-        (job.criterionIds ?? []).forEach((id, k) => {
-          const row = hit?.rows?.[handleFor(k)];
-          if (row !== undefined && decodeRow(row)) provenOrdinaryRow.set(id, row);
-        });
+      // Where the stored check of this replacement can be proven: on the base when the base asked about the rule;
+      // (#461) on `via` when the base reused the rule AND carried `via`'s stored attempt unchanged.
+      const viaEntry = H?.entries.find(([o]) => o.criterionId === id)?.[1];
+      const src: ProvenRecord | null = sourceOfRule(id) === "base" ? A : H && viaEntry && stableJson(viaEntry) === stableJson(entry) ? H : null;
+      if (isProtectedRule(original)) {
+        plan.repairs[id] = entry;
+        if (src && (src.protectedJobsProven.get(id) ?? 0) >= 2) record.totals.repairChecksCarried += 1;
+        continue;
       }
-      for (const job of this.triggerJobs("verification", ordViews.filter((x) => x.trigger !== undefined && isValidTrigger(x.trigger, baseQuestions)), replacementViews, baseQuestions, p.limits)) {
-        const hit = answerFor(job);
-        (job.criterionIds ?? []).forEach((id, k) => {
-          const v = hit?.triggers?.[handleFor(k)];
-          if (v !== undefined) provenOrdinaryTrigger.set(id, v);
-        });
-      }
-      // Protected: every proven answer of their check joins `proven` (an identical request finds it by hash).
-      const protViews = protectedReplacements.filter((x) => replacementViews.has(x.criterionId));
-      const protTriggered = protViews.filter((x) => x.trigger !== undefined && isValidTrigger(x.trigger, baseQuestions));
-      const protectedJobsProven = new Map<string, number>();
-      for (const role of roles) {
-        for (const job of [...this.batchJobs(role, protViews, replacementViews, p.limits), ...this.triggerJobs(role, protTriggered, replacementViews, baseQuestions, p.limits)]) {
-          const hit = answerFor(job);
-          if (!hit) continue;
-          plan.proven[job.hash] = hit;
-          for (const id of job.criterionIds ?? []) protectedJobsProven.set(id, (protectedJobsProven.get(id) ?? 0) + 1);
-        }
-      }
-      for (const [original, entry] of entries) {
-        const id = original.criterionId;
-        const here = p.rules.find((r) => r.criterionId === id);
-        // Only for a rule reused here, unchanged (the stored attempt is keyed by the rule's hash).
-        if (!here || !plan.reusedRules.has(id) || entry.ruleHash !== ruleHashOf(here)) continue;
-        record.totals.repairsCarried += 1;
-        if (entry.kind !== "replacement" || !entry.replacement) {
-          plan.repairs[id] = entry;
-          continue;
-        }
-        if (isProtectedRule(original)) {
-          plan.repairs[id] = entry;
-          if ((protectedJobsProven.get(id) ?? 0) >= 2) record.totals.repairChecksCarried += 1;
-          continue;
-        }
-        // An ordinary replacement: its stored check is kept only when proven and shown the same today.
-        const rep = entry.replacement;
-        const baseView = replacementViews.get(rep.criterionId);
-        const nowView = await this.replacementViewHere(rep, p);
-        const oc = entry.ordinaryCheck;
+      // An ordinary replacement: its stored check is kept only when proven and shown the same today (and, from
+      // `via`, the same on the base too).
+      const rep = entry.replacement;
+      const nowView = await this.replacementViewHere(rep, p);
+      const oc = entry.ordinaryCheck;
+      const shownSame = (lvl: ProvenRecord): boolean => {
+        const lv = lvl.replacementViews.get(rep.criterionId);
+        if (!lv || !nowView) return false;
         const triggeredHere = rep.trigger !== undefined && isValidTrigger(rep.trigger, p.questions);
-        const triggeredBase = rep.trigger !== undefined && isValidTrigger(rep.trigger, baseQuestions);
-        const proven =
-          oc !== undefined && baseView !== undefined && nowView !== null &&
-          provenOrdinaryRow.get(rep.criterionId) === oc.row &&
-          ruleFingerprint("verification", baseView) === ruleFingerprint("verification", nowView) &&
-          triggeredHere === triggeredBase &&
-          (!triggeredHere || (provenOrdinaryTrigger.get(rep.criterionId) === oc.trigger && triggerFingerprint("verification", triggerViewOf(rep, baseView, baseQuestions)) === triggerFingerprint("verification", triggerViewOf(rep, nowView, p.questions))));
-        if (proven) {
-          plan.repairs[id] = entry;
-          record.totals.repairChecksCarried += 1;
-        } else {
-          // Keep the replacement (no new re-draft), drop its stored check: it is checked again now.
-          const { ordinaryCheck: _dropped, ...rest } = entry;
-          void _dropped;
-          plan.repairs[id] = rest;
-        }
+        const triggeredThere = rep.trigger !== undefined && isValidTrigger(rep.trigger, lvl.questions);
+        return ruleFingerprint("verification", lv) === ruleFingerprint("verification", nowView) && triggeredHere === triggeredThere &&
+          (!triggeredHere || triggerFingerprint("verification", triggerViewOf(rep, lv, lvl.questions)) === triggerFingerprint("verification", triggerViewOf(rep, nowView, p.questions)));
+      };
+      const triggeredHere = rep.trigger !== undefined && isValidTrigger(rep.trigger, p.questions);
+      const proven =
+        src !== null && oc !== undefined &&
+        src.ordinaryRow.get(rep.criterionId) === oc.row &&
+        (!triggeredHere || src.ordinaryTrigger.get(rep.criterionId) === oc.trigger) &&
+        shownSame(src) && (src === A || shownSame(A));
+      if (proven) {
+        plan.repairs[id] = entry;
+        record.totals.repairChecksCarried += 1;
+      } else {
+        // Keep the replacement (no new re-draft), drop its stored check: it is checked again now.
+        const { ordinaryCheck: _dropped, ...rest } = entry;
+        void _dropped;
+        plan.repairs[id] = rest;
       }
     }
 

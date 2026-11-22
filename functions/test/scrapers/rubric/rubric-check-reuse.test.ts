@@ -279,8 +279,14 @@ describe("(#440) reuse is for one rulebook and one pair of versions, named on th
     const other = { ...v2, routeKey: "QM_route-one" } as VisaRubric;
     const held = await svc().check({ routeKey: "QM_route-one", version: 2, runId: "QM_route-one__v2", rubric: other, codeLeftOutIds: [], reuseFrom: { version: 1, rubric: { ...v1, routeKey: "QM_route-one" } } });
     assert.deepEqual(held, { ok: false, reasonCodes: ["checker_reuse_refused:rulebook_not_allowed"] });
-    const v3 = await svc().check({ routeKey: KEY, version: 3, runId: `${KEY}__v3`, rubric: { ...v2, version: 3 }, codeLeftOutIds: [], reuseFrom: { version: 2, rubric: { ...v2, reviewStatus: "approved" } } });
-    assert.deepEqual(v3, { ok: false, reasonCodes: ["checker_reuse_refused:version_not_allowed"] });
+    // (#461) 2 -> 3 is now a listed pair; any other step (1 -> 3, 3 -> 4) is still refused.
+    const v3from1 = await svc().check({ routeKey: KEY, version: 3, runId: `${KEY}__v3`, rubric: { ...v2, version: 3 }, codeLeftOutIds: [], reuseFrom: { version: 1, rubric: v1 } });
+    assert.deepEqual(v3from1, { ok: false, reasonCodes: ["checker_reuse_refused:version_not_allowed"] });
+    const v4 = await svc().check({ routeKey: KEY, version: 4, runId: `${KEY}__v4`, rubric: { ...v2, version: 4 }, codeLeftOutIds: [], reuseFrom: { version: 3, rubric: { ...v2, version: 3, reviewStatus: "approved" } } });
+    assert.deepEqual(v4, { ok: false, reasonCodes: ["checker_reuse_refused:version_not_allowed"] });
+    // (#461) The 1 -> 2 pair names no hop: a `via` on it is refused.
+    const withVia = await svc().check({ ...v2Input(v1, v2), reuseFrom: { version: 1, rubric: v1, via: { version: 1, rubric: v1 } } });
+    assert.deepEqual(withVia, { ok: false, reasonCodes: ["checker_reuse_refused:via_not_allowed"] });
     const pending = await svc().check({ ...v2Input(v1, v2), reuseFrom: { version: 1, rubric: { ...v1, reviewStatus: "pending_review" } } });
     assert.deepEqual(pending, { ok: false, reasonCodes: ["checker_reuse_refused:base_not_approved"] });
     const missing = await svc().check({ ...v2Input(v1, v2), reuseFrom: { version: 1, rubric: null as any } });

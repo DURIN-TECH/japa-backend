@@ -32,6 +32,8 @@ import type { GateReport, LayerCheckInput, LayerCheckOutcome, LoadedPublishSetti
 // (#233 P4b) The route's stack, read live (the resolver itself, not the module index, which also loads admin routes).
 import { resolveRouteStack } from "../shared-routes/route-stack";
 import { EMAIL_BRANDING } from "./email/branding";
+// (#461) The listed reuse pairs: a pair may name the one hop back its base reused from (`viaVersion`).
+import { checkReusePairFor } from "./rubric-check-reuse-pair";
 import {
   RubricReviewError,
   parseRubricVersionId,
@@ -124,8 +126,9 @@ export interface RubricCheckInput {
   codeLeftOutIds: readonly string[];
   // (#440) Reuse the check's answers from this earlier version (stored as it is, UNFILTERED) for rules that did
   // not change. Set only when the run was started with `reuseCheckFromVersion` (the script's flag); the checker
-  // accepts it for one rulebook and one pair of versions only and holds anything else before any spend.
-  reuseFrom?: { version: number; rubric: VisaRubric };
+  // accepts it for one rulebook and its listed pairs of versions only and holds anything else before any spend.
+  // (#461) `via`: the version the base itself reused from, for a pair that names it (see the checker's input).
+  reuseFrom?: { version: number; rubric: VisaRubric; via?: { version: number; rubric: VisaRubric } };
 }
 
 /**
@@ -709,7 +712,16 @@ export class RubricAutoPublishService {
           // (#440) With `reuseCheckFromVersion`, the earlier version is handed to the check as stored; the check
           // decides whether that pair may reuse anything (and holds before any spend when it may not). A base
           // version that cannot be read is passed as missing, so the check holds rather than asking everything.
-          const reuseFrom = opts.reuseCheckFromVersion !== undefined ? { version: opts.reuseCheckFromVersion, rubric: (await rubricStore.getVersionForReview(routeKey, opts.reuseCheckFromVersion)) as VisaRubric } : undefined;
+          // (#461) When the listed pair for this step names a hop (`viaVersion`: version 2 reused its answers from
+          // version 1), that version is read too and handed over as `via`, so the check can prove the answers the
+          // base reused. Nothing else is read: an unlisted step gets no `via` and the check refuses it as before.
+          let reuseFrom: RubricCheckInput["reuseFrom"];
+          if (opts.reuseCheckFromVersion !== undefined) {
+            const base = (await rubricStore.getVersionForReview(routeKey, opts.reuseCheckFromVersion)) as VisaRubric;
+            const viaVersion = checkReusePairFor(routeKey, opts.reuseCheckFromVersion, version)?.viaVersion;
+            const via = viaVersion !== undefined ? { version: viaVersion, rubric: (await rubricStore.getVersionForReview(routeKey, viaVersion)) as VisaRubric } : undefined;
+            reuseFrom = { version: opts.reuseCheckFromVersion, rubric: base, ...(via ? { via } : {}) };
+          }
           const outcome = await this.callChecker(this.deps.checker, { routeKey, version, runId, rubric, codeLeftOutIds: report.excludedCriterionIds, ...(reuseFrom ? { reuseFrom } : {}) });
           extras.checkerRequests = outcome.requests;
           if (!outcome.ok) {
