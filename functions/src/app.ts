@@ -88,6 +88,8 @@ const app = express();
 // the address that front end saw (the rightmost `X-Forwarded-For` entry it
 // appends). Never `true`: the leftmost entries are whatever the client sent.
 // The public pay-link rate limit is keyed on this `req.ip`.
+// Confirmed on durin-seli-dev (2026-11-22): a live request arrives with
+// exactly one `X-Forwarded-For` entry (`req.ips.length=1`), so 1 hop is right.
 app.set("trust proxy", 1);
 
 // Middleware
