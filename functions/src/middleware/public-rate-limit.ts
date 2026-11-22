@@ -31,24 +31,6 @@ interface Bucket {
   resetAt: number;
 }
 
-/**
- * Review round 1 of #391 (orchestrator): a ONE-OFF log of how many proxy
- * hops `X-Forwarded-For` lists (`req.ips.length` with trust proxy 1), on the
- * dev project only, so the orchestrator can confirm on durin-seli-dev after
- * the merge that `req.ip` is the caller's address. No address is logged.
- * TEMPORARY: removed once checked.
- */
-let proxyHopsLogged = false;
-function logProxyHopsOnce(req: Request): void {
-  if (proxyHopsLogged) return;
-  const project = process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || "";
-  if (project !== "durin-seli-dev") return;
-  proxyHopsLogged = true;
-  const forwarded = String(req.headers["x-forwarded-for"] ?? "");
-  const listed = forwarded ? forwarded.split(",").length : 0;
-  console.log(`[pay-link rate limit] trust-proxy check: req.ips.length=${req.ips.length}, x-forwarded-for entries=${listed}`);
-}
-
 /** Options for one limiter. */
 export interface RateLimitOptions {
   /** Requests allowed per window per key. */
@@ -74,7 +56,6 @@ export function createPublicRateLimit(opts: RateLimitOptions): RateLimiter {
     // `req.ip` honours the app's trust-proxy setting (1 hop, app.ts: the
     // Google front end's view of the caller); never a raw header, so a
     // spoofed leftmost `X-Forwarded-For` entry cannot change the key.
-    logProxyHopsOnce(req);
     const key = req.ip || "unknown";
     const at = now();
     let bucket = buckets.get(key);
