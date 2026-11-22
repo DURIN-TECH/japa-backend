@@ -152,3 +152,43 @@ export function slotEndsAt(
 export function hoursAfter(at: Date, hours: number): Date {
   return new Date(at.getTime() + hours * HOUR_MS);
 }
+
+// ============================================
+// Has the slot already started? (issue #472)
+// ============================================
+//
+// A user booked 11 AM today at 1 PM: nothing on the server refused a slot
+// that had already begun. Every route that books a slot or moves one
+// (`POST /consultations`, the guest `POST /agencies/public/:slug/consultations`
+// and a slot-moving `PUT /consultations/:id`) asks THIS one helper, so the
+// rule reads the same everywhere.
+//
+// "Started" means `slotStartsAt(slot) <= now`: a slot that starts exactly
+// now counts as started (there is no time left to join it on time). There is
+// NO minimum lead time (that is a product decision, issue #477): a slot one
+// minute from now is still bookable.
+
+/** The error code every booking route answers for a slot that has started (issue #472). */
+export const SLOT_IN_PAST_CODE = "SLOT_IN_PAST";
+
+/** The plain-words message that goes with `SLOT_IN_PAST` (the apps show it as is). */
+export const SLOT_IN_PAST_MESSAGE = "That time has already passed. Please pick a later time.";
+
+/**
+ * True when the slot has already STARTED at `now` (issue #472). Pure.
+ *
+ * The slot is read exactly as every other rule reads it (`slotStartsAt`):
+ * `scheduledDate`'s UTC calendar day plus the wall-clock `scheduledTime` in
+ * the booking's own `timezone` (Africa/Lagos when none is stored).
+ *
+ * @param slot the booking's (or the request's) date, time and zone
+ * @param now the SERVER clock. Callers pass `chargeRuntime.now()`, never a
+ *   time the caller of the API sent, so a client cannot move "now".
+ * @throws when `scheduledDate` is not a Timestamp-like value (as `slotStartsAt`)
+ */
+export function isSlotInPast(
+  slot: Pick<Consultation, "scheduledDate" | "scheduledTime" | "timezone">,
+  now: Date
+): boolean {
+  return slotStartsAt(slot).getTime() <= now.getTime();
+}

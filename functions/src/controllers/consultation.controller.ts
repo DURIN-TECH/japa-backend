@@ -73,6 +73,14 @@ import {
   noShowReportService,
 } from "../services/no-show-report.service";
 import { chargeRuntime } from "../services/charge-checkout.service";
+// Issue #472: the one "has this slot already started?" rule, and the zone check.
+import {
+  DEFAULT_BOOKING_TIMEZONE,
+  isKnownTimeZone,
+  isSlotInPast,
+  SLOT_IN_PAST_CODE,
+  SLOT_IN_PAST_MESSAGE,
+} from "../consultations/slot-time";
 import { clientChargeFields } from "../money/client-charge";
 // Used to invite a freshly-provisioned client to set a password (claim their account).
 import { authController } from "./auth.controller";
@@ -146,6 +154,22 @@ type PendingCheckoutShape = "checkout" | "create";
 
 /** The 400 message for a `scheduledTime` that is neither accepted form (same wording as the edit route, #316). */
 const BAD_SCHEDULED_TIME = "scheduledTime must be a 24-hour HH:mm or a 12-hour h:mm AM/PM time";
+
+/** Issue #472: the 400 message for a `timezone` that is not a real IANA zone. */
+const BAD_TIMEZONE = "timezone must be an IANA time zone such as Africa/Lagos";
+
+/**
+ * Issue #472: the zone a NEW booking's wall-clock time is read in. Pure.
+ *  - missing (`undefined`, `null` or `""`, as the old `timezone || ...`
+ *    treated it): the default, Africa/Lagos;
+ *  - a real IANA zone (`isKnownTimeZone`): that zone;
+ *  - anything else (`"Mars/Base"`, a number): null, which the routes answer
+ *    with 400 VALIDATION_ERROR instead of silently reading it as Lagos.
+ */
+function resolveBookingTimezone(value: unknown): string | null {
+  if (value === undefined || value === null || value === "") return DEFAULT_BOOKING_TIMEZONE;
+  return isKnownTimeZone(value) ? value : null;
+}
 
 export class ConsultationController {
   /**
@@ -506,6 +530,31 @@ export class ConsultationController {
       const { Timestamp } = await import("firebase-admin/firestore");
       const scheduledTimestamp = Timestamp.fromDate(scheduledAt);
 
+      // Issue #472: the zone the wall-clock `scheduledTime` is in. Missing
+      // keeps the old default (Africa/Lagos); a value that is not a real
+      // IANA zone used to fall back to Lagos SILENTLY (and so be read at the
+      // wrong instant), and is now a plain 400 before anything is read.
+      const bookingZone = resolveBookingTimezone(timezone);
+      if (bookingZone === null) {
+        sendError(res, "VALIDATION_ERROR", BAD_TIMEZONE);
+        return;
+      }
+      // Issue #472: a slot that has already STARTED (by the server clock,
+      // never one the caller sends) is refused here: right after the
+      // date/time parse and BEFORE the resume branch below
+      // (`findResumableBooking`), the monthly-limit count and `lockQuote`. So
+      // nothing is written, priced, sent to Paystack or notified, and an old
+      // unpaid booking of a past slot is never resumed through this route.
+      if (
+        isSlotInPast(
+          { scheduledDate: scheduledTimestamp, scheduledTime: normalizedTime, timezone: bookingZone },
+          chargeRuntime.now()
+        )
+      ) {
+        sendError(res, SLOT_IN_PAST_CODE, SLOT_IN_PAST_MESSAGE, 400);
+        return;
+      }
+
       // Determine if auth'd user is an agent or a client
       const agentProfile = await this.getAgentForUser(authUserId);
 
@@ -731,7 +780,8 @@ export class ConsultationController {
         // #288: always the normalised 24-hour `HH:mm`.
         scheduledTime: normalizedTime,
         durationMinutes: durationMinutes || 30,
-        timezone: timezone || "Africa/Lagos",
+        // Issue #472: the checked zone (a missing one is Africa/Lagos, as before).
+        timezone: bookingZone,
         ...(meetingPlatform ? { meetingPlatform } : {}),
         ...(meetingLink ? { meetingLink } : {}),
         // Paid: the locked snapshot; free: priceUsdCents 0 and no Paystack.
@@ -915,7 +965,13 @@ export class ConsultationController {
    *  - 409 PAYMENT_IN_PROGRESS: a schedule field on a `pending_payment`
    *    booking whose checkout (`transactionId`) is still inside its quote
    *    lock (`quoteExpiresAt` in the future). Meeting fields and `summary`
-   *    are still saved then.
+   *    are still saved then;
+   *  - 400 SLOT_IN_PAST (issue #472): the edit really moves the slot and the
+   *    MERGED slot (new values over the stored ones) has already started by
+   *    the server clock. An edit that does not move the slot is never
+   *    refused for this, even on a booking whose slot has passed.
+   *    `timezone`, when sent, must be a real IANA zone (else 400
+   *    VALIDATION_ERROR).
    *
    * One body is all or nothing: a single refused field refuses the whole
    * edit. EVERY refusal writes nothing and notifies nobody. A saved edit
@@ -1982,6 +2038,34 @@ export class ConsultationController {
         sendError(res, "VALIDATION_ERROR", BAD_SCHEDULED_TIME, 400);
         return;
       }
+      // Issue #472: the day, parsed once. A value that is not a date used to
+      // throw inside `Timestamp.fromDate` (much later, after the guest's
+      // account was made) and answer 500; it is now a plain 400 up front.
+      const guestScheduledAt = new Date(scheduledDate);
+      if (Number.isNaN(guestScheduledAt.getTime())) {
+        sendError(res, "VALIDATION_ERROR", "scheduledDate must be a valid date", 400);
+        return;
+      }
+      const { Timestamp } = await import("firebase-admin/firestore");
+      const guestScheduledTimestamp = Timestamp.fromDate(guestScheduledAt);
+      // Issue #472: the zone must be a real IANA zone (missing = Africa/Lagos).
+      const bookingZone = resolveBookingTimezone(timezone);
+      if (bookingZone === null) {
+        sendError(res, "VALIDATION_ERROR", BAD_TIMEZONE, 400);
+        return;
+      }
+      // Issue #472: a slot that has already started (server clock) is
+      // refused BEFORE the agency is read, a price is locked or a guest
+      // account is provisioned (`auth.createUser`, the claim email).
+      if (
+        isSlotInPast(
+          { scheduledDate: guestScheduledTimestamp, scheduledTime: normalizedTime, timezone: bookingZone },
+          chargeRuntime.now()
+        )
+      ) {
+        sendError(res, SLOT_IN_PAST_CODE, SLOT_IN_PAST_MESSAGE, 400);
+        return;
+      }
       // Constrain the free-text type to the known set; default to "initial".
       const allowedTypes: ConsultationType[] = [
         "initial",
@@ -2064,7 +2148,7 @@ export class ConsultationController {
       }
 
       // --- Create the consultation -------------------------------------------
-      const { Timestamp } = await import("firebase-admin/firestore");
+      // (Timestamp and the checked day/zone were set up with the inputs above.)
       const consultation = await consultationService.createConsultation({
         userId: clientUid,
         agentId: agency.ownerId, // owner acts as the booking agent for guest flow
@@ -2077,11 +2161,13 @@ export class ConsultationController {
         clientEmail: normalizedEmail,
         agentName: agency.ownerName,
         type: consultType,
-        scheduledDate: Timestamp.fromDate(new Date(scheduledDate)),
+        // Issue #472: the day parsed (and checked) once, above.
+        scheduledDate: guestScheduledTimestamp,
         // #288: always the normalised 24-hour `HH:mm`.
         scheduledTime: normalizedTime,
         durationMinutes: 30,
-        timezone: timezone || "Africa/Lagos",
+        // Issue #472: the checked zone (a missing one is Africa/Lagos, as before).
+        timezone: bookingZone,
         // Paid: the locked snapshot; free: priceUsdCents 0 and no Paystack.
         ...(charge
           ? { ...charge, status: "pending_payment" as const, paymentStatus: "pending" as const }
