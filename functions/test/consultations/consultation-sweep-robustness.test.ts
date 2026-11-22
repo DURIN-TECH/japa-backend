@@ -66,6 +66,7 @@ import {
 } from "../../src/services/consultation.service";
 import { PAYSTACK_LOOKUP_TIMEOUT_MS } from "../../src/services/billing/paystack.provider";
 import { notificationService } from "../../src/services/notification.service";
+import { consultationCharging } from "../../src/services/consultation-charge.service";
 import { backfillSweepLane, needsSweepLane } from "../../src/scripts/backfill-sweep-lane";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -1312,4 +1313,118 @@ describe("review round 1: the live checkout, outages, the time budget, the cance
     harness.clock.advanceHours(1);
     notified.length = 0;
   }
+});
+
+// ============================================
+// Review round 2: a settle that throws never loses the notices deferred
+// before it
+// ============================================
+
+describe("review round 2: deferred refund notices survive a later settle failing", () => {
+  const notified: Array<{ userId: string; type: string; body: string }> = [];
+  beforeEach(() => {
+    notified.length = 0;
+    (notificationService as any).notifyUser = async (n: { userId: string; type: string; body: string }) => {
+      notified.push({ userId: n.userId, type: n.type, body: n.body });
+    };
+  });
+
+  /** Make every transaction that reads the exception of `reference` throw (a Firestore ABORTED, say). */
+  function failSettleOf(reference: string): () => void {
+    const real = consultationCharging.runTransaction;
+    consultationCharging.runTransaction = ((fn: any) =>
+      real((tx: any) =>
+        fn(
+          new Proxy(tx, {
+            get(target, key) {
+              if (key === "get") {
+                return async (ref: any) => {
+                  if (ref?.id === reference) throw new Error("10 ABORTED: too much contention");
+                  return target.get(ref);
+                };
+              }
+              const value = target[key];
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          })
+        )
+      )) as any;
+    return () => {
+      consultationCharging.runTransaction = real;
+    };
+  }
+
+  /** A booking with two paid RETIRED checkouts (the client paid both old slots); the live one final unpaid. */
+  async function twoPaidRetired(): Promise<void> {
+    await seedPending("b1", 30, { transactionId: "live-1", supersededCheckouts: [entry("old-1"), entry("old-2")] });
+    paystackPaid("old-1", "b1", { amountMinor: FEE_KOBO, currency: "NGN" }, harness.clock.now(), { fees: 20_000 });
+    paystackPaid("old-2", "b1", { amountMinor: FEE_KOBO, currency: "NGN" }, harness.clock.now(), { fees: 20_000 });
+    paystackAbandoned("live-1", "b1");
+  }
+
+  const clientNotices = () => notified.filter((n) => n.userId === "uid-client1" && n.type === "consultation_refunded");
+  const agentDebitNotices = () =>
+    notified.filter((n) => n.userId === "uid-agent1" && /Processing fee taken from your balance|payment processing fee/.test(n.body));
+
+  test("the sweep: the second settle throws; the first refund's notice and the agent's fee-debit notice are still sent, once", async () => {
+    await twoPaidRetired();
+    const restore = failSettleOf("old-2");
+    let result;
+    try {
+      result = await consultationService.sweepAbandonedBookings();
+    } finally {
+      restore();
+    }
+    assert.equal(result.errors, 1, "the failed booking is counted");
+    assert.equal(booking("b1").status, "pending_payment", "never cancelled on a failure");
+    assert.equal(refundsOf("b1").length, 1, "the first refund was written");
+    assert.equal(clientNotices().length, 1, "the client is told about it once");
+    assert.match(clientNotices()[0].body, /^Your consultation moved/, "the usual wording: no cancel followed");
+    assert.equal(agentDebitNotices().length, 1, "the agent's fee-debit notice too");
+
+    // The next run settles the second one; the first is not announced again.
+    harness.clock.advanceHours(1);
+    await consultationService.sweepAbandonedBookings();
+    assert.equal(refundsOf("b1").length, 2);
+    assert.equal(clientNotices().length, 2, "one notice per refund, never two for the first");
+    assert.equal(agentDebitNotices().length, 2);
+  });
+
+  test("the admin cancel: the same failure still sends the collected notices once", async () => {
+    await twoPaidRetired();
+    const restore = failSettleOf("old-2");
+    try {
+      // The controller answers 500; nothing is cancelled.
+      await call("cancelSweepReview", ROLES.ADMIN, "b1");
+    } finally {
+      restore();
+    }
+    assert.equal(booking("b1").status, "pending_payment");
+    assert.equal(refundsOf("b1").length, 1);
+    assert.equal(clientNotices().length, 1);
+    assert.equal(agentDebitNotices().length, 1);
+  });
+
+  test("the time budget also stops lookups inside a booking (the rest waits for the next run)", async () => {
+    await seedPending("b1", 30, { transactionId: "live-1", supersededCheckouts: [entry("old-1"), entry("old-2")] });
+    for (const r of ["old-1", "old-2", "live-1"]) paystackAbandoned(r, "b1");
+    let ms = 0;
+    const real = sweepRuntime.wallClockMs;
+    sweepRuntime.wallClockMs = () => ms;
+    const seen: string[] = [];
+    harness.onLookup = async (reference: string) => {
+      seen.push(reference);
+      ms += SWEEP_TIME_BUDGET_MS; // the first lookup spends the whole budget
+      return undefined;
+    };
+    try {
+      const result = await consultationService.sweepAbandonedBookings();
+      assert.deepEqual(seen, ["old-1"]);
+      assert.equal(result.leftForCap, 1);
+      assert.equal(result.cancelled, 0);
+      assert.equal(booking("b1").status, "pending_payment");
+    } finally {
+      sweepRuntime.wallClockMs = real;
+    }
+  });
 });

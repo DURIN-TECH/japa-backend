@@ -1385,7 +1385,11 @@ interface SweepLookups {
 async function lookUpSweepCheckouts(
   booking: Consultation,
   options: {
-    budget: { remaining: number } | null;
+    /**
+     * `deadline` (review round 2): the run's wall-clock end (`sweepRuntime`
+     * ms). Past it no further lookup starts: the rest waits, as for the cap.
+     */
+    budget: { remaining: number; deadline?: number } | null;
     fresh: boolean;
     at: Timestamp;
     logId: string;
@@ -1409,6 +1413,7 @@ async function lookUpSweepCheckouts(
   /** Ask Paystack about one reference; false when the run's budget is spent. */
   const ask = async (reference: string): Promise<boolean> => {
     if (options.budget && options.budget.remaining <= 0) return false;
+    if (options.budget?.deadline !== undefined && sweepRuntime.wallClockMs() >= options.budget.deadline) return false;
     if (options.budget) options.budget.remaining--;
     out.calls++;
     try {
@@ -1969,6 +1974,11 @@ class ConsultationService {
       leftForCap: 0, setAside: 0, released: 0, lookups: 0,
     };
 
+    // Review round 1 (orchestrator note 3) / round 2: the run's wall-clock
+    // budget starts with the run (before the release pass and the query).
+    // Bookings not reached in time wait for the next run (`leftForCap`).
+    const deadline = sweepRuntime.wallClockMs() + SWEEP_TIME_BUDGET_MS;
+
     // ---- 0. Release set-aside bookings that changed (issue #411) ----
     // Before the main query, so a released booking is swept in this run.
     try {
@@ -1989,15 +1999,12 @@ class ConsultationService {
       .get();
     result.scanned = snapshot.size;
 
-    // Issue #411: the Paystack budget of THIS run, shared by every booking.
-    const budget = { remaining: SWEEP_MAX_LOOKUPS_PER_RUN };
-    // Review round 1 (orchestrator note 3): the run's wall-clock budget.
-    // Bookings not reached in time wait for the next run (`leftForCap`), so
-    // the function never hits its own timeout mid-booking.
-    const startedAt = sweepRuntime.wallClockMs();
+    // Issue #411: the Paystack budget of THIS run, shared by every booking,
+    // and (review round 2) its deadline, also checked before each lookup.
+    const budget = { remaining: SWEEP_MAX_LOOKUPS_PER_RUN, deadline };
 
     for (const [index, doc] of snapshot.docs.entries()) {
-      if (sweepRuntime.wallClockMs() - startedAt >= SWEEP_TIME_BUDGET_MS) {
+      if (sweepRuntime.wallClockMs() >= deadline) {
         const left = snapshot.size - index;
         result.leftForCap += left;
         console.warn(`[consultation sweep] time budget spent; ${left} booking(s) left for the next run`);
@@ -2035,7 +2042,7 @@ class ConsultationService {
     id: string,
     booking: Consultation,
     observedFingerprint: string,
-    budget: { remaining: number },
+    budget: { remaining: number; deadline?: number },
     result: AbandonedSweepResult
   ): Promise<void> {
     // ---- 1. Not abandoned: skipped BEFORE any Paystack call ----
@@ -2212,22 +2219,32 @@ class ConsultationService {
     const outcomes: Array<SettleOutcome | null> = [];
     const records: SweepCheckoutRecord[] = [];
     const notices: DeferredRefundNotice[] = [];
-    for (const reference of references) {
-      const reported = look.lookups.get(reference)?.result;
-      // A paid state always comes with Paystack's answer; never settle without it.
-      if (!reported) continue;
-      const outcome = await settlePayment(id, reference, reported, { deferRefundNotice: options.deferNotices === true });
-      if (outcome && "deferredNotice" in outcome && outcome.deferredNotice) notices.push(outcome.deferredNotice);
-      outcomes.push(outcome);
-      records.push(recordForSettle(reference, outcome, stamp));
-      if (!isConfirmingSweepSettle(outcome) && !isHandledSweepSettle(outcome)) {
-        // Paid, but neither applied nor recorded (wrong amount, ...):
-        // left for a human, never cancelled.
-        console.error(
-          `[consultation sweep] ${id} is paid at Paystack (${reference}) but could not be settled ` +
-            `(${outcome?.kind ?? "booking gone"}); left as it is for review`
-        );
+    try {
+      for (const reference of references) {
+        const reported = look.lookups.get(reference)?.result;
+        // A paid state always comes with Paystack's answer; never settle without it.
+        if (!reported) continue;
+        const outcome = await settlePayment(id, reference, reported, { deferRefundNotice: options.deferNotices === true });
+        if (outcome && "deferredNotice" in outcome && outcome.deferredNotice) notices.push(outcome.deferredNotice);
+        outcomes.push(outcome);
+        records.push(recordForSettle(reference, outcome, stamp));
+        if (!isConfirmingSweepSettle(outcome) && !isHandledSweepSettle(outcome)) {
+          // Paid, but neither applied nor recorded (wrong amount, ...):
+          // left for a human, never cancelled.
+          console.error(
+            `[consultation sweep] ${id} is paid at Paystack (${reference}) but could not be settled ` +
+              `(${outcome?.kind ?? "booking gone"}); left as it is for review`
+          );
+        }
       }
+    } catch (error) {
+      // Review round 2: a later settle failed. Notices deferred by the
+      // earlier ones would be lost for good (a re-settle finds the refund
+      // row and creates, so defers, nothing): send them now, with the usual
+      // wording (no cancel will follow this run), then let the caller count
+      // the failure. Covers the sweep and the admin cancel.
+      await sendNotices(notices, false);
+      throw error;
     }
     return { outcomes, records, notices };
   }
