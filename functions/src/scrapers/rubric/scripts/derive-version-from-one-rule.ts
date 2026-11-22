@@ -40,7 +40,17 @@
  * PLANNED REQUESTS (printed, 0 model calls): what `publish:rubric --reuse-check-from 1` would send for
  * version 2: the rule check (rules reused from version 1 vs asked now, and the requests that makes), the
  * trigger check, the intention-to-stay readings, the repair step's upper bound, and on its own line the
- * question wording check (`rubric-question-check.ts`), which has no reuse (#441).
+ * question wording check (`rubric-question-check.ts`), which has no reuse (deferred, #463): every item is asked.
+ *
+ * (#461) SAME-RULES MODE (`--same-rules`): build version 3 as a copy of the approved version 2 of the same
+ * rulebook (`CHECK_REUSE_PAIR_V3`), with NO `--out` file and no re-draft. Every rule, question, document item
+ * and the `competence` block are version 2's, byte for byte; version 3 is a pristine pending draft (none of
+ * version 2's review or approval fields). Its purpose: a publish run whose wording check is shown the rules'
+ * list lines (#461), with the rule check reusing version 2's answers (`--reuse-check-from 2`, which follows
+ * version 2's own reuse one hop back to version 1). The same refusals, head check (version 2 both approved and
+ * latest), `auto_publish_on` check and store write (`writeDerivedPendingVersion` with base 2) apply. The plan
+ * needs version 1 too (`--via`, the version the check's proof goes back to); offline also its check record
+ * (`--via-checker`).
  *
  * OUTPUT: ids, counts and code words only. Never a quote, a title, a question's wording or model text
  * (an unexpected failure prints its class).
@@ -54,6 +64,7 @@
  *
  * Run (from functions/):
  *   npm run derive:one-rule-version -- --project <id> --version <v1.json> --out <result.json> --page <snapshot.json> [--offline --head <head.json> --checker <checker-v1.json>] [--write]
+ *   (#461) npm run derive:one-rule-version -- --same-rules --project <id> --version <v2.json> --via <v1.json> --page <snapshot.json> [--offline --head <head.json> --checker <checker-v2.json> --via-checker <checker-v1.json>] [--write]
  * `--offline` reads nothing from any project (the head and the check record come from files, the publish
  * settings are the code defaults) and cannot be combined with `--write`.
  */
@@ -70,7 +81,7 @@ import { lexiconFor } from "../../language/language-lexicon";
 import { SnapshotQuoteIndex } from "../rubric-quote";
 import { readLeadInList, verifyListItems } from "../rubric-list-items";
 import { competenceProblems } from "../rubric-competence";
-import { CHECK_REUSE_PAIR } from "../../../services/rubric-check-reuse-pair";
+import { CHECK_REUSE_PAIR, CHECK_REUSE_PAIR_V3, type CheckReusePair } from "../../../services/rubric-check-reuse-pair";
 import { ruleHashOf } from "../rubric-repair";
 import { fromFirestoreRest, placeQuestions } from "./redraft-competence-rule";
 
@@ -358,11 +369,15 @@ export interface PlanSources {
   provider?: LlmProvider;
 }
 
-/** The planned requests of the version 2 publish. */
+/** The planned requests of the new version's publish. */
 export interface PublishPlan {
+  // (#461) The version the check reuses from (1 for version 2, 2 for version 3).
+  fromVersion: number;
   check: import("../rubric-checker").CheckRequestPlan;
-  // The question wording check: no reuse (#441). `ifSameLeftOut`: with version 1's left-out rules; `atMost`: none left out.
-  questionCheck: { ifSameLeftOut: number; atMost: number };
+  // The question wording check: no reuse (deferred, #463), every item asked. `ifSameLeftOut`: with the base's
+  // left-out rules; `atMost`: none left out. (#461) `shortenedQuotes`: quotes cut at the field limit (with the
+  // base's left-out rules), list lines included.
+  questionCheck: { ifSameLeftOut: number; atMost: number; shortenedQuotes: number };
 }
 
 /**
@@ -370,7 +385,7 @@ export interface PublishPlan {
  * check is planned by the checker itself (`planRequests`: the same preparation as a run). The question
  * wording check is counted from its own batching (`buildCheckItems` + `batchItems`) on the served view.
  */
-export async function planPublish(v1: VisaRubric, v2: VisaRubric, sources: PlanSources): Promise<PublishPlan> {
+export async function planPublish(v1: VisaRubric, v2: VisaRubric, sources: PlanSources, via?: VisaRubric): Promise<PublishPlan> {
   const { RubricCheckerService } = await import("../rubric-checker");
   const checker = new RubricCheckerService({
     provider: () => sources.provider ?? new PlanOnlyProvider(),
@@ -388,15 +403,18 @@ export async function planPublish(v1: VisaRubric, v2: VisaRubric, sources: PlanS
   const runId = `${v2.routeKey}__v${v2.version}`;
   // The code gates' own leave-outs are not worked out offline: only the polarity plan and the repair bound
   // read them, and both treat "none" as the larger case.
-  const check = await checker.planRequests({ routeKey: v2.routeKey, version: v2.version, runId, rubric: v2, codeLeftOutIds: [], reuseFrom: { version: v1.version, rubric: v1 } });
+  // (#461) `via`: for version 3, the version the base (version 2) reused its answers from (one hop back).
+  const check = await checker.planRequests({ routeKey: v2.routeKey, version: v2.version, runId, rubric: v2, codeLeftOutIds: [], reuseFrom: { version: v1.version, rubric: v1, ...(via ? { via: { version: via.version, rubric: via } } : {}) } });
   const { buildCheckItems, batchItems, DEFAULT_QUESTION_CHECK_LIMITS } = await import("../rubric-question-check");
   const { applyExclusions } = await import("../rubric-exclusions");
-  const calls = (excluded: readonly string[]): number => {
+  /** The wording check's requests (every item asked: no reuse) and its shortened quotes, for a set of left-out rules. */
+  const calls = (excluded: readonly string[]): { requests: number; shortened: number } => {
     const view = applyExclusions({ ...v2, excludedCriterionIds: [...excluded], questionPlan: undefined });
-    const { questions, evidence } = buildCheckItems(view);
-    return batchItems(questions, DEFAULT_QUESTION_CHECK_LIMITS).length + batchItems(evidence, DEFAULT_QUESTION_CHECK_LIMITS).length;
+    const { questions, evidence, shortenedQuotes } = buildCheckItems(view);
+    return { requests: batchItems(questions, DEFAULT_QUESTION_CHECK_LIMITS).length + batchItems(evidence, DEFAULT_QUESTION_CHECK_LIMITS).length, shortened: shortenedQuotes };
   };
-  return { check, questionCheck: { ifSameLeftOut: calls(v1.excludedCriterionIds ?? []), atMost: calls([]) } };
+  const same = calls(v1.excludedCriterionIds ?? []);
+  return { fromVersion: v1.version, check, questionCheck: { ifSameLeftOut: same.requests, atMost: calls([]).requests, shortenedQuotes: same.shortened } };
 }
 
 /** The plan as report lines (counts and code words only). */
@@ -404,7 +422,9 @@ export function planLines(plan: PublishPlan): string[] {
   const lines: string[] = [];
   const c = plan.check;
   const t = c.reuse?.totals;
-  if (t) lines.push(`rule check: ${t.rulesReused} rule(s) reused from version 1, ${t.rulesAsked} asked again; triggers ${t.triggersReused} reused, ${t.triggersAsked} asked again; intention-to-stay readings reused ${t.polarityReused}; stored re-drafts carried ${t.repairsCarried} (with their check ${t.repairChecksCarried}).`);
+  // (#461) The version reused from, and the one hop back when the check followed it.
+  const via = c.reuse?.via ? ` (answers version ${plan.fromVersion} reused proven on version ${c.reuse.via.version})` : "";
+  if (t) lines.push(`rule check: ${t.rulesReused} rule(s) reused from version ${plan.fromVersion}${via}, ${t.rulesAsked} asked again; triggers ${t.triggersReused} reused, ${t.triggersAsked} asked again; intention-to-stay readings reused ${t.polarityReused}; stored re-drafts carried ${t.repairsCarried} (with their check ${t.repairChecksCarried}).`);
   // (Fix round 1) Why the asked rules are asked, by reason code (e.g. `base_answer_mismatch` when version 1's
   // audit letters were overwritten), so an unexpected count is seen before any spend.
   if (c.reuse) {
@@ -417,8 +437,8 @@ export function planLines(plan: PublishPlan): string[] {
     lines.push(`rule check requests: ${c.check}; trigger check requests: ${c.trigger}; intention-to-stay requests: ${c.polarity}; repair requests at most ${c.repairAtMost}.`);
     lines.push(`rule check planned: ${c.check + c.trigger + c.polarity} request(s), at most ${c.check + c.trigger + c.polarity + c.repairAtMost} with repairs (each may take its one retry for a transient provider failure).`);
   }
-  // On its own line: the question wording check has no reuse (owner decision on #441).
-  lines.push(`question wording check (no reuse, #441): ${plan.questionCheck.ifSameLeftOut} request(s) if the same rules are left out as in version 1; at most ${plan.questionCheck.atMost}.`);
+  // On its own line: the question wording check has no reuse (deferred, #463): every item is asked.
+  lines.push(`question wording check (no reuse, #463; every item asked): ${plan.questionCheck.ifSameLeftOut} request(s) if the same rules are left out as in version ${plan.fromVersion}; at most ${plan.questionCheck.atMost}; quotes shortened ${plan.questionCheck.shortenedQuotes}.`);
   return lines;
 }
 
@@ -504,13 +524,30 @@ export async function runDerive(inputs: { v1: VisaRubric; out: any; snapshot: Gu
     for (const l of planLines(summary.plan)) deps.print(`  ${l}`);
   }
 
-  if (alreadyThere) {
+  return finishRun(summary, { pair: CHECK_REUSE_PAIR, alreadyThere, draft: built.draft, base: inputs.v1 }, opts, deps, stop);
+}
+
+/**
+ * The part of a run shared by both modes once the new version is built and its plan printed (#440; #461 made it
+ * take the pair, so the same-rules mode uses exactly the same guards): a version already there is reported and
+ * nothing is written; the target's publish settings are read and `auto_publish_on` refuses a write (a line in a
+ * dry run); then, with `write`, the narrow pending write over the pair's base version, with its fingerprint.
+ */
+async function finishRun(
+  summary: DeriveRunSummary,
+  args: { pair: Readonly<CheckReusePair>; alreadyThere: boolean; draft: Omit<VisaRubric, "version" | "createdAt">; base: VisaRubric },
+  opts: { write: boolean },
+  deps: DeriveRunDeps,
+  stop: (code: DeriveRefusal) => DeriveRunSummary
+): Promise<DeriveRunSummary> {
+  const { pair } = args;
+  if (args.alreadyThere) {
     summary.alreadyExists = true;
-    deps.print(`a version ${v2Number} already exists on the target (not compared with this build); nothing was written.`);
+    deps.print(`a version ${pair.toVersion} already exists on the target (not compared with this build); nothing was written.`);
     return summary;
   }
 
-  // ---- (#440 fix round 1) automatic publishing must be off for this route before version 2 exists ----
+  // ---- (#440 fix round 1) automatic publishing must be off for this route before the new version exists ----
   // Read on every run that can reach the project; offline it is not read, and a write is impossible there.
   const { routeAllowed } = await import("../rubric-publish-settings");
   let loaded: import("../rubric-publish-settings").LoadedPublishSettings | null | undefined;
@@ -521,25 +558,25 @@ export async function runDerive(inputs: { v1: VisaRubric; out: any; snapshot: Gu
       loaded = null;
     }
   }
-  const autoOn = autoPublishOn(loaded, inputs.v1.routeKey, routeAllowed);
+  const autoOn = autoPublishOn(loaded, args.base.routeKey, routeAllowed);
   if (autoOn) {
     const why = loaded === undefined ? "publish settings not read (offline)" : loaded === null || loaded.readError !== undefined ? "publish settings unreadable" : "publish mode auto and this route allowed";
     // The dry run says so as a refusal line and goes on; the write stops here.
     if (opts.write) return stop("auto_publish_on");
-    deps.print(`a write would be refused (auto_publish_on: ${why}). Keep the publish mode manual until the publish:rubric --reuse-check-from ${CHECK_REUSE_PAIR.fromVersion} run has finished.`);
+    deps.print(`a write would be refused (auto_publish_on: ${why}). Keep the publish mode manual until the publish:rubric --reuse-check-from ${pair.fromVersion} run has finished.`);
   } else deps.print("  publish settings: automatic publishing does not apply to this route (a write may go ahead).");
   if (!opts.write) {
-    deps.print(`\n(dry run: nothing was written. Add --write to store version ${v2Number} as a pending draft.)`);
+    deps.print(`\n(dry run: nothing was written. Add --write to store version ${pair.toVersion} as a pending draft.)`);
     return summary;
   }
   if (!deps.writeDerived) return stop("no_store");
 
-  // ---- the write: pending only, through the store's narrow path ----
+  // ---- the write: pending only, through the store's narrow path, over the pair's base version ----
   const { derivedBaseFingerprint } = await import("../rubric.store");
-  const result = await deps.writeDerived({ ...built.draft, createdAt: deps.now() } as Omit<VisaRubric, "version">, { baseVersion: CHECK_REUSE_PAIR.fromVersion, baseFingerprint: derivedBaseFingerprint(inputs.v1) });
+  const result = await deps.writeDerived({ ...args.draft, createdAt: deps.now() } as Omit<VisaRubric, "version">, { baseVersion: pair.fromVersion, baseFingerprint: derivedBaseFingerprint(args.base) });
   if (result.written) {
     summary.written = true;
-    deps.print(`stored version ${result.version} as a pending draft; the head's approved version stays ${CHECK_REUSE_PAIR.fromVersion}.`);
+    deps.print(`stored version ${result.version} as a pending draft; the head's approved version stays ${pair.fromVersion}.`);
     return summary;
   }
   if (result.reason === "already_exists") {
@@ -548,6 +585,79 @@ export async function runDerive(inputs: { v1: VisaRubric; out: any; snapshot: Gu
     return summary;
   }
   return stop(result.reason);
+}
+
+// ============================================
+// (#461) Same-rules mode: version 3 as a copy of the approved version 2
+// ============================================
+
+/** What `deriveSameRules` builds (pure; no I/O). */
+export type SameRulesOutcome = { ok: false; refusal: DeriveRefusal } | { ok: true; draft: Omit<VisaRubric, "version" | "createdAt"> };
+
+/**
+ * Build version 3 from the approved version 2 of the one rulebook in `CHECK_REUSE_PAIR_V3`. Pure: no project,
+ * no model, no `--out` file. Every content field is version 2's own (rules, questions, document items, the
+ * `competence` block, the polarity proposal, the sources), copied as it is; only the version number, the creation
+ * time and the review and approval fields (`RUBRIC_REVIEW_FIELDS`) are not carried: the review fields take their
+ * pending initial values and every other one is absent, so the publish pipeline decides all of them again.
+ * Refusals (code words): `rulebook_not_allowed`, `not_a_shared_rulebook`, `version_not_allowed`,
+ * `base_not_approved`, `version_file_split` (a split version's header holds no rules: the whole version is needed).
+ */
+export function deriveSameRules(v2: VisaRubric): SameRulesOutcome {
+  const refuse = (refusal: DeriveRefusal): SameRulesOutcome => ({ ok: false, refusal });
+  if (!v2 || v2.routeKey !== CHECK_REUSE_PAIR_V3.routeKey) return refuse("rulebook_not_allowed");
+  const parts = splitRulebookKey(v2.routeKey);
+  if (!parts.ok || parts.authorityIdKind !== "group") return refuse("not_a_shared_rulebook");
+  if (v2.version !== CHECK_REUSE_PAIR_V3.fromVersion) return refuse("version_not_allowed");
+  if (v2.reviewStatus !== "approved") return refuse("base_not_approved");
+  if (!Array.isArray(v2.criteria) || (v2 as any).contentStorage !== undefined) return refuse("version_file_split");
+  // Everything of version 2 but its number, its creation time and its review and approval fields.
+  const base: Record<string, unknown> = { ...(v2 as unknown as Record<string, unknown>) };
+  delete base.version;
+  delete base.createdAt;
+  for (const f of RUBRIC_REVIEW_FIELDS) delete base[f];
+  // Served-side only: never stored.
+  delete base.stackLayers;
+  return { ok: true, draft: { ...base, ...INITIAL_REVIEW_VALUES } as unknown as Omit<VisaRubric, "version" | "createdAt"> };
+}
+
+/**
+ * (#461) Build version 3, print what it is and the planned requests of `publish:rubric --reuse-check-from 2`
+ * (with `via`, version 1, for the check's one hop back), and with `write` store it. The head on the target must
+ * have version 2 as both its approved and its latest version (or version 3 as the latest: reported, nothing
+ * written). Prints ids, counts and code words only.
+ */
+export async function runSameRules(inputs: { v2: VisaRubric; via?: VisaRubric }, opts: { write: boolean }, deps: DeriveRunDeps): Promise<DeriveRunSummary> {
+  const pair = CHECK_REUSE_PAIR_V3;
+  const summary: DeriveRunSummary = { refusal: null, changes: [], notProven: [], unchanged: 0, written: false, alreadyExists: false, plan: null };
+  const stop = (code: DeriveRefusal): DeriveRunSummary => {
+    summary.refusal = code;
+    deps.print(`refused (${code}); nothing was written.`);
+    return summary;
+  };
+  const built = deriveSameRules(inputs.v2);
+  if (!built.ok) return stop(built.refusal);
+  summary.unchanged = built.draft.criteria.length;
+
+  // ---- the head on the target: version 2 must be both the approved and the latest version ----
+  const head = await deps.readHead(inputs.v2.routeKey);
+  if (!head) return stop("no_head");
+  const alreadyThere = head.approvedVersion === pair.fromVersion && head.latestVersion === pair.toVersion;
+  if (!alreadyThere && (head.approvedVersion !== pair.fromVersion || head.latestVersion !== pair.fromVersion)) return stop("head_moved");
+  if (!head.latestSourceSetHash || head.latestSourceSetHash !== built.draft.sourceSetHash) return stop("source_set_differs");
+
+  // ---- what version 3 is (counts only) ----
+  const v3 = { ...(built.draft as VisaRubric), version: pair.toVersion };
+  deps.print(`${inputs.v2.routeKey}: version ${pair.toVersion} built as a copy of version ${pair.fromVersion} (same rules; 0 model calls).`);
+  deps.print(`  rules ${v3.criteria.length} (differing from version ${pair.fromVersion}: ${rulesThatDiffer(inputs.v2, v3).length}); questions ${v3.intakeQuestions?.length ?? 0}; document items ${v3.evidenceItems?.length ?? 0}; competence steps: ${v3.competence?.steps.length ?? 0}.`);
+
+  // ---- the planned requests of its publish ----
+  if (deps.plan) {
+    if (!inputs.via) deps.print(`  plan: version ${pair.viaVersion} not given (--via), so the check would hold (checker_reuse_refused:via_mismatch).`);
+    summary.plan = await planPublish(inputs.v2, v3, deps.plan, inputs.via);
+    for (const l of planLines(summary.plan)) deps.print(`  ${l}`);
+  }
+  return finishRun(summary, { pair, alreadyThere, draft: built.draft, base: inputs.v2 }, opts, deps, stop);
 }
 
 // ============================================
@@ -576,10 +686,17 @@ async function main(): Promise<void> {
     console.error(`derive-version-from-one-rule: refused (${problem}); nothing was written. Name the target with --project <id> (never ${PRODUCTION_PROJECT}).`);
     process.exit(2);
   }
+  // (#461) `--same-rules`: version 3 as a copy of version 2 (no `--out`; `--via` is version 1, for the plan).
+  const sameRules = process.argv.includes("--same-rules");
   const versionPath = arg("version");
   const outPath = arg("out");
   const pagePath = arg("page");
-  if (!versionPath || !outPath || !pagePath || (offline && (!arg("head") || !arg("checker")))) {
+  const viaPath = arg("via");
+  if (sameRules && (!versionPath || !pagePath || !viaPath || (offline && (!arg("head") || !arg("checker") || !arg("via-checker"))))) {
+    console.error("usage: --same-rules --project <id> --version <v2.json> --via <v1.json> --page <page.json> [--offline --head <head.json> --checker <check-record-v2.json> --via-checker <check-record-v1.json>] [--write]");
+    process.exit(2);
+  }
+  if (!sameRules && (!versionPath || !outPath || !pagePath || (offline && (!arg("head") || !arg("checker"))))) {
     console.error("usage: --project <id> --version <v1.json> --out <result.json> --page <page.json> [--offline --head <head.json> --checker <check-record.json>] [--write]");
     process.exit(2);
   }
@@ -587,9 +704,11 @@ async function main(): Promise<void> {
   // placeholder id lets the service modules load; nothing reaches any project.
   process.env.GCLOUD_PROJECT = offline ? "derive-offline" : (project as string);
   process.env.GOOGLE_CLOUD_PROJECT = process.env.GCLOUD_PROJECT;
-  const v1 = readJson(versionPath) as VisaRubric;
-  const out = readJson(outPath);
-  const snapshot = readJson(pagePath) as GuidanceSnapshotContent;
+  const v1 = readJson(versionPath as string) as VisaRubric;
+  const out = sameRules ? null : readJson(outPath as string);
+  const snapshot = readJson(pagePath as string) as GuidanceSnapshotContent;
+  // (#461) Same-rules mode: `--version` is version 2 (the base), `--via` version 1.
+  const via = sameRules ? (readJson(viaPath as string) as VisaRubric) : undefined;
   /** The snapshot from the file when it is the one asked for (the plan reads it); else the project's store. */
   const readSnapshot = async (sourceId: string, contentHash: string): Promise<GuidanceSnapshotContent> => {
     if (sourceId === snapshot.sourceId && contentHash === snapshot.contentHash) return snapshot;
@@ -602,11 +721,13 @@ async function main(): Promise<void> {
   if (offline) {
     const head = readJson(arg("head") as string) as RubricHead;
     const record = readJson(arg("checker") as string);
+    // (#461) Same-rules mode: the hop's record too (version 1's), served only under its own run id.
+    const viaRecord = sameRules ? readJson(arg("via-checker") as string) : null;
     deps = {
       readHead: async (key) => (head.routeKey === key ? head : null),
       plan: {
         loadSettings: async () => ({ settings: { ...DEFAULT_PUBLISH_SETTINGS }, exists: false, problems: [] }),
-        loadCheckerRecord: async (runId) => (record?.runId === runId ? record : null),
+        loadCheckerRecord: async (runId) => (record?.runId === runId ? record : viaRecord?.runId === runId ? viaRecord : null),
         readSnapshot,
       },
       now: () => null,
@@ -617,7 +738,7 @@ async function main(): Promise<void> {
     const { firestoreCheckerLedger } = await import("../rubric-checker");
     const { Timestamp } = await import("firebase-admin/firestore");
     const emulator = process.env.FIRESTORE_EMULATOR_HOST || "";
-    console.log(`project ${project}${emulator ? ` (emulator ${emulator})` : ""}: ${write ? "WRITE: version 2 is stored as a pending draft if every check passes" : "DRY RUN: reads only, nothing is written"}.`);
+    console.log(`project ${project}${emulator ? ` (emulator ${emulator})` : ""}: ${write ? `WRITE: version ${sameRules ? CHECK_REUSE_PAIR_V3.toVersion : CHECK_REUSE_PAIR.toVersion} is stored as a pending draft if every check passes` : "DRY RUN: reads only, nothing is written"}.`);
     deps = {
       readHead: (key) => rubricStore.getHead(key),
       writeDerived: (draft, o) => rubricStore.writeDerivedPendingVersion(draft, o),
@@ -627,7 +748,7 @@ async function main(): Promise<void> {
       print: (l) => console.log(l),
     };
   }
-  const summary = await runDerive({ v1, out, snapshot }, { write }, deps);
+  const summary = sameRules ? await runSameRules({ v2: v1, via }, { write }, deps) : await runDerive({ v1, out, snapshot }, { write }, deps);
   if (summary.refusal) process.exit(1);
 }
 
