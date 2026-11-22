@@ -44,6 +44,9 @@ export class TransactionController {
    * Paystack fee stands so. ADMIN ONLY: the admin list of fees still waiting
    * for Paystack is
    * `GET /transactions?role=admin&type=consultation_fee&paystackFeeStatus=unknown`.
+   * Issue #393: paid payment requests whose fee is still unknown are
+   * `type=escrow_release&paystackFeeStatus=unknown` (same index
+   * transactions(type, paystackFeeStatus, createdAt desc)).
    * Any other caller passing it (client, agent, owner; whatever `role` says)
    * gets 403 before anything is read; an unknown value is 400. Agent-side
    * rows carry `paystackFeeMinor`, `agentCreditMinor` and `paystackFeeStatus`
@@ -342,7 +345,8 @@ export class TransactionController {
    * Paystack's fee when it is now known (well-formed, in the charge
    * currency). Admins never type a fee in. Answers:
    *  - not an admin: 403 before anything is read (no token: 401, verifyAuth);
-   *  - no such Transaction, or not a consultation fee: 404;
+   *  - no such Transaction, or not a consultation fee / payment-request
+   *    `escrow_release` (the fee-tracked types, #393): 404;
    *  - written before #395 (no fee status, credited A): 409 FEE_NOT_TRACKED;
    *  - the fee was already stored: 200 `{ refreshed: false, transaction }`,
    *    nothing written (a known fee is never overwritten);

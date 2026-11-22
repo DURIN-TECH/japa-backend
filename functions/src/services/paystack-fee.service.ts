@@ -24,13 +24,17 @@
 //  - Still unknown after the lookup: nothing is written at all.
 //  - A fee of the whole charge or more is stored with status
 //    "fee_not_less_than_amount" and still credits nothing (admin list).
+//
+// ISSUE #393: a paid payment request (`escrow_release`) tracks Paystack's
+// fee the same way (`isPaystackFeeTracked`), so the job and the admin
+// refresh resolve its unknown fee too, under the same once-only rules.
 
 import { Timestamp } from "firebase-admin/firestore";
 import type { Transaction } from "../types";
 import { collections } from "../utils/firebase";
 import { chargeRuntime } from "./charge-checkout.service";
 import { PaystackTransactionLookup, paystackProvider } from "./billing/paystack.provider";
-import { awaitsPaystackFee, classifyPaystackFee, paystackFeeFields } from "../money/paystack-fee";
+import { awaitsPaystackFee, classifyPaystackFee, isPaystackFeeTracked, paystackFeeFields } from "../money/paystack-fee";
 import type { PaystackFeeResolvedBy } from "../types";
 
 /** The most unknown-fee rows one run of the job looks up. */
@@ -58,7 +62,7 @@ export const paystackFeeJobConfig = {
 
 /** What storing a looked-up fee did (one row). */
 export type FeeResolveOutcome =
-  /** No such Transaction, or not a consultation fee. */
+  /** No such Transaction, or not a fee-tracked type (consultation fee / payment-request `escrow_release`). */
   | { kind: "not_found" }
   /** Written before #395 (no fee status): it keeps counting as A; never looked up. */
   | { kind: "not_tracked"; transaction: Transaction }
@@ -108,7 +112,8 @@ class PaystackFeeService {
    * Look one fee row up at Paystack and store its fee if it is still
    * unknown (see the header). Never throws for a Paystack failure.
    *
-   * @param transactionId the consultation fee Transaction's id
+   * @param transactionId the fee-tracked Transaction's id (a consultation
+   *   fee, or since #393 a payment-request `escrow_release`)
    * @param by "job" or "admin_refresh" (stored on the row)
    */
   async resolveOne(transactionId: string, by: Extract<PaystackFeeResolvedBy, "job" | "admin_refresh">): Promise<FeeResolveOutcome> {
@@ -117,7 +122,8 @@ class PaystackFeeService {
     const snap = await ref.get();
     if (!snap.exists) return { kind: "not_found" };
     const row = snap.data() as Transaction;
-    if (row.type !== "consultation_fee") return { kind: "not_found" };
+    // Issue #393: payment-request rows are fee-tracked too; any other type is not.
+    if (!isPaystackFeeTracked(row.type)) return { kind: "not_found" };
     if (row.paystackFeeStatus === undefined) return { kind: "not_tracked", transaction: row };
     if (!awaitsPaystackFee(row)) return { kind: "already_resolved", transaction: row };
     const reference = row.providerTransactionId;
@@ -160,8 +166,9 @@ class PaystackFeeService {
   }
 
   /**
-   * The scheduled job (issue #395): consultation fees whose Paystack fee is
-   * still unknown are looked up again.
+   * The scheduled job (issue #395): every consultation fee (and, since
+   * #393, every paid payment request's `escrow_release`) whose Paystack
+   * fee is still unknown is looked up again.
    *
    * Issue #413 (D): OLDEST `createdAt` first, at most
    * `paystackFeeJobConfig.batchSize` per run (index
@@ -171,8 +178,9 @@ class PaystackFeeService {
    * (`paystackFeeStatus: "set_aside"`), so the job no longer picks it and a
    * batch of permanently unknown rows can never starve a newer one. A
    * set-aside row counts exactly as an unknown one, is listed for admins
-   * (`GET /transactions?role=admin&type=consultation_fee&paystackFeeStatus=set_aside`)
-   * and the admin refresh still resolves it.
+   * (`GET /transactions?role=admin&type=consultation_fee|escrow_release&paystackFeeStatus=set_aside`)
+   * and the admin refresh still resolves it. Both fee-tracked types share
+   * the one query (it filters on the fee status, not the type).
    * One row's failure never stops the run.
    */
   async resolveUnknownFees(): Promise<FeeLookupRunResult> {
@@ -184,8 +192,9 @@ class PaystackFeeService {
       .get();
     result.scanned = snap.size;
     for (const doc of snap.docs) {
-      // Belt and braces: only consultation fees are ever looked up.
-      if ((doc.data() as Transaction).type !== "consultation_fee") continue;
+      // Belt and braces: only fee-tracked rows (consultation fees and, since
+      // #393, payment-request `escrow_release` rows) are ever looked up.
+      if (!isPaystackFeeTracked((doc.data() as Transaction).type)) continue;
       try {
         const outcome = await this.resolveOne(doc.id, "job");
         if (outcome.kind === "resolved" || outcome.kind === "already_resolved") result.resolved++;
