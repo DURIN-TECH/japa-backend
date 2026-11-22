@@ -1,6 +1,11 @@
 import { Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { transactionService, TransactionFilters } from "../services/transaction.service";
+import {
+  transactionService,
+  TransactionFilters,
+  // Issue #413 (E): admin filter combinations Firestore has an index for.
+  unsupportedAdminFilterCombination,
+} from "../services/transaction.service";
 import { toClientTransaction } from "../transactions/client-transaction";
 import { collections } from "../utils/firebase";
 import { Agent, PaystackFeeStatus, Transaction } from "../types";
@@ -18,10 +23,13 @@ const TRANSACTION_TYPES: Transaction["type"][] = [
   "consultation_fee", "service_fee", "government_fee", "refund", "escrow_release", "withdrawal",
   // Issue #354: Paystack's fee on a refunded payment, taken from the agent.
   "paystack_fee_debit",
+  // Issue #413: an agent's adjustment when a refund mismatch is resolved.
+  "refund_adjustment",
 ];
 
 /** Issue #395: every Paystack-fee status, for the admin `paystackFeeStatus` list filter. */
-const PAYSTACK_FEE_STATUSES: PaystackFeeStatus[] = ["known", "unknown", "fee_not_less_than_amount"];
+// Issue #413 (D): "set_aside" lists the rows the lookup job gave up on.
+const PAYSTACK_FEE_STATUSES: PaystackFeeStatus[] = ["known", "unknown", "fee_not_less_than_amount", "set_aside"];
 
 export class TransactionController {
   /**
@@ -140,6 +148,18 @@ export class TransactionController {
         return;
       }
 
+      // Review round 1 of #413 (E: "never a 500"): on the agent, owner and
+      // admin lists a date filter that does not parse is a 400 naming it,
+      // before anything is read (their Firestore query would otherwise throw
+      // on an Invalid Date). The client view keeps ignoring it (in memory).
+      for (const name of ["startDate", "endDate"] as const) {
+        const raw = req.query[name];
+        if (raw === undefined) continue;
+        if (typeof raw !== "string" || raw.trim() === "" || Number.isNaN(new Date(raw).getTime())) {
+          sendError(res, "VALIDATION_ERROR", `${name} must be a date (ISO 8601, e.g. 2026-11-21)`);
+          return;
+        }
+      }
       let transactions;
 
       switch (role) {
@@ -147,6 +167,15 @@ export class TransactionController {
         if (req.authz?.role !== ROLES.ADMIN) {
           sendError(res, "FORBIDDEN", ErrorMessages.FORBIDDEN, 403);
           return;
+        }
+        // Issue #413 (E): a filter combination with no Firestore index is a
+        // 400 naming it, never a 500 from the query.
+        {
+          const unsupported = unsupportedAdminFilterCombination(filters);
+          if (unsupported) {
+            sendError(res, "VALIDATION_ERROR", unsupported);
+            return;
+          }
         }
         transactions = await transactionService.getAllTransactions(filters);
         break;

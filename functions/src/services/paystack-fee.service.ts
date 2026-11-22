@@ -36,6 +36,26 @@ import type { PaystackFeeResolvedBy } from "../types";
 /** The most unknown-fee rows one run of the job looks up. */
 export const PAYSTACK_FEE_LOOKUP_BATCH_SIZE = 100;
 
+/**
+ * Issue #413 (D): how many scheduled-job lookups that Paystack ANSWERED
+ * without a usable fee a row gets before it is set aside
+ * (`paystackFeeStatus: "set_aside"`). The job runs every 15 minutes, so 12
+ * lookups is about three hours of Paystack saying "no fee". A lookup that
+ * failed because Paystack could not be reached does not count (an outage
+ * must not set every row aside).
+ */
+export const PAYSTACK_FEE_MAX_JOB_LOOKUPS = 12;
+
+/**
+ * The job's tunables, read at run time (issue #413 D). A property bag so a
+ * test can use a small batch without seeding hundreds of rows; production
+ * never changes them.
+ */
+export const paystackFeeJobConfig = {
+  batchSize: PAYSTACK_FEE_LOOKUP_BATCH_SIZE,
+  maxJobLookups: PAYSTACK_FEE_MAX_JOB_LOOKUPS,
+};
+
 /** What storing a looked-up fee did (one row). */
 export type FeeResolveOutcome =
   /** No such Transaction, or not a consultation fee. */
@@ -56,6 +76,8 @@ export interface FeeLookupRunResult {
   scanned: number;
   resolved: number;
   stillUnknown: number;
+  /** Issue #413 (D): rows set aside by this run (out of lookups). */
+  setAside: number;
   errors: number;
 }
 
@@ -138,17 +160,27 @@ class PaystackFeeService {
   }
 
   /**
-   * The scheduled job (issue #395): every consultation fee whose Paystack
-   * fee is still unknown is looked up again, at most
-   * PAYSTACK_FEE_LOOKUP_BATCH_SIZE per run. Single-field equality query on
-   * `paystackFeeStatus` (Firestore's automatic index), no ordering needed.
+   * The scheduled job (issue #395): consultation fees whose Paystack fee is
+   * still unknown are looked up again.
+   *
+   * Issue #413 (D): OLDEST `createdAt` first, at most
+   * `paystackFeeJobConfig.batchSize` per run (index
+   * transactions(paystackFeeStatus, createdAt asc) in firestore.indexes.json).
+   * Each lookup Paystack answers without a usable fee counts on the row
+   * (`paystackFeeLookupAttempts`); at `maxJobLookups` the row is SET ASIDE
+   * (`paystackFeeStatus: "set_aside"`), so the job no longer picks it and a
+   * batch of permanently unknown rows can never starve a newer one. A
+   * set-aside row counts exactly as an unknown one, is listed for admins
+   * (`GET /transactions?role=admin&type=consultation_fee&paystackFeeStatus=set_aside`)
+   * and the admin refresh still resolves it.
    * One row's failure never stops the run.
    */
   async resolveUnknownFees(): Promise<FeeLookupRunResult> {
-    const result: FeeLookupRunResult = { scanned: 0, resolved: 0, stillUnknown: 0, errors: 0 };
+    const result: FeeLookupRunResult = { scanned: 0, resolved: 0, stillUnknown: 0, setAside: 0, errors: 0 };
     const snap = await collections.transactions
       .where("paystackFeeStatus", "==", "unknown")
-      .limit(PAYSTACK_FEE_LOOKUP_BATCH_SIZE)
+      .orderBy("createdAt", "asc")
+      .limit(paystackFeeJobConfig.batchSize)
       .get();
     result.scanned = snap.size;
     for (const doc of snap.docs) {
@@ -157,13 +189,50 @@ class PaystackFeeService {
       try {
         const outcome = await this.resolveOne(doc.id, "job");
         if (outcome.kind === "resolved" || outcome.kind === "already_resolved") result.resolved++;
-        else result.stillUnknown++;
+        else {
+          result.stillUnknown++;
+          // Only a lookup Paystack ANSWERED counts toward setting it aside.
+          if (outcome.kind === "still_unknown" && (await this.countJobLookup(doc.id))) result.setAside++;
+        }
       } catch (error) {
         console.error(`[paystack-fee job] ${doc.id} failed:`, error);
         result.errors++;
       }
     }
     return result;
+  }
+
+  /**
+   * Count one answered job lookup that left a row unknown (issue #413 D),
+   * and set the row aside once it has had `maxJobLookups` of them. One
+   * transaction that re-reads the row: only a row STILL "unknown" is
+   * touched (a refresh or a refund may have resolved it meanwhile).
+   *
+   * @returns true when this call set the row aside
+   */
+  private async countJobLookup(transactionId: string): Promise<boolean> {
+    const ref = collections.transactions.doc(transactionId);
+    return chargeRuntime.runTransaction<boolean>(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return false;
+      const row = snap.data() as Transaction;
+      if (row.paystackFeeStatus !== "unknown") return false;
+      const attempts = (Number(row.paystackFeeLookupAttempts) || 0) + 1;
+      const now = Timestamp.fromDate(chargeRuntime.now());
+      const setAside = attempts >= paystackFeeJobConfig.maxJobLookups;
+      tx.update(ref, {
+        paystackFeeLookupAttempts: attempts,
+        ...(setAside ? { paystackFeeStatus: "set_aside", paystackFeeSetAsideAt: now } : {}),
+        updatedAt: now,
+      });
+      if (setAside) {
+        console.error(
+          `[paystack-fee job] ${transactionId}: still no usable fee after ${attempts} lookups; set aside for an admin ` +
+            "(credited nowhere, the admin refresh can still resolve it)"
+        );
+      }
+      return setAside;
+    });
   }
 }
 

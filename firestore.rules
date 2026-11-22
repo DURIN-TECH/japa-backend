@@ -757,6 +757,17 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // ---- No-show reports (issue #382), explicit deny ----
+    // noShowReports/{consultationId}: a client's "the meeting didn't happen"
+    // report on a paid consultation, the frozen fee it names, and the admin's
+    // decision. Written only by the API (POST /consultations/:id/no-show-report
+    // and its admin resolve), inside the transactions that freeze and unfreeze
+    // the agent's fee. A client that could write one could freeze an agent's
+    // money or mark it resolved. Denied for every client, admins included.
+    match /noShowReports/{consultationId} {
+      allow read, write: if false;
+    }
+
     // ---- Withdrawal locks (issue #287), explicit deny ----
     // withdrawalLocks/{agentUserId}: one document per agent, read and written
     // by the backend inside the withdrawal transaction so that two

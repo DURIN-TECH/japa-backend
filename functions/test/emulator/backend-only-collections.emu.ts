@@ -44,6 +44,10 @@ const COLLECTIONS = [
   // Consultation payments held for refund (issue #180 review fix): amounts,
   // references and other people's booking ids. Never read or forged by a client.
   "consultationPaymentExceptions",
+  // No-show reports (issue #382): a client's "the meeting didn't happen"
+  // report, the agent's frozen fee and the admin's decision. Only the API
+  // writes them; a client that could write one could freeze an agent's money.
+  "noShowReports",
   // Payment requests (issue #181): the agent's dollar price, the charge
   // snapshot, the checkout references and the paid status. Only the API
   // writes them (settlement in one Firestore transaction); a client that

@@ -52,6 +52,8 @@ function millisOf(value: unknown): number | null {
  *
  *  - (issue #390) frozen by a refund HELD for an admin
  *    (`feeHoldFrozenByRefundId`): HELD, unless it was already refunded;
+ *  - (issue #382) frozen by an open no-show report (`feeHoldFrozenByReportId`):
+ *    HELD, unless it was already refunded;
  *  - no `feeHold` (a fee written before #317 and not yet backfilled): HELD.
  *    The safe reading: it can be refunded from the hold, never withdrawn
  *    then cancelled. `npm run backfill:fee-holds` stamps every such fee
@@ -65,7 +67,7 @@ function millisOf(value: unknown): number | null {
  * @param at the server clock
  */
 export function feeHoldStatusAt(
-  fee: Pick<Transaction, "feeHold"> & Partial<Pick<Transaction, "feeHoldFrozenByRefundId">>,
+  fee: Pick<Transaction, "feeHold"> & Partial<Pick<Transaction, "feeHoldFrozenByRefundId" | "feeHoldFrozenByReportId">>,
   at: Date
 ): FeeHoldStatus {
   const hold = fee.feeHold;
@@ -73,6 +75,10 @@ export function feeHoldStatusAt(
   // Issue #390: a fee whose refund is HELD for an admin is frozen: held,
   // whatever the clock or a closed meeting say, until the refund is worked out.
   if (fee.feeHoldFrozenByRefundId) return "held";
+  // Issue #382: so is a fee whose client reported the meeting did not
+  // happen: frozen until an admin decides (the freeze wins over any release
+  // rule, the clock's and a closed meeting's alike).
+  if (fee.feeHoldFrozenByReportId) return "held";
   if (!hold) return "held";
   if (hold.state === "released") return "released";
   const now = at.getTime();
@@ -81,6 +87,71 @@ export function feeHoldStatusAt(
   const slotStart = millisOf(hold.slotStartAt);
   if (millisOf(hold.meetingClosedAt) !== null && slotStart !== null && now >= slotStart) return "released";
   return "held";
+}
+
+// ============================================
+// Issue #383: clock skew at release
+// ============================================
+//
+// Two server instances' clocks can disagree by a little. A cancel on an
+// instance whose clock is a minute BEHIND could see a fee still "held" that a
+// withdrawal on an instance a minute AHEAD already saw "released" and paid
+// out. Funding that refund "from the hold" would then give back money that
+// is no longer there (Seli would carry it). So a refund is funded from the
+// hold only when the fee is clearly held: the transaction's own clock is
+// more than a margin before `releaseAt`, AND the agent's last withdrawal
+// (stamped on `withdrawalLocks/{agentUid}`, read in the same transaction) is
+// not at or after `releaseAt - margin`. Otherwise it is planned exactly as a
+// released fee: from the agent's available balance (#351, the agent carries
+// it; never Seli).
+
+/** Issue #383: how close to `releaseAt` a held fee stops funding a refund from the hold, in ms. */
+export const RELEASE_SKEW_MARGIN_MS = 2 * 60 * 1000;
+
+/**
+ * Whether a refund of `fee` at time `at` may be paid OUT OF THE HOLD (issue
+ * #383). Pure. One clock: `at` is the time read once by the transaction.
+ *
+ *  - not held at `at` (released, refunded): false;
+ *  - frozen (by a held refund, #390, or an open no-show report, #382) since
+ *    before `releaseAt - margin`: true, unless the agent's last withdrawal
+ *    is at or after `releaseAt - margin` (review round 1: a withdrawal on a
+ *    clock running ahead, made before the freeze, may have taken it);
+ *  - no readable `releaseAt` (a pre-#317 fee not backfilled): true (held,
+ *    the safe reading, as `feeHoldStatusAt`);
+ *  - otherwise true only when `at < releaseAt - margin` AND the agent's last
+ *    withdrawal is not at or after `releaseAt - margin`.
+ *
+ * @param fee the stored fee Transaction
+ * @param at the transaction's clock
+ * @param lastWithdrawalAt when the agent last withdrew (from their withdrawal lock), or null
+ */
+export function refundFundableFromHold(
+  fee: Pick<Transaction, "feeHold"> &
+    Partial<Pick<Transaction, "feeHoldFrozenByRefundId" | "feeHoldFrozenAt" | "feeHoldFrozenByReportId" | "feeHoldFrozenByReportAt">>,
+  at: Date,
+  lastWithdrawalAt: Date | null
+): boolean {
+  if (feeHoldStatusAt(fee, at) !== "held") return false;
+  const releaseAt = millisOf(fee.feeHold?.releaseAt);
+  if (releaseAt === null) return true;
+  const cutoff = releaseAt - RELEASE_SKEW_MARGIN_MS;
+  const frozenAt = [
+    fee.feeHoldFrozenByRefundId ? millisOf(fee.feeHoldFrozenAt) : null,
+    // Issue #382: an open no-show report freezes the fee too.
+    fee.feeHoldFrozenByReportId ? millisOf(fee.feeHoldFrozenByReportAt) : null,
+  ].filter((v): v is number => v !== null);
+  // The agent's last withdrawal, at or after the cutoff: it may have seen
+  // the fee released (on a clock running ahead) and paid it out, even when
+  // the fee was frozen before the cutoff on this one (review round 1, from
+  // #382 QA: a freeze only stops withdrawals AFTER it; it cannot tell a
+  // withdrawal stamped late by a fast clock from one made later). Planned
+  // from available then: the agent carries it, never Seli.
+  const withdrewNearRelease = !!lastWithdrawalAt && lastWithdrawalAt.getTime() >= cutoff;
+  // Frozen before the cutoff: held ever since, whatever this clock says.
+  if (frozenAt.some((ms) => ms < cutoff)) return !withdrewNearRelease;
+  if (at.getTime() >= cutoff) return false;
+  return !withdrewNearRelease;
 }
 
 /**

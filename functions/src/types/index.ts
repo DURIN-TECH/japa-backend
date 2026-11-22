@@ -1424,9 +1424,81 @@ export interface Consultation extends Partial<ChargeSnapshot>, Partial<QuoteLock
   refundId?: string;
   /** Mirror of the refund Transaction's status. */
   refundStatus?: RefundStatus;
+  /**
+   * Issue #413 (portal design #357): mirror of the refund row's
+   * `refundHeldReason` while the refund is HELD for an admin, so a held
+   * refund does not read as a plain "failed" one. Removed when the refund is
+   * worked out (or closed: `refundStatus: "closed"` then says so).
+   */
+  refundHeldReason?: RefundHeldReason;
+  /**
+   * Issue #382: mirror of the booking's "the meeting didn't happen" report
+   * (`noShowReports/{bookingId}`), written in the same commit as the report
+   * and its resolution. What the client view shows (`noShowReport`); the
+   * admin-facing details stay on the report doc.
+   */
+  noShowReport?: ConsultationNoShowReportMirror;
   
   createdAt: Timestamp;
   updatedAt: Timestamp;
+}
+
+/** Issue #382: where a no-show report stands. */
+export type NoShowReportStatus =
+  /** Reported, waiting for an admin; the agent's fee is frozen. */
+  | "open"
+  /** An admin decided the agent did not show: full refund, the agent pays Paystack's fee. */
+  | "refunded"
+  /** An admin decided the meeting happened: no refund, the fee follows its normal release. */
+  | "released";
+
+/** Issue #382: what an admin decided about a no-show report (no default). */
+export type NoShowReportDecision = "agent_no_show" | "meeting_happened";
+
+/** Issue #382: the booking's copy of its no-show report (see `Consultation.noShowReport`). */
+export interface ConsultationNoShowReportMirror {
+  status: NoShowReportStatus;
+  createdAt: Timestamp;
+  resolvedAt?: Timestamp;
+}
+
+/**
+ * Issue #382: a client's report that a PAID consultation did not happen,
+ * made while the agent's fee is still held. ONE per booking, at the
+ * deterministic id `noShowReports/{consultationId}` (`tx.create`). Backend
+ * only (firestore.rules denies every client). Nothing happens
+ * automatically: an admin decides (`NoShowReportDecision`).
+ */
+export interface NoShowReport {
+  /** = the booking id. */
+  id: string;
+  consultationId: string;
+  /** The booking's client (who reported). */
+  clientId: string;
+  /** The booking's agent (whose fee is frozen). */
+  agentId: string;
+  agencyId?: string;
+  /** Denormalised for the admin list. */
+  clientName?: string;
+  agentName?: string;
+  /** The booking's settled consultation_fee Transaction (frozen by this report). */
+  feeTransactionId: string;
+  /** What the client paid: minor units of `currency` (the fee row's own figures). */
+  amountMinor: number;
+  currency: string;
+  /** When the slot started (as it stood when reported). */
+  slotStartAt: Timestamp;
+  /** The client's note, if any (at most NO_SHOW_NOTE_MAX_LENGTH characters). */
+  note?: string;
+  status: NoShowReportStatus;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  /** Set when an admin decides. */
+  decision?: NoShowReportDecision;
+  resolvedAt?: Timestamp;
+  resolvedBy?: string;
+  /** The refund row written for `agent_no_show`. */
+  refundId?: string;
 }
 
 /**
@@ -1606,7 +1678,15 @@ export type TransactionType =
   // outflow: lowers revenue and the available balance of its currency from
   // the moment it is written, never `heldBalance`; may take it below zero.
   // Never shown to the client.
-  | "paystack_fee_debit";
+  | "paystack_fee_debit"
+  // Issue #413 (mismatch resolution, decision 2026-11-21): an adjustment of
+  // the AGENT's balance when an admin resolves a refund Paystack paid in a
+  // different amount than planned. `amount` > 0 with `adjustmentDirection`
+  // ("credit": the agent gets it, "debit": it is taken). Settled when
+  // written (`completed`); counts in revenue and the available balance of its
+  // currency, never `heldBalance`. One per reference
+  // (`mismatchAdjustmentDocId`, `tx.create`). Never shown to the client.
+  | "refund_adjustment";
 
 export type TransactionStatus = 
   | "pending"
@@ -1615,7 +1695,11 @@ export type TransactionStatus =
   | "failed"
   | "refunded"
   | "held_in_escrow"
-  | "released";
+  | "released"
+  // Issue #413 (B): a HELD consultation refund an admin closed with nothing
+  // to refund (client-caused, Paystack's fee >= the charge). Final: never
+  // settled, counted in no balance and no revenue, never sent to Paystack.
+  | "closed";
 
 // ============================================
 // CONSULTATION REFUNDS AND FEE HOLDS (issue #317)
@@ -1644,7 +1728,44 @@ export type RefundReason =
  * admin retry moves a `failed` row back to `pending`, and it re-uses the
  * SAME row.
  */
-export type RefundStatus = Extract<TransactionStatus, "pending" | "processing" | "completed" | "failed">;
+export type RefundStatus = Extract<TransactionStatus, "pending" | "processing" | "completed" | "failed" | "closed">;
+
+/**
+ * Issue #413 (A): why a LIVE refund row (not a held one) was flagged
+ * `failed` for an admin by the engine itself, rather than by Paystack:
+ *  - "provider_refund_mismatch": Paystack already holds a refund for the
+ *    charge that is not failed, but whose amount or currency is not the
+ *    row's (or is missing), e.g. a manual refund made in the Paystack
+ *    dashboard. It is NOT adopted (it may not be ours to adopt) and NO new
+ *    refund is created (a second refund on the same charge could pay the
+ *    client twice). The agent's fee stays where the refund left it (frozen
+ *    for the admin's decision).
+ */
+export type RefundFailureReason = "provider_refund_mismatch";
+
+/**
+ * Issue #413 (A): the Paystack refund found for a charge that did NOT match
+ * the row (see RefundFailureReason). Stored exactly as Paystack reported it;
+ * a field Paystack did not report is null (never guessed).
+ */
+export interface ProviderRefundMismatch {
+  /** Paystack's refund id. */
+  id: string;
+  /** Paystack's amount, in minor units of `currency`, or null when not reported. */
+  amountMinor: number | null;
+  /** Paystack's upper-case currency code, or null when not reported. */
+  currency: string | null;
+  /** Paystack's own status of that refund ("pending", "processed", ...). */
+  status: string;
+  /** When the engine saw it. */
+  seenAt: Timestamp;
+}
+
+/**
+ * Issue #413 (B): the outcome an admin closed a held consultation refund
+ * with (the row is then `closed`). Only one today.
+ */
+export type RefundClosedOutcome = "nothing_to_refund";
 
 /**
  * Where the money of a refund comes from (issue #317, #351 reversal):
@@ -1662,7 +1783,43 @@ export type RefundStatus = Extract<TransactionStatus, "pending" | "processing" |
  *    the row carries no `agentId` at all. The money given back is exactly
  *    the money that came in on that reference.
  */
-export type RefundFundedFrom = "hold" | "available" | "unapplied_payment";
+export type RefundFundedFrom =
+  | "hold"
+  | "available"
+  | "unapplied_payment"
+  // Issue #413 (mismatch resolution): the TOP-UP refund sent when Paystack
+  // refunded less than planned and the admin put the gap on the agent. The
+  // agent already gave back the planned amount on the original row, so the
+  // top-up is neutral for the agent's balances and revenue: it is money Seli
+  // was holding for the client, sent on to them.
+  | "mismatch_top_up";
+
+/**
+ * Issue #413 (mismatch resolution): what an admin decided for a refund row
+ * flagged `provider_refund_mismatch`, stored on that row (it is then final).
+ * X is what Paystack really refunded (read from Paystack, `processed`), P
+ * what the row planned for the client. Minor units of the row's currency.
+ */
+export interface RefundMismatchResolution {
+  /** Who carries the difference (no default). */
+  carriedBy: PaystackFeeBorneBy;
+  /** Paystack's refund that was adopted (its id, as read from Paystack). */
+  providerRefundId: string;
+  /** X. */
+  refundedMinor: number;
+  /** P. */
+  plannedMinor: number;
+  /** The top-up refund row (`mismatchTopUpDocId`), when one was sent (X < P, agent). */
+  topUpRefundId?: string;
+  /** G = P - X, when a top-up was sent. */
+  topUpMinor?: number;
+  /** The agent's adjustment row (`mismatchAdjustmentDocId`), when one was written. */
+  adjustmentId?: string;
+  /** Signed effect of that adjustment on the agent (+ credit, - debit), 0 when none. */
+  agentAdjustmentMinor: number;
+  resolvedBy: string;
+  resolvedAt: Timestamp;
+}
 
 /**
  * Issue #390 (decision 2026-11-16, "whoever caused the refund carries
@@ -1732,7 +1889,17 @@ export interface FeeHold {
  *    so the credit would be zero or negative. The fee is stored, nothing is
  *    credited automatically, and the row is listed for an admin.
  */
-export type PaystackFeeStatus = "known" | "unknown" | "fee_not_less_than_amount";
+export type PaystackFeeStatus =
+  | "known"
+  | "unknown"
+  | "fee_not_less_than_amount"
+  // Issue #413 (D): an "unknown" row the scheduled lookup job gave up on
+  // after PAYSTACK_FEE_MAX_JOB_LOOKUPS answered lookups. It counts EXACTLY
+  // as "unknown" everywhere (credited nowhere, nothing guessed), the job no
+  // longer picks it (so it cannot starve newer rows), it is listed for
+  // admins (`GET /transactions?role=admin&type=consultation_fee&paystackFeeStatus=set_aside`)
+  // and the admin refresh (and a refund's own lookup) still resolve it.
+  | "set_aside";
 
 /** Issue #395: what stored Paystack's fee on a consultation fee Transaction. */
 export type PaystackFeeResolvedBy = "settle" | "job" | "admin_refresh" | "refund";
@@ -1804,6 +1971,15 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   feeHoldFrozenByRefundId?: string;
   /** Issue #390: when the fee was frozen (see `feeHoldFrozenByRefundId`). */
   feeHoldFrozenAt?: Timestamp;
+  /**
+   * Issue #382: set while the booking's client has an OPEN "the meeting
+   * didn't happen" report (`noShowReports/{id}`, this is its id). The fee is
+   * FROZEN: held whatever the clock or a closed meeting say, so it is never
+   * available or withdrawable until an admin decides. Removed when they do.
+   */
+  feeHoldFrozenByReportId?: string;
+  /** Issue #382: when the report froze the fee. */
+  feeHoldFrozenByReportAt?: Timestamp;
 
   // ---- Issue #395: Paystack's fee on a consultation fee (type "consultation_fee") ----
   // Decision (user, 2026-11-17): on a paid consultation the AGENT pays
@@ -1830,6 +2006,15 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   paystackFeeResolvedAt?: Timestamp;
   /** What stored Paystack's fee (see PaystackFeeResolvedBy). */
   paystackFeeResolvedBy?: PaystackFeeResolvedBy;
+  /**
+   * Issue #413 (D): how many scheduled-job lookups answered without a usable
+   * fee for this row. At PAYSTACK_FEE_MAX_JOB_LOOKUPS the row is set aside
+   * (`paystackFeeStatus: "set_aside"`). A lookup Paystack could not answer
+   * (outage) does not count.
+   */
+  paystackFeeLookupAttempts?: number;
+  /** Issue #413 (D): when the job set the row aside. */
+  paystackFeeSetAsideAt?: Timestamp;
 
   // ---- Issue #317: a consultation refund (type "refund") ----
   // Refund rows are written by the backend only (firestore.rules deny every
@@ -1905,8 +2090,18 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   feeDebitId?: string;
   /** Issue #390: on a `paystack_fee_debit` of a consultation refund, that refund row's id. */
   refundId?: string;
-  /** Paystack's id of the refund, once Paystack has one. */
+  /**
+   * Paystack's id of the refund, once Paystack has one. Issue #383: the
+   * row's CURRENT attempt: every refund the engine creates or adopts for the
+   * row replaces it, so only that attempt's webhooks move the row.
+   */
   providerRefundId?: string;
+  /**
+   * Issue #383: Paystack refund ids of the row's EARLIER attempts (replaced
+   * by a newer one, or retired by an admin retry of a failed row). Their
+   * webhooks are still recognised as ours, but change nothing.
+   */
+  previousProviderRefundIds?: string[];
   /** Paystack's own refund status as last seen ("pending", "processed", ...). */
   providerRefundStatus?: string;
   /** How many times the engine has tried (claimed) the Paystack call. */
@@ -1923,10 +2118,50 @@ export interface Transaction extends Partial<ChargeSnapshot> {
   refundLeaseUntil?: Timestamp;
   /** The last error from Paystack, for admins. */
   refundLastError?: string;
+  /**
+   * Issue #381: when the row last ENTERED `processing` (Paystack accepted
+   * it). The processing poll picks rows that have sat there longer than
+   * REFUND_PROCESSING_POLL_AFTER_MINUTES. Rows that entered processing before
+   * #381 have none and are picked by `updatedAt` instead.
+   */
+  processingSince?: Timestamp;
   /** When Paystack reported the refund processed. */
   refundedAt?: Timestamp;
   /** When the row became `failed`. */
   refundFailedAt?: Timestamp;
+  /**
+   * Issue #413 (A): why the ENGINE flagged a live row `failed` for an admin
+   * (see RefundFailureReason). Removed by an admin retry (set again when the
+   * same check fails again).
+   */
+  refundFailureReason?: RefundFailureReason;
+  /**
+   * Issue #413 (A): the Paystack refund that did not match this row (kept
+   * after a retry, as history and so the client is told it is delayed only
+   * once per such refund).
+   */
+  providerRefundMismatch?: ProviderRefundMismatch;
+  /** Issue #413 (B): when an admin closed this held refund (status `closed`). */
+  refundClosedAt?: Timestamp;
+  /** Issue #413 (B): the admin who closed it. */
+  refundClosedBy?: string;
+  /** Issue #413 (B): what it was closed as. */
+  refundClosedOutcome?: RefundClosedOutcome;
+  // ---- Issue #413: resolving a mismatch-flagged refund ----
+  /** On the flagged row once an admin resolved it (see RefundMismatchResolution). */
+  refundMismatchResolution?: RefundMismatchResolution;
+  /** On a resolved row whose `amount` was set to what Paystack refunded: the amount it planned. */
+  plannedAmountMinor?: number;
+  /** On a top-up refund row: the original refund row it completes. */
+  refundTopUpOf?: string;
+  /**
+   * On a top-up refund row: Paystack refund ids of the same charge that are
+   * NOT this row's (the original refund, earlier attempts). The engine and
+   * the poll never adopt or match them.
+   */
+  refundTopUpExcludes?: string[];
+  /** On a `refund_adjustment`: whether the agent is credited or debited `amount`. */
+  adjustmentDirection?: "credit" | "debit";
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -2098,6 +2333,10 @@ export type NotificationType =
   // the fee was given back), and a refund that is delayed (failed at Paystack).
   | "consultation_refunded"
   | "consultation_refund_delayed"
+  // Issue #382: a client reported a paid meeting did not happen (agent: the
+  // payment is paused; client: confirmation), and an admin decided it.
+  | "consultation_no_show_reported"
+  | "consultation_no_show_resolved"
   // Payments
   | "payment_received"
   | "payment_request"

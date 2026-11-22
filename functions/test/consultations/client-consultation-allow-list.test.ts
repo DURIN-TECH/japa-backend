@@ -179,6 +179,11 @@ const FULL_BOOKING: Required<Consultation> = {
   // Issue #317: the refund row's id is internal; its status is shown.
   refundId: "HIDDEN-refund-row-id",
   refundStatus: "processing",
+  // Issue #413: the booking's mirror of a HELD refund's reason (hidden: the
+  // client reads `refundStatus`, and the transaction's `refundState`).
+  refundHeldReason: "fee_not_less_than_amount",
+  // Issue #382: the booking's mirror of its no-show report (shown: status and times).
+  noShowReport: { status: "open", createdAt: at(5) },
 };
 
 /**
@@ -200,7 +205,9 @@ const SHOWN_FROM: Partial<Record<keyof Consultation, readonly string[]>> = {
   scheduledTime: ["scheduledTime"],
   durationMinutes: ["durationMinutes"],
   timezone: ["timezone"],
-  status: ["status"],
+  // Issue #382: `canReportNoShow` is worked out from the status (with the
+  // fee's hold and the slot) at read time.
+  status: ["status", "canReportNoShow"],
   meetingLink: ["meetingLink"],
   meetingPlatform: ["meetingPlatform"],
   priceUsdCents: ["priceUsdCents", "effectiveRate"],
@@ -219,6 +226,8 @@ const SHOWN_FROM: Partial<Record<keyof Consultation, readonly string[]>> = {
   cancellationReason: ["cancellationReason"],
   // Issue #317: where the refund stands (no ids).
   refundStatus: ["refundStatus"],
+  // Issue #382: the report's status and times only.
+  noShowReport: ["noShowReport"],
   createdAt: ["createdAt"],
   updatedAt: ["updatedAt"],
 };
@@ -248,6 +257,8 @@ const HIDDEN_FIELDS: readonly (keyof Consultation)[] = [
   "cancelledBy",
   // Issue #317: the refund row id (`refund_<Paystack reference>`).
   "refundId",
+  // Issue #413: internal reason a refund is held for an admin.
+  "refundHeldReason",
 ];
 
 /** Marker values that must not appear anywhere in a client response. */
@@ -460,6 +471,9 @@ describe("client consultation allow-list (issue #332)", () => {
       cancellationReason: "Travel moved",
       // Issue #317: the refund's status (its id stays hidden).
       refundStatus: "processing",
+      // Issue #382: not worked out here (false), and the report's status and time only.
+      canReportNoShow: false,
+      noShowReport: { status: "open", createdAt: at(5) },
       createdAt: at(1),
       updatedAt: at(2),
     });
@@ -492,9 +506,11 @@ describe("client consultation allow-list (issue #332)", () => {
       paymentStatus: "paid", createdAt: at(1), updatedAt: at(1),
     };
     // Free: only the zero dollar price.
-    assert.deepEqual(toClientConsultation({ ...base, priceUsdCents: 0 } as unknown as Consultation), { ...base, priceUsdCents: 0 });
+    // Issue #382: every client view carries the two report fields.
+    const report = { canReportNoShow: false, noShowReport: null };
+    assert.deepEqual(toClientConsultation({ ...base, priceUsdCents: 0 } as unknown as Consultation), { ...base, ...report, priceUsdCents: 0 });
     // Legacy: only the naira fee.
-    assert.deepEqual(toClientConsultation({ ...base, fee: 5_000 } as unknown as Consultation), { ...base, fee: 5_000 });
+    assert.deepEqual(toClientConsultation({ ...base, fee: 5_000 } as unknown as Consultation), { ...base, ...report, fee: 5_000 });
   });
 
   test("bookingSummary (checkout, verify and every 409 body) is payer-safe and carries the effective rate", () => {

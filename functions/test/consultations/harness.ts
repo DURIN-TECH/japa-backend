@@ -70,6 +70,8 @@ export const harness = {
   refundCalls: [] as RefundCall[],
   /** Every `findRefundsForTransaction` call (the charge reference), in order. */
   refundLookups: [] as string[],
+  /** Issue #381: every `fetchRefund` call (Paystack's refund id), in order. */
+  refundFetches: [] as string[],
   /** charge reference -> the refunds "Paystack" holds for it. */
   paystackRefunds: new Map<string, PaystackRefund[]>(),
   /**
@@ -125,6 +127,7 @@ export const harness = {
     this.onLookup = undefined;
     this.refundCalls.length = 0;
     this.refundLookups.length = 0;
+    this.refundFetches.length = 0;
     this.paystackRefunds.clear();
     this.refundBehaviour.length = 0;
     this.failNextRefundLookup = false;
@@ -177,6 +180,8 @@ export async function useHarness(): Promise<void> {
     // Issue #317: the refund rows take the agent's withdrawal lock, and the
     // hold tests withdraw (bank accounts).
     "withdrawalLocks", "bankAccounts",
+    // Issue #382: the client's "the meeting didn't happen" reports.
+    "noShowReports",
   ]) {
     firebase.collections[name] = fakeCollection(name);
   }
@@ -274,6 +279,20 @@ export async function useHarness(): Promise<void> {
       throw new PaystackApiError("PAYSTACK_ERROR: connect ETIMEDOUT", {});
     }
     return [...(harness.paystackRefunds.get(reference) ?? [])];
+  };
+  // Issue #381: GET /refund/:id, answered from the refunds "Paystack" holds
+  // (any charge); the same outage switch as the list.
+  ps.fetchRefund = async (refundId: string) => {
+    harness.refundFetches.push(refundId);
+    if (harness.failNextRefundLookup) {
+      harness.failNextRefundLookup = false;
+      throw new PaystackApiError("PAYSTACK_ERROR: connect ETIMEDOUT", {});
+    }
+    for (const list of harness.paystackRefunds.values()) {
+      const found = list.find((r) => r.id === refundId);
+      if (found) return { ...found };
+    }
+    return null;
   };
 
   // ---- Guest account provisioning: a fake Auth user + no claim email ----

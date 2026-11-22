@@ -72,7 +72,8 @@ export function decideFeeHoldBackfill(
   hasRefundRow = false
 ): FeeHoldBackfillAction {
   // Issue #390: a fee frozen by a held refund must never be released here.
-  if (fee.feeHoldFrozenByRefundId) return { kind: "skip_frozen" };
+  // Issue #382: a fee frozen by an open no-show report is skipped too.
+  if (fee.feeHoldFrozenByRefundId || fee.feeHoldFrozenByReportId) return { kind: "skip_frozen" };
   if (fee.feeHold) return { kind: "skip_has_hold" };
   // A refund was written against this fee: its hold belongs to the refund.
   if (hasRefundRow) return { kind: "skip_refunded" };
