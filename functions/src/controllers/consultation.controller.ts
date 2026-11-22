@@ -966,10 +966,12 @@ export class ConsultationController {
    *    booking whose checkout (`transactionId`) is still inside its quote
    *    lock (`quoteExpiresAt` in the future). Meeting fields and `summary`
    *    are still saved then;
-   *  - 400 SLOT_IN_PAST (issue #472): the edit really moves the slot and the
-   *    MERGED slot (new values over the stored ones) has already started by
-   *    the server clock. An edit that does not move the slot is never
-   *    refused for this, even on a booking whose slot has passed.
+   *  - 400 SLOT_IN_PAST (issue #472): the edit moves the slot's START and
+   *    the MERGED slot (new values over the stored ones) has already started
+   *    by the server clock. An edit that leaves the start where it is
+   *    (meeting fields, summary, only the duration, the stored schedule
+   *    resent) is never refused for this, even on a booking whose slot has
+   *    passed.
    *    `timezone`, when sent, must be a real IANA zone (else 400
    *    VALIDATION_ERROR).
    *

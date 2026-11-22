@@ -618,14 +618,17 @@ export function slotChanges(current: Consultation, updates: EditUpdates): boolea
 }
 
 /**
- * Issue #472: true when the slot a booking would have AFTER this edit (the
- * edit's schedule values over the stored ones) has already started at `at`.
- * Pure. Only the three values that place the START matter. (An edit of
- * `durationMinutes` alone still reaches this check, since `slotChanges`
- * counts it as a move: on a booking whose slot has passed it is refused,
- * like any other reschedule.) A merged slot whose date cannot
- * be read at all is not judged here (there is nothing to compare; the value
- * checks already refused a bad `scheduledDate` in the request).
+ * Issue #472: true when this edit moves the booking's START to an instant
+ * that has already started at `at`. Pure.
+ *
+ * The slot judged is the MERGED one: the edit's schedule values over the
+ * stored ones (only `scheduledTime` sent keeps the stored `scheduledDate`
+ * and `timezone`). It is judged only when its START differs from the stored
+ * start: an edit that leaves the start where it is (only `durationMinutes`,
+ * or the same time in another spelling) is not a move into the past, so the
+ * #316 table still lets the agent fix the length of a booking whose slot has
+ * begun. A slot whose date cannot be read at all is not judged here (the
+ * value checks already refused a bad `scheduledDate` in the request).
  *
  * @param current the booking as read in the edit's transaction
  * @param updates the checked values from `parseEditBody`
@@ -638,9 +641,18 @@ export function movesIntoPast(current: Consultation, updates: EditUpdates, at: D
     timezone: (updates.timezone ?? current.timezone) as Consultation["timezone"],
   };
   try {
+    const newStart = slotStartsAt(merged).getTime();
+    // The start does not move: nothing to judge (see above).
+    let oldStart: number | null = null;
+    try {
+      oldStart = slotStartsAt(current).getTime();
+    } catch {
+      oldStart = null; // no readable stored slot: any readable new one is a move
+    }
+    if (oldStart === newStart) return false;
     return isSlotInPast(merged, at);
   } catch {
-    // No readable stored date (bad legacy data): leave the edit to the other rules.
+    // No readable merged date (bad legacy data): leave the edit to the other rules.
     return false;
   }
 }
@@ -1571,14 +1583,15 @@ class ConsultationService {
       if (!decision.ok) return { kind: "refused", refusal: decision };
 
       // Issue #472: an edit that really MOVES the slot (`slotChanges`) may
-      // not move it to a time that has already started. Judged here, inside
-      // the transaction, on the freshly read booking and the server clock,
-      // with the MERGED slot: new values over the stored ones (only
+      // not move its START to a time that has already started. Judged here,
+      // inside the transaction, on the freshly read booking and the server
+      // clock, with the MERGED slot: new values over the stored ones (only
       // `scheduledTime` sent keeps the stored `scheduledDate` and
       // `timezone`). Refused before anything is written or notified.
-      // An edit that does NOT move the slot (meeting link, summary, or
-      // resending the stored schedule) is never refused here, so a booking
-      // whose slot has passed can still get its notes written up (#316).
+      // An edit that does NOT move the start (meeting link, summary, only
+      // the duration, or resending the stored schedule) is never refused
+      // here, so the #316 table is unchanged for a booking whose slot has
+      // passed.
       if (slotChanges(current, updates) && movesIntoPast(current, updates, at)) {
         return {
           kind: "refused",

@@ -480,14 +480,20 @@ describe("PUT /consultations/:id refuses a move into the past (issue #472)", () 
     assert.equal(bookings()[0].scheduledTime, "10:00");
   });
 
-  test("changing only the duration of a past booking counts as a move (the criterion keys on slotChanges)", async () => {
-    // `durationMinutes` is a schedule field, so `slotChanges` is true and the
-    // merged slot (start unchanged, already passed) is judged: refused. A
-    // booking whose slot has passed cannot be rescheduled in any way.
+  test("changing only the duration of a past booking is saved: its start does not move (#316 table)", async () => {
     await seedParties();
     await seedBooking("2026-11-22", "10:00");
-    assertSlotInPast(await agentEdits({ durationMinutes: 45 }), "duration only");
-    assert.equal(bookings()[0].durationMinutes, 30);
+    const out = await agentEdits({ durationMinutes: 45 });
+    assert.ok(out.status === 0 || out.status === 200, JSON.stringify(out.body));
+    assert.equal(bookings()[0].durationMinutes, 45);
+  });
+
+  test("movesIntoPast: same start in another spelling, or duration only, is not a move", () => {
+    const current = slot("2026-11-22", "10:00", "Africa/Lagos") as unknown as Consultation;
+    assert.equal(movesIntoPast(current, { durationMinutes: 45 }, NOW), false);
+    assert.equal(movesIntoPast(current, { scheduledTime: "10:00" }, NOW), false);
+    // A real move to another past time is.
+    assert.equal(movesIntoPast(current, { scheduledTime: "09:00" }, NOW), true);
   });
 
   test("an unknown timezone is 400 VALIDATION_ERROR, nothing written", async () => {
